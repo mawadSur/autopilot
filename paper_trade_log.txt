@@ -1,0 +1,44 @@
+2025-06-17 20:57:23,588 - Compiled the loaded model, but the compiled metrics have yet to be built. `model.compile_metrics` will be empty until you train or evaluate the model.
+2025-06-17 20:57:24,831 - Error occurred: Exception encountered when calling LSTMCell.call().
+
+[1mDimensions must be equal, but are 9 and 11 for '{{node sequential_1/bidirectional_1/forward_lstm_1/lstm_cell_1/MatMul}} = MatMul[T=DT_FLOAT, grad_a=false, grad_b=false, transpose_a=false, transpose_b=false](sequential_1/bidirectional_1/forward_lstm_1/strided_slice_1, sequential_1/bidirectional_1/forward_lstm_1/lstm_cell_1/Cast/ReadVariableOp)' with input shapes: [1,9], [11,256].[0m
+
+Arguments received by LSTMCell.call():
+  • inputs=tf.Tensor(shape=(1, 9), dtype=float32)
+  • states=('tf.Tensor(shape=(1, 64), dtype=float32)', 'tf.Tensor(shape=(1, 64), dtype=float32)')
+  • training=False
+2025-06-18 22:19:56,336 - Compiled the loaded model, but the compiled metrics have yet to be built. `model.compile_metrics` will be empty until you train or evaluate the model.
+2025-06-18 22:19:57,296 - Error occurred: "['sma_ratio', 'ema_20', 'macd', 'rsi_14', 'vol_change'] not in index"
+2025-06-18 22:22:03,727 - Compiled the loaded model, but the compiled metrics have yet to be built. `model.compile_metrics` will be empty until you train or evaluate the model.
+2025-06-18 22:22:04,137 - Error occurred: Exception encountered when calling LSTM.call().
+
+[1mslice index 0 of dimension 1 out of bounds. for '{{node sequential_1/bidirectional_1/forward_lstm_1/strided_slice}} = StridedSlice[Index=DT_INT32, T=DT_FLOAT, begin_mask=5, ellipsis_mask=0, end_mask=5, new_axis_mask=0, shrink_axis_mask=2](data, sequential_1/bidirectional_1/forward_lstm_1/strided_slice/stack, sequential_1/bidirectional_1/forward_lstm_1/strided_slice/stack_1, sequential_1/bidirectional_1/forward_lstm_1/strided_slice/stack_2)' with input shapes: [1,0,14], [3], [3], [3] and with computed input tensors: input[1] = <0 0 0>, input[2] = <0 1 0>, input[3] = <1 1 1>.[0m
+
+Arguments received by LSTM.call():
+  • sequences=tf.Tensor(shape=(1, 0, 14), dtype=float32)
+  • initial_state=None
+  • mask=None
+  • training=False
+2025-06-18 22:26:20,926 - Compiled the loaded model, but the compiled metrics have yet to be built. `model.compile_metrics` will be empty until you train or evaluate the model.
+2025-06-18 22:26:21,576 - Prediction confidence: 0.3092
+2025-06-18 22:26:21,576 - No trade made: confidence below threshold.
+2025-06-18 22:27:13,507 - Compiled the loaded model, but the compiled metrics have yet to be built. `model.compile_metrics` will be empty until you train or evaluate the model.
+2025-06-18 22:27:14,085 - Prediction confidence: 0.3092
+2025-06-18 22:27:14,085 - No trade made: confidence below threshold.
+2025-06-18 22:28:56,397 - Compiled the loaded model, but the compiled metrics have yet to be built. `model.compile_metrics` will be empty until you train or evaluate the model.
+2025-06-18 22:28:57,029 - Prediction confidence: 0.3092
+2025-06-18 22:28:57,029 - No trade made: confidence below threshold.
+2025-06-18 22:29:40,404 - Compiled the loaded model, but the compiled metrics have yet to be built. `model.compile_metrics` will be empty until you train or evaluate the model.
+2025-06-18 22:29:40,974 - Prediction confidence: 0.3092
+2025-06-18 22:29:40,974 - No trade made: confidence below threshold.
+2025-06-18 22:30:48,657 - Compiled the loaded model, but the compiled metrics have yet to be built. `model.compile_metrics` will be empty until you train or evaluate the model.
+2025-06-18 22:30:49,854 - Prediction confidence: 0.3092
+2025-06-18 22:30:49,855 - Error occurred: API Secret required for private endpoints
+2025-06-18 22:33:15,454 - Compiled the loaded model, but the compiled metrics have yet to be built. `model.compile_metrics` will be empty until you train or evaluate the model.
+2025-06-18 22:33:16,107 - Prediction confidence: 0.3092
+2025-06-18 22:33:16,107 - Error occurred: API Secret required for private endpoints
+2025-06-18 22:34:11,165 - Compiled the loaded model, but the compiled metrics have yet to be built. `model.compile_metrics` will be empty until you train or evaluate the model.
+2025-06-18 22:34:11,740 - Prediction confidence: 0.3092
+2025-06-18 22:34:12,037 - BUY ORDER executed: {'symbol': 'ETHUSDT', 'orderId': 4137875, 'orderListId': -1, 'clientOrderId': 'x-HNA2TXFJ6835b69c1ae3143c337c0f', 'transactTime': 1750275251950, 'price': '0.00000000', 'origQty': '0.05000000', 'executedQty': '0.05000000', 'origQuoteOrderQty': '0.00000000', 'cummulativeQuoteQty': '124.74450000', 'status': 'FILLED', 'timeInForce': 'GTC', 'type': 'MARKET', 'side': 'BUY', 'workingTime': 1750275251950, 'fills': [{'price': '2494.89000000', 'qty': '0.05000000', 'commission': '0.00000000', 'commissionAsset': 'ETH', 'tradeId': 1148558}], 'selfTradePreventionMode': 'EXPIRE_MAKER'}
+2025-06-18 22:45:12,213 - Compiled the loaded model, but the compiled metrics have yet to be built. `model.compile_metrics` will be empty until you train or evaluate the model.
+2025-06-18 22:47:29,563 - Compiled the loaded model, but the compiled metrics have yet to be built. `model.compile_metrics` will be empty until you train or evaluate the model.

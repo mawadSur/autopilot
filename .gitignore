@@ -1,0 +1,9 @@
+*.keras
+*.h5
+*.dylib
+*.so
+tfenv/
+__pycache__/
+*.zip
+*.tar.gz
+*.whl
