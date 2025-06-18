@@ -1,1 +1,9 @@
-wheel==0.45.1
+backtrader
+python-dotenv
+tensorflow-macos==2.11.0
+scikit-learn
+matplotlib
+pandas
+python-binance
+setuptools
+wheel
