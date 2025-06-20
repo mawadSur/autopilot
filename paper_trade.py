@@ -10,17 +10,21 @@ from train_model import focal_loss
 from dotenv import load_dotenv
 import logging
 
+# Load .env and credentials
 load_dotenv()
-
-logging.basicConfig(filename='paper_trade_log.txt', level=logging.INFO, format='%(asctime)s - %(message)s')
-
 API_KEY = os.getenv("BINANCE_TESTNET_KEY")
 API_SECRET = os.getenv("BINANCE_TESTNET_SECRET")
+
 client = Client(API_KEY, API_SECRET)
 client.API_URL = 'https://testnet.binance.vision/api'
 
+# Logging
+logging.basicConfig(filename='paper_trade_log.txt', level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# Load trained model
 model = load_model('eth_lstm_model.h5', custom_objects={'loss': focal_loss()})
 
+# ---------- Feature Engineering ----------
 def compute_rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -46,7 +50,7 @@ def engineer_features(df):
     df.dropna(inplace=True)
     return df
 
-def prepare_input(df, window_size=150):
+def prepare_input(df, window_size=60):
     df = engineer_features(df)
     feature_cols = [
         'open', 'high', 'low', 'close', 'body', 'range',
@@ -56,8 +60,9 @@ def prepare_input(df, window_size=150):
     recent = df[feature_cols].values[-window_size:]
     return np.expand_dims(recent, axis=0), df['close'].iloc[-1]
 
-def fetch_eth_ohlcv(hours=200):
-    klines = client.get_klines(symbol='ETHUSDT', interval=KLINE_INTERVAL_1HOUR, limit=hours)
+# ---------- Binance Data Fetch ----------
+def fetch_eth_ohlcv(minutes=80):
+    klines = client.get_klines(symbol='ETHUSDT', interval=KLINE_INTERVAL_1MINUTE, limit=minutes)
     df = pd.DataFrame(klines, columns=[
         'open_time', 'open', 'high', 'low', 'close', 'volume',
         'close_time', 'quote_asset_volume', 'num_trades',
@@ -65,17 +70,30 @@ def fetch_eth_ohlcv(hours=200):
     ])
     df['date'] = pd.to_datetime(df['open_time'], unit='ms')
     df.set_index('date', inplace=True)
+    print(df.index[-3:])
     df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
     return df
 
-def run_multiple_trades(n=10, interval=5):
+# ---------- Trading Simulation ----------
+def run_multiple_trades(n=10, interval=60):
     total_profit = 0.0
     trade_count = 0
+    last_close = None
+
     for i in range(n):
         try:
             df = fetch_eth_ohlcv()
             X, current_price = prepare_input(df)
             prediction = model.predict(X)[0][0]
+
+            new_close = df['close'].iloc[-1]
+            if last_close == new_close:
+                print(f"[{i+1}] Waiting for fresh data...")
+                time.sleep(interval)
+                continue
+            last_close = new_close
+
+            print(df[['close', 'macd', 'rsi_14', 'sma_ratio']].tail(3))
 
             print(f"[{i+1}] Prediction: {prediction:.4f} | Price: {current_price:.2f}")
 
@@ -86,16 +104,19 @@ def run_multiple_trades(n=10, interval=5):
                 total_profit += pnl
                 trade_count += 1
                 print(f"✅ Trade {i+1}: Buy {entry:.2f} → Sell {simulated_exit:.2f} | PnL: {pnl:.2f}")
+                logging.info(f"Trade {i+1} | Entry: {entry:.2f}, Exit: {simulated_exit:.2f}, PnL: {pnl:.2f}")
             else:
                 print(f"🚫 Trade {i+1}: Skipped (Confidence too low)")
 
         except Exception as e:
             print(f"❌ Error on trade {i+1}: {e}")
+            logging.error(f"Error on trade {i+1}: {e}")
 
         time.sleep(interval)
 
     print(f"\n📊 Trades completed: {trade_count}/{n}")
     print(f"💰 Total simulated PnL: {total_profit:.2f} USD")
 
+# ---------- Main ----------
 if __name__ == "__main__":
-    run_multiple_trades(n=10, interval=5)
+    run_multiple_trades(n=10, interval=60)  # every 60 seconds

@@ -1,22 +1,46 @@
 import backtrader as bt
 import pandas as pd
+import json
+
+class SignalData(bt.feeds.PandasData):
+    lines = ('signal', 'confidence',)
+    params = (
+        ('datetime', None),
+        ('open', 'open'),
+        ('high', 'high'),
+        ('low', 'low'),
+        ('close', 'close'),
+        ('volume', 'volume'),
+        ('openinterest', -1),
+        ('signal', -1),
+        ('confidence', -1),
+    )
 
 class SignalStrategy(bt.Strategy):
     params = (
-        ('take_profit', 0.03),    # 5% take profit
-        ('stop_loss', 0.020),     # 2.5% stop loss
-        ('max_hold', 12),         # 24 bars max hold (~24 hours for hourly data)
+        ('atr_period', 14),
+        ('atr_tp_mult', 1.5),
+        ('atr_sl_mult', 1.0),
+        ('min_volume_ratio', 0.5),
+        ('cooldown_bars', 5),
+        ('max_hold', 24),
     )
 
     def __init__(self):
         self.order = None
         self.entry_price = None
         self.entry_bar = None
+        self.last_exit_bar = -999
+
+        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
 
         self.total_trades = 0
         self.total_wins = 0
         self.total_losses = 0
         self.log_list = []
+
+        with open("model_meta.json", "r") as f:
+            self.conf_threshold = json.load(f).get("best_threshold", 0.6)
 
     def log(self, txt):
         dt = self.datas[0].datetime.datetime(0)
@@ -28,24 +52,29 @@ class SignalStrategy(bt.Strategy):
 
     def next(self):
         if self.order:
-            return  # Wait for order to complete
+            return
 
         if not self.position:
-            if self.datas[0].signal[0] == 1:
+            if self.data.signal[0] == 1 and self.data.confidence[0] >= self.conf_threshold:
+                if self.data.volume[0] < self.data.volume[-1] * self.p.min_volume_ratio:
+                    return
+                if len(self) - self.last_exit_bar < self.p.cooldown_bars:
+                    return
+
                 self.order = self.buy()
                 self.entry_price = self.data.close[0]
                 self.entry_bar = len(self)
-                self.log(f'BUY at {self.entry_price}')
+                self.tp_price = self.entry_price + self.atr[0] * self.p.atr_tp_mult
+                self.sl_price = self.entry_price - self.atr[0] * self.p.atr_sl_mult
+                self.log(f'BUY at {self.entry_price:.2f} | TP: {self.tp_price:.2f}, SL: {self.sl_price:.2f}')
         else:
             current_price = self.data.close[0]
-            tp_price = self.entry_price * (1 + self.params.take_profit)
-            sl_price = self.entry_price * (1 - self.params.stop_loss)
             held_bars = len(self) - self.entry_bar
 
             should_exit = (
-                current_price >= tp_price or
-                current_price <= sl_price or
-                held_bars >= self.params.max_hold
+                current_price >= self.tp_price or
+                current_price <= self.sl_price or
+                held_bars >= self.p.max_hold
             )
 
             if should_exit:
@@ -57,7 +86,8 @@ class SignalStrategy(bt.Strategy):
                     self.total_wins += 1
                 else:
                     self.total_losses += 1
-                self.log(f'SELL at {current_price} | PnL: {pnl:.2f} → {result}')
+                self.last_exit_bar = len(self)
+                self.log(f'SELL at {current_price:.2f} | PnL: {pnl:.2f} → {result}')
                 self.log_list.append({
                     "entry_bar": self.entry_bar,
                     "exit_bar": len(self),
@@ -68,44 +98,29 @@ class SignalStrategy(bt.Strategy):
                     "result": result
                 })
 
-
-class SignalData(bt.feeds.PandasData):
-    lines = ('signal',)
-    params = (
-        ('datetime', None),
-        ('open', 'open'),
-        ('high', 'high'),
-        ('low', 'low'),
-        ('close', 'close'),
-        ('volume', 'volume'),
-        ('openinterest', -1),
-        ('signal', -1),
-    )
-
 def run_backtest(csv_path='eth_signals.csv'):
     df = pd.read_csv(csv_path, parse_dates=['date'], index_col='date')
-    if 'signal' not in df.columns:
-        raise ValueError("Your CSV must include a 'signal' column.")
+    if 'signal' not in df.columns or 'confidence' not in df.columns:
+        raise ValueError("CSV must include 'signal' and 'confidence' columns.")
     df.dropna(inplace=True)
 
     cerebro = bt.Cerebro()
-    data = SignalData(dataname=df)
-    cerebro.adddata(data)
+    cerebro.adddata(SignalData(dataname=df))
     cerebro.addstrategy(SignalStrategy)
     cerebro.broker.setcash(10000)
     cerebro.broker.setcommission(commission=0.001)
-    # cerebro.addsizer(bt.sizers.FixedSize, stake=2)
-    cerebro.addsizer(bt.sizers.PercentSizer, percents=95)  # risk 10% of portfolio per trade
+    cerebro.addsizer(bt.sizers.PercentSizer, percents=95)
 
+    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
+    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
 
     print("\n=== Starting Backtest ===")
-    starting_value = cerebro.broker.getvalue()
-    print("Start Portfolio Value:", starting_value)
+    start_val = cerebro.broker.getvalue()
+    print(f"Start Portfolio Value: {start_val}")
 
     strat = cerebro.run()[0]
-
-    ending_value = cerebro.broker.getvalue()
-    print("Final Portfolio Value:", ending_value)
+    end_val = cerebro.broker.getvalue()
+    print(f"Final Portfolio Value: {end_val}")
 
     print("\n=== Trade Log ===")
     for trade in strat.log_list:
@@ -116,13 +131,14 @@ def run_backtest(csv_path='eth_signals.csv'):
     print(f"Wins: {strat.total_wins}")
     print(f"Losses: {strat.total_losses}")
     if strat.total_trades > 0:
-        win_rate = strat.total_wins / strat.total_trades * 100
-        print(f"Win Rate: {win_rate:.2f}%")
-    else:
-        print("No trades were made.")
-    print(f"Total Return: {(ending_value - starting_value):.2f} USD")
+        print(f"Win Rate: {strat.total_wins / strat.total_trades * 100:.2f}%")
+    print(f"Total Return: {end_val - start_val:.2f} USD")
 
-    cerebro.plot()
+    print("\n=== Analyzers ===")
+    print("Sharpe Ratio:", strat.analyzers.sharpe.get_analysis())
+    print("Max Drawdown:", strat.analyzers.drawdown.get_analysis().get('max', {}).get('drawdown', 'N/A'), "%")
+
+    cerebro.plot(style='candlestick')
 
 if __name__ == "__main__":
     run_backtest()

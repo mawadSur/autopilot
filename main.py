@@ -4,6 +4,7 @@ import label
 import backtest
 import history
 import paper_trade
+import generate_signal
 import trade
 
 def main():
@@ -23,6 +24,10 @@ def main():
     elif args.step == "train":
         print("▶️ Training model...")
         train_model.train_model()
+
+    elif args.step == "generate":
+        print("▶️ Generating Signal...")
+        generate_signal.main()
 
     elif args.step == "backtest":
         print("📉 Running backtest...")

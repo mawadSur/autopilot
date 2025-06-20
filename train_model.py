@@ -9,6 +9,7 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
 from tensorflow.keras.callbacks import EarlyStopping
 import tensorflow.keras.backend as K
 import matplotlib.pyplot as plt
+import json
 
 def compute_rsi(series, period=14):
     delta = series.diff()
@@ -22,14 +23,12 @@ def compute_rsi(series, period=14):
 def preprocess_and_label(df, window_size=150, threshold=0.005):
     df = df.copy()
 
-    # Feature engineering
+    # === Feature Engineering ===
     df['body'] = df['close'] - df['open']
     df['range'] = df['high'] - df['low']
     df['upper_wick'] = df['high'] - df[['close', 'open']].max(axis=1)
     df['lower_wick'] = df[['close', 'open']].min(axis=1) - df['low']
     df['return'] = df['close'].pct_change()
-
-    # Technical indicators
     df['sma_10'] = df['close'].rolling(10).mean()
     df['sma_50'] = df['close'].rolling(50).mean()
     df['sma_ratio'] = df['sma_10'] / df['sma_50'] - 1
@@ -37,10 +36,9 @@ def preprocess_and_label(df, window_size=150, threshold=0.005):
     df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
     df['rsi_14'] = compute_rsi(df['close'], 14)
     df['vol_change'] = df['volume'].pct_change()
-
     df.dropna(inplace=True)
 
-    # Label creation
+    # === Label Creation ===
     df['target'] = (df['close'].shift(-1) - df['close']) / df['close']
     df['label'] = (df['target'] > threshold).astype(int)
     df.dropna(inplace=True)
@@ -50,11 +48,9 @@ def preprocess_and_label(df, window_size=150, threshold=0.005):
         'upper_wick', 'lower_wick', 'return', 'sma_ratio',
         'ema_20', 'macd', 'rsi_14', 'vol_change'
     ]
-
     features = df[feature_cols].values
     labels = df['label'].values
 
-    # Create LSTM windows
     X, y = [], []
     for i in range(window_size, len(features)):
         X.append(features[i - window_size:i])
@@ -62,6 +58,9 @@ def preprocess_and_label(df, window_size=150, threshold=0.005):
 
     X = np.array(X)
     y = np.array(y)
+
+    if X.shape[0] == 0:
+        raise ValueError("❌ No samples created. Check if window size is too large.")
 
     # Normalize
     scaler = StandardScaler()
@@ -96,14 +95,14 @@ def train_model():
     print("✅ Class balance:", np.bincount(y))
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
 
-    # Auto class weight
+    # Compute class weights
     weights = class_weight.compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
     class_weight_dict = dict(zip(np.unique(y_train), weights))
     print(f"📊 Class weights: {class_weight_dict}")
 
     model = build_lstm_model(input_shape=(X.shape[1], X.shape[2]))
 
-    early_stop = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
+    early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 
     history = model.fit(
         X_train, y_train,
@@ -111,13 +110,13 @@ def train_model():
         batch_size=32,
         validation_split=0.2,
         class_weight=class_weight_dict,
-        # callbacks=[early_stop],
+        callbacks=[early_stop],
         verbose=1
     )
 
     probs = model.predict(X_test)
     fpr, tpr, thresholds = roc_curve(y_test, probs)
-    best_threshold = thresholds[np.argmax(tpr - fpr)]
+    best_threshold = float(thresholds[np.argmax(tpr - fpr)])
 
     print("\n📈 Threshold candidates (from ROC):")
     for i in range(0, len(thresholds), max(1, len(thresholds) // 5)):
@@ -141,10 +140,15 @@ def train_model():
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
+    model.save('eth_lstm_model.h5')
+
     plt.show()
 
-    model.save('eth_lstm_model.h5')
+    with open("model_meta.json", "w") as f:
+        json.dump({"threshold": best_threshold}, f)
+
     print("✅ Model saved as eth_lstm_model.h5")
+    print("📝 Threshold saved in model_meta.json")
 
 if __name__ == "__main__":
     train_model()

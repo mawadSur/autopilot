@@ -1,43 +1,59 @@
+import os
+import time
 import pandas as pd
 import numpy as np
-import datetime
+from datetime import datetime
 from tensorflow.keras.models import load_model
 from binance.client import Client
 from binance.enums import *
-import os
 
-# === Binance Credentials (use env variables or secrets) ===
+# === Binance Credentials ===
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
 client = Client(API_KEY, API_SECRET)
 
-# === Load Trained Model ===
+# === Load Model ===
 model = load_model('eth_lstm_model.h5')
 
-# === Feature Engineering (match Step 3) ===
+# === Feature Engineering ===
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
 def engineer_features(df):
     df['body'] = df['close'] - df['open']
     df['range'] = df['high'] - df['low']
     df['upper_wick'] = df['high'] - df[['close', 'open']].max(axis=1)
     df['lower_wick'] = df[['close', 'open']].min(axis=1) - df['low']
     df['return'] = df['close'].pct_change()
+    df['sma_10'] = df['close'].rolling(10).mean()
+    df['sma_50'] = df['close'].rolling(50).mean()
+    df['sma_ratio'] = df['sma_10'] / df['sma_50'] - 1
+    df['ema_20'] = df['close'].ewm(span=20).mean()
+    df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
+    df['rsi_14'] = compute_rsi(df['close'], 14)
+    df['vol_change'] = df['volume'].pct_change()
     df.dropna(inplace=True)
     return df
 
-# === Format Data for Prediction ===
-def prepare_input(df, window_size=10):
+def prepare_input(df, window_size=60):
     df = engineer_features(df)
     feature_cols = [
-            'open', 'high', 'low', 'close', 'body', 'range',
-            'upper_wick', 'lower_wick', 'return', 'sma_ratio',
-            'ema_20', 'macd', 'rsi_14', 'vol_change'
-        ]
+        'open', 'high', 'low', 'close', 'body', 'range',
+        'upper_wick', 'lower_wick', 'return', 'sma_ratio',
+        'ema_20', 'macd', 'rsi_14', 'vol_change'
+    ]
     recent = df[feature_cols].values[-window_size:]
-    return np.expand_dims(recent, axis=0)
+    return np.expand_dims(recent, axis=0), df['close'].iloc[-1]
 
-# === Fetch Live ETH Data ===
-def fetch_eth_ohlcv(days=15):
-    klines = client.get_klines(symbol='ETHUSDT', interval=KLINE_INTERVAL_1DAY, limit=days)
+# === Fetch ETH OHLCV ===
+def fetch_eth_ohlcv(minutes=80):
+    klines = client.get_klines(symbol='ETHUSDT', interval=KLINE_INTERVAL_1MINUTE, limit=minutes)
     df = pd.DataFrame(klines, columns=[
         'open_time', 'open', 'high', 'low', 'close', 'volume',
         'close_time', 'quote_asset_volume', 'num_trades',
@@ -48,28 +64,57 @@ def fetch_eth_ohlcv(days=15):
     df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
     return df
 
-# === Trade Logic ===
-def trade_if_signal():
-    df = fetch_eth_ohlcv()
-    X = prepare_input(df)
-    prediction = model.predict(X)[0][0]
+# === Trade Handler ===
+def trade_live(log_path="trade_log.csv", portfolio_pct=0.1, iterations=20, interval=60):
+    account_info = client.get_account()
+    balances = {asset['asset']: float(asset['free']) for asset in account_info['balances']}
+    usdt_balance = balances.get('USDT', 0.0)
 
-    print(f"Prediction Confidence: {prediction:.4f}")
+    if usdt_balance == 0.0:
+        print("❌ No USDT available in your Binance account.")
+        return
 
-    if prediction > 0.9:
-        print("💹 Signal: BUY ETH")
-        quantity = 0.05  # define your trade size
+    df_log = []
+
+    for i in range(iterations):
         try:
-            order = client.order_market_buy(
-                symbol='ETHUSDT',
-                quantity=quantity
-            )
-            print(f"Order executed: {order}")
-        except Exception as e:
-            print("Trade failed:", str(e))
-    else:
-        print("🚫 No action — prediction below threshold.")
+            df = fetch_eth_ohlcv()
+            X, current_price = prepare_input(df)
+            prediction = model.predict(X)[0][0]
 
-# === Schedule Daily Run (manually or with cron)
-if __name__ == "__main__":
-    trade_if_signal()
+            print(f"[{i+1}] Prediction: {prediction:.4f} | Price: {current_price:.2f} | USDT Balance: ${usdt_balance:.2f}")
+
+            if prediction > 0.7:
+                usd_position = usdt_balance * portfolio_pct
+                eth_bought = usd_position / current_price
+                sell_price = current_price * 1.01  # simulate 1% gain
+                pnl = eth_bought * (sell_price - current_price)
+                usdt_balance += pnl
+
+                print(f"✅ BUY → SELL | Entry: {current_price:.2f} → Exit: {sell_price:.2f} | PnL: ${pnl:.2f}")
+                df_log.append({
+                    'iteration': i + 1,
+                    'entry_price': current_price,
+                    'exit_price': sell_price,
+                    'eth_traded': eth_bought,
+                    'prediction': prediction,
+                    'pnl': pnl,
+                    'balance': usdt_balance,
+                    'timestamp': datetime.utcnow()
+                })
+            else:
+                print(f"🚫 Skipped trade — confidence too low.")
+
+        except Exception as e:
+            print(f"❌ Error: {e}")
+
+        time.sleep(interval)
+
+    # Save log
+    log_df = pd.DataFrame(df_log)
+    log_df.to_csv(log_path, index=False)
+    print(f"📦 Saved trade log to {log_path}")
+
+
+# === Main ===
+trade_live()

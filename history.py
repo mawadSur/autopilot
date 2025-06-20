@@ -1,78 +1,95 @@
-import requests
-import pandas as pd
+import os
 import time
+import pandas as pd
 from datetime import datetime, timedelta
+from binance.client import Client
+from dotenv import load_dotenv
 
-def fetch_hourly_eth_chunk(start_timestamp, end_timestamp, vs_currency='usd'):
-    url = "https://api.coingecko.com/api/v3/coins/ethereum/market_chart/range"
-    params = {
-        'vs_currency': vs_currency,
-        'from': int(start_timestamp),
-        'to': int(end_timestamp)
-    }
-    response = requests.get(url, params=params)
-    data = response.json()
+load_dotenv()
+api_key = os.getenv("BINANCE_KEY")
+api_secret = os.getenv("BINANCE_SECRET")
+client = Client(api_key, api_secret)
 
-    if 'prices' not in data or 'total_volumes' not in data:
-        raise ValueError("❌ CoinGecko response missing 'prices'. Likely invalid date range.")
+OUTPUT_DIR = "eth_1s_data"
+SYMBOL = "ETHUSDT"
+INTERVAL = Client.KLINE_INTERVAL_1SECOND
+CHUNK_SECONDS = 60 * 60 * 24  # 1 day = 86400 seconds
+LIMIT = 1000  # Max rows per Binance call
 
-    df_price = pd.DataFrame(data['prices'], columns=['timestamp', 'price'])
-    df_volume = pd.DataFrame(data['total_volumes'], columns=['timestamp', 'volume'])
+def ensure_output_dir():
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
 
-    df = pd.merge(df_price, df_volume, on='timestamp')
-    df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('date', inplace=True)
+def get_output_filename(start_ts):
+    dt = datetime.utcfromtimestamp(start_ts / 1000).strftime('%Y-%m-%d')
+    return os.path.join(OUTPUT_DIR, f"eth_1s_{dt}.csv")
 
-    df['open'] = df['price']
-    df['high'] = df['price']
-    df['low'] = df['price']
-    df['close'] = df['price']
-    df = df[['open', 'high', 'low', 'close', 'volume']]
-    return df
+def file_already_exists(start_ts):
+    return os.path.exists(get_output_filename(start_ts))
 
-def fetch_eth_hourly_365d():
-    print("📥 Fetching ETH hourly price & volume (past 365 days)...")
-    now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
-    end = now
-    chunk_days = 90
-    all_chunks = []
+def fetch_chunk(start_ms, end_ms):
+    """Fetch one full day's worth of 1-second data."""
+    all_rows = []
+    current_ms = start_ms
 
-    # Work backwards in exact chunks
-    for _ in range(0, 365, chunk_days):
-        start = end - timedelta(days=chunk_days)
-        print(f"⏳ Fetching {start.date()} to {end.date()}...")
-
+    while current_ms < end_ms:
         try:
-            df = fetch_hourly_eth_chunk(start.timestamp(), end.timestamp())
-            all_chunks.append(df)
-            time.sleep(1.3)
+            klines = client.get_klines(
+                symbol=SYMBOL,
+                interval=INTERVAL,
+                startTime=current_ms,
+                limit=LIMIT
+            )
+            if not klines:
+                break
+
+            for k in klines:
+                all_rows.append({
+                    "timestamp": k[0],
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "volume": float(k[5])
+                })
+
+            last_ts = klines[-1][0]
+            current_ms = last_ts + 1000
+            time.sleep(0.25)
+
         except Exception as e:
-            print(f"⚠️ Failed to fetch chunk {start.date()} to {end.date()}: {e}")
+            print(f"❌ Error during fetch: {e}")
+            time.sleep(2)
 
-        end = start  # Move window back
+    return all_rows
 
-    df_all = pd.concat(all_chunks)
-    df_all = df_all[~df_all.index.duplicated()]
-    df_all = df_all.sort_index()
+def run_backfill(start_days_ago=365):
+    ensure_output_dir()
+    now = datetime.utcnow().replace(microsecond=0, second=0, minute=0)
+    start_date = now - timedelta(days=start_days_ago)
 
-    # Validate gaps
-    expected_range = pd.date_range(
-        start=df_all.index.min(), end=df_all.index.max(), freq='h'
-    )
-    missing = expected_range.difference(df_all.index)
+    current = start_date
 
-    print(f"📊 Expected rows: {len(expected_range)}")
-    print(f"✅ Saved rows:    {len(df_all)}")
-    print(f"❌ Missing hours: {len(missing)}")
+    while current < now:
+        start_ts = int(current.timestamp() * 1000)
+        end_ts = int((current + timedelta(days=1)).timestamp() * 1000)
+        out_path = get_output_filename(start_ts)
 
-    if not missing.empty:
-        print("⚠️ Missing timestamps:")
-        for ts in missing[:10]:
-            print("  -", ts)
+        if file_already_exists(start_ts):
+            print(f"✅ Skipping existing: {out_path}")
+        else:
+            print(f"📥 Fetching: {current.date()}...")
+            data = fetch_chunk(start_ts, end_ts)
+            if data:
+                df = pd.DataFrame(data)
+                df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('date', inplace=True)
+                df.to_csv(out_path)
+                print(f"✅ Saved {len(df)} rows → {out_path}")
+            else:
+                print(f"⚠️ No data for {current.date()}")
 
-    return df_all
+        current += timedelta(days=1)
 
 if __name__ == "__main__":
-    df = fetch_eth_hourly_365d()
-    df.to_csv("eth_ohlc.csv")
-    print(f"✅ Saved {len(df)} hourly rows to eth_ohlc.csv")
+    run_backfill(start_days_ago=365)

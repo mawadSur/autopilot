@@ -1,5 +1,7 @@
 import pandas as pd
 import numpy as np
+import os
+from glob import glob
 from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.models import load_model
 
@@ -22,20 +24,25 @@ def compute_features(df):
     df['sma_50'] = df['close'].rolling(50).mean()
     df['sma_ratio'] = df['sma_10'] / df['sma_50'] - 1
     df['vol_change'] = df['volume'].pct_change()
-    df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['macd'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
-    df['rsi_14'] = compute_rsi(df['close'])
+    df['ema_20'] = df['close'].ewm(span=20).mean()
+    df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
+    df['rsi_14'] = compute_rsi(df['close'], 14)
     df.dropna(inplace=True)
     return df
 
 def sliding_window(data, window=100):
-    X = []
-    for i in range(window, len(data)):
-        X.append(data[i - window:i])
-    return np.array(X)
+    return np.array([data[i - window:i] for i in range(window, len(data))])
+
+def load_ohlc_chunks(folder='data/ohlc_chunks'):
+    files = sorted(glob(os.path.join(folder, '*.csv')))
+    dfs = [pd.read_csv(f, parse_dates=['date'], index_col='date') for f in files]
+    df = pd.concat(dfs).sort_index()
+    df = df[~df.index.duplicated()]
+    return df
 
 def main():
-    df = pd.read_csv('eth_ohlc.csv', parse_dates=['date'], index_col='date')
+    print("📥 Loading historical OHLC data...")
+    df = load_ohlc_chunks()
     df = compute_features(df)
 
     feature_cols = [
@@ -44,27 +51,31 @@ def main():
         'ema_20', 'macd', 'rsi_14', 'vol_change'
     ]
 
+    print("🧠 Preparing model inputs...")
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(df[feature_cols])
     X = sliding_window(X_scaled, window=100)
 
+    print("📈 Running inference...")
     model = load_model('eth_lstm_model.h5', compile=False)
     preds = model.predict(X).flatten()
 
-    signal_df = df.iloc[100:].copy()
-    signal_df['model_conf'] = preds
-    signal_df['true_future_return'] = (signal_df['close'].shift(-1) - signal_df['close']) / signal_df['close']
+    result_df = df.iloc[100:].copy()
+    result_df['confidence'] = preds
+    result_df['true_future_return'] = (result_df['close'].shift(-1) - result_df['close']) / result_df['close']
 
-    # Smart filter: Only buy if confidence high, RSI < 70, MACD positive
-    signal_df['signal'] = np.where(
-        (signal_df['model_conf'] > 0.75) & 
-        (signal_df['rsi_14'] < 70) & 
-        (signal_df['macd'] > 0), 
+    # Apply rule-based signal filtering
+    result_df['signal'] = np.where(
+        (result_df['confidence'] > 0.75) &
+        (result_df['rsi_14'] < 70) &
+        (result_df['macd'] > 0),
         1, 0
     )
 
-    signal_df[['open', 'high', 'low', 'close', 'volume', 'signal', 'model_conf', 'true_future_return']].to_csv('eth_signals.csv')
-    print("✅ Saved smart signals to eth_signals.csv")
+    result_df[['open', 'high', 'low', 'close', 'volume', 'signal', 'confidence', 'true_future_return']]\
+        .to_csv('eth_signals.csv')
+
+    print(f"✅ Signals saved to eth_signals.csv | Positives: {result_df['signal'].sum()}")
 
 if __name__ == "__main__":
     main()
