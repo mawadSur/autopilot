@@ -7,3 +7,4 @@ python-binance
 setuptools
 wheel
 tensorflow
+tqdm

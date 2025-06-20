@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import os
+from tqdm.auto import tqdm
 from glob import glob
 
 def compute_rsi(series, period=14):
@@ -12,10 +13,9 @@ def compute_rsi(series, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def preprocess_and_label(df, window_size=10, threshold=0.02):
-    df = df.copy()
+def preprocess_and_save_batches(df, window_size=150, threshold=0.02, batch_size=500_000, out_dir="labeled_chunks"):
+    os.makedirs(out_dir, exist_ok=True)
 
-    # === Feature Engineering ===
     df['body'] = df['close'] - df['open']
     df['range'] = df['high'] - df['low']
     df['upper_wick'] = df['high'] - df[['close', 'open']].max(axis=1)
@@ -30,7 +30,6 @@ def preprocess_and_label(df, window_size=10, threshold=0.02):
     df['vol_change'] = df['volume'].pct_change()
     df.dropna(inplace=True)
 
-    # === Labeling ===
     df['target'] = (df['close'].shift(-1) - df['close']) / df['close']
     df['label'] = (df['target'] > threshold).astype(int)
     df.dropna(inplace=True)
@@ -40,28 +39,54 @@ def preprocess_and_label(df, window_size=10, threshold=0.02):
         'upper_wick', 'lower_wick', 'return', 'sma_ratio',
         'ema_20', 'macd', 'rsi_14', 'vol_change'
     ]
-    features = df[feature_cols].values
-    labels = df['label'].values
+    features = df[feature_cols].values.astype(np.float32)
+    labels = df['label'].values.astype(np.uint8)
 
-    # === Sliding Windows ===
-    X = []
-    y = []
+    total = len(features)
+    batch_idx = 0
+    X_batch, y_batch = [], []
 
-    for i in range(window_size, len(features)):
-        X.append(features[i - window_size:i])
-        y.append(labels[i])
+    print(f"📈 Generating labeled windows with batch size: {batch_size}")
+    for i in tqdm(range(window_size, total), desc="Labeling windows"):
+        X_batch.append(features[i - window_size:i])
+        y_batch.append(labels[i])
 
-    return np.array(X), np.array(y), df  # Also return DataFrame for saving
+        if len(X_batch) >= batch_size:
+            X_arr = np.array(X_batch, dtype=np.float32)
+            y_arr = np.array(y_batch, dtype=np.uint8)
+            np.savez_compressed(f"{out_dir}/batch_{batch_idx}.npz", X=X_arr, y=y_arr)
+            print(f"💾 Saved batch {batch_idx} at index {i} ({df.index[i]})")
+            X_batch, y_batch = [], []
+            batch_idx += 1
 
-def load_all_chunks(folder='data/ohlc_chunks'):
+    if X_batch:
+        X_arr = np.array(X_batch, dtype=np.float32)
+        y_arr = np.array(y_batch, dtype=np.uint8)
+        np.savez_compressed(f"{out_dir}/batch_{batch_idx}.npz", X=X_arr, y=y_arr)
+        print(f"💾 Saved final batch {batch_idx} at index {total-1} ({df.index[-1]})")
+
+    print(f"✅ Completed batching. Total batches: {batch_idx + 1}")
+
+def load_all_chunks(folder='eth_1s_data'):
     files = sorted(glob(os.path.join(folder, '*.csv')))
-    dfs = [pd.read_csv(f, parse_dates=['date'], index_col='date') for f in files]
+    if not files:
+        raise ValueError(f"No CSV files found in directory: {folder}")
+
+    dfs = []
+    for f in tqdm(files, desc="Loading CSV chunks"):
+        try:
+            df = pd.read_csv(f, parse_dates=['date'], index_col='date')
+            dfs.append(df)
+        except Exception as e:
+            print(f"⚠️ Skipping file {f}: {e}")
+
+    if not dfs:
+        raise ValueError("No valid dataframes loaded — cannot concatenate.")
+
     combined = pd.concat(dfs)
     combined = combined[~combined.index.duplicated()].sort_index()
     return combined
 
 if __name__ == "__main__":
     df = load_all_chunks()
-    X, y, labeled_df = preprocess_and_label(df, window_size=150, threshold=0.02)
-    labeled_df.to_csv('labeled_data.csv')
-    print(f"✅ Labeled dataset saved to labeled_data.csv with shape: {X.shape}, Labels: {np.bincount(y)}")
+    preprocess_and_save_batches(df, window_size=150, threshold=0.02)

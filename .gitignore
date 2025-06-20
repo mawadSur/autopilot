@@ -8,3 +8,4 @@ __pycache__/
 *.tar.gz
 *.whl
 *.csv
+labeled_chunks/
