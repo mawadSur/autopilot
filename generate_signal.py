@@ -33,9 +33,28 @@ def compute_features(df):
 def sliding_window(data, window=100):
     return np.array([data[i - window:i] for i in range(window, len(data))])
 
-def load_ohlc_chunks(folder='data/ohlc_chunks'):
+def load_ohlc_chunks(folder='eth_1s_data'):
     files = sorted(glob(os.path.join(folder, '*.csv')))
-    dfs = [pd.read_csv(f, parse_dates=['date'], index_col='date') for f in files]
+    
+    if not files:
+        raise FileNotFoundError(f"No CSV files found in folder: {folder}")
+
+    print(f"📁 Found {len(files)} CSV files in {folder}")
+
+    dfs = []
+    for f in files:
+        try:
+            df = pd.read_csv(f, parse_dates=['date'], index_col='date')
+            if not df.empty:
+                dfs.append(df)
+            else:
+                print(f"⚠️ Skipping empty file: {f}")
+        except Exception as e:
+            print(f"⚠️ Skipping corrupted file: {f} | Error: {e}")
+
+    if not dfs:
+        raise ValueError("No valid dataframes to concatenate. Please check your CSV files.")
+
     df = pd.concat(dfs).sort_index()
     df = df[~df.index.duplicated()]
     return df

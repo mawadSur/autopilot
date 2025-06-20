@@ -9,3 +9,4 @@ __pycache__/
 *.whl
 *.csv
 labeled_chunks/
+model_meta.json

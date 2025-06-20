@@ -7,6 +7,7 @@ from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
 from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.layers import Input
 import tensorflow.keras.backend as K
 import matplotlib.pyplot as plt
 import json
@@ -79,7 +80,8 @@ def focal_loss(gamma=2., alpha=0.25):
 
 def build_lstm_model(input_shape):
     model = Sequential()
-    model.add(Bidirectional(LSTM(64, return_sequences=True), input_shape=input_shape))
+    model.add(Input(shape=input_shape))  # ✅ Explicit Input layer
+    model.add(Bidirectional(LSTM(64, return_sequences=True)))
     model.add(Dropout(0.3))
     model.add(Bidirectional(LSTM(32)))
     model.add(Dropout(0.2))
