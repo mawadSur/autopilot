@@ -27,7 +27,12 @@ def compute_features(df):
     df['ema_20'] = df['close'].ewm(span=20).mean()
     df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
     df['rsi_14'] = compute_rsi(df['close'], 14)
+
     df.dropna(inplace=True)
+
+    # 🚨 New step: remove any remaining bad values
+    df = df.replace([np.inf, -np.inf], np.nan).dropna()
+
     return df
 
 def sliding_window(data, window=100):
