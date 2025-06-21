@@ -35,9 +35,6 @@ def compute_features(df):
 
     return df
 
-def sliding_window(data, window=100):
-    return np.array([data[i - window:i] for i in range(window, len(data))])
-
 def load_ohlc_chunks(folder='eth_1s_data'):
     files = sorted(glob(os.path.join(folder, '*.csv')))
     
@@ -64,6 +61,12 @@ def load_ohlc_chunks(folder='eth_1s_data'):
     df = df[~df.index.duplicated()]
     return df
 
+def sliding_window_generator(data, window=100, batch_size=100000):
+    for start in range(window, len(data), batch_size):
+        end = min(start + batch_size, len(data))
+        windows = np.array([data[i - window:i] for i in range(start, end)])
+        yield windows, start, end
+
 def main():
     print("📥 Loading historical OHLC data...")
     df = load_ohlc_chunks()
@@ -77,15 +80,19 @@ def main():
 
     print("🧠 Preparing model inputs...")
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(df[feature_cols])
-    X = sliding_window(X_scaled, window=100)
+    X_scaled = scaler.fit_transform(df[feature_cols].values)
 
-    print("📈 Running inference...")
+    print("📈 Running inference in batches...")
     model = load_model('eth_lstm_model.h5', compile=False)
-    preds = model.predict(X).flatten()
+    all_preds = []
 
-    result_df = df.iloc[100:].copy()
-    result_df['confidence'] = preds
+    for X_batch, start_idx, end_idx in sliding_window_generator(X_scaled, window=100, batch_size=100000):
+        preds = model.predict(X_batch).flatten()
+        all_preds.extend(preds)
+        print(f"🧪 Inferred {len(preds)} records ({start_idx} to {end_idx})")
+
+    result_df = df.iloc[100:100+len(all_preds)].copy()
+    result_df['confidence'] = all_preds
     result_df['true_future_return'] = (result_df['close'].shift(-1) - result_df['close']) / result_df['close']
 
     # Apply rule-based signal filtering
