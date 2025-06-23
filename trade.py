@@ -6,6 +6,7 @@ from datetime import datetime
 from tensorflow.keras.models import load_model
 from binance.client import Client
 from binance.enums import *
+from utils import compute_rsi
 
 # === Binance Credentials ===
 API_KEY = os.getenv('BINANCE_API_KEY')
@@ -16,14 +17,7 @@ client = Client(API_KEY, API_SECRET)
 model = load_model('eth_lstm_model.h5')
 
 # === Feature Engineering ===
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+
 
 def engineer_features(df):
     df['body'] = df['close'] - df['open']

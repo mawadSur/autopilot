@@ -9,6 +9,7 @@ from binance.enums import *
 from train_model import focal_loss
 from dotenv import load_dotenv
 import logging
+from utils import compute_rsi
 
 # Load .env and credentials
 load_dotenv()
@@ -25,15 +26,6 @@ logging.basicConfig(filename='paper_trade_log.txt', level=logging.INFO, format='
 model = load_model('eth_lstm_model.h5', custom_objects={'loss': focal_loss()})
 
 # ---------- Feature Engineering ----------
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
 def engineer_features(df):
     df['body'] = df['close'] - df['open']
     df['range'] = df['high'] - df['low']

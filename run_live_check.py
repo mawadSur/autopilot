@@ -7,15 +7,8 @@ from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.models import load_model
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+from utils import compute_rsi
 
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
 
 def fetch_latest_data(symbol="ETHUSDT", interval="1m", limit=200):
     url = "https://api.binance.com/api/v3/klines"

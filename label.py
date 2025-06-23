@@ -3,15 +3,7 @@ import numpy as np
 import os
 from tqdm.auto import tqdm
 from glob import glob
-
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+from utils import compute_rsi
 
 def preprocess_and_save_batches(df, window_size=150, threshold=0.02, batch_size=500_000, out_dir="labeled_chunks"):
     os.makedirs(out_dir, exist_ok=True)

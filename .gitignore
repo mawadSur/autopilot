@@ -9,4 +9,5 @@ __pycache__/
 *.whl
 *.csv
 labeled_chunks/
-model_meta.jsone
+model_meta.json
+.venv*
