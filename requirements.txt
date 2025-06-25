@@ -6,5 +6,5 @@ pandas
 python-binance
 setuptools
 wheel
-tensorflow
+tensorflow==2.15
 tqdm
