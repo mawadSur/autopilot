@@ -1,6 +1,11 @@
 import backtrader as bt
 import pandas as pd
 import json
+import matplotlib
+import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
+import os
+
 
 class SignalData(bt.feeds.PandasData):
     lines = ('signal', 'confidence',)
@@ -33,6 +38,8 @@ class SignalStrategy(bt.Strategy):
         self.last_exit_bar = -999
 
         self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
+        self.pbar = tqdm(desc="Backtesting Progress", ncols=100)
+
 
         self.total_trades = 0
         self.total_wins = 0
@@ -51,6 +58,7 @@ class SignalStrategy(bt.Strategy):
             self.order = None
 
     def next(self):
+        self.pbar.update(1)  # update progress bar  
         if self.order:
             return
 
@@ -98,21 +106,51 @@ class SignalStrategy(bt.Strategy):
                     "result": result
                 })
 
-def run_backtest(csv_path='eth_signals.csv'):
-    df = pd.read_csv(csv_path, parse_dates=['date'], index_col='date')
-    if 'signal' not in df.columns or 'confidence' not in df.columns:
-        raise ValueError("CSV must include 'signal' and 'confidence' columns.")
-    df.dropna(inplace=True)
+    def stop(self):
+        self.pbar.close()
 
-    cerebro = bt.Cerebro()
-    cerebro.adddata(SignalData(dataname=df))
-    cerebro.addstrategy(SignalStrategy)
-    cerebro.broker.setcash(10000)
-    cerebro.broker.setcommission(commission=0.001)
-    cerebro.addsizer(bt.sizers.PercentSizer, percents=95)
+CHUNK_SIZE = 1_000_000  # Tune based on memory capacity
+PROGRESS_FILE = 'chunk_progress.txt'
 
-    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
-    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+
+def run_backtest_in_chunks(csv_path='eth_signals.csv'):
+    chunk_iter = pd.read_csv(csv_path, parse_dates=['date'], index_col='date', chunksize=CHUNK_SIZE)
+
+    # Load resume index if exists
+    start_chunk = 0
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE, 'r') as f:
+            start_chunk = int(f.read().strip())
+        print(f"⏩ Resuming from chunk {start_chunk}")
+
+    for i, chunk in enumerate(tqdm(chunk_iter, desc="Backtesting Chunks")):
+        if i < start_chunk:
+            continue  # skip previously processed chunks
+
+        if 'signal' not in chunk.columns or 'confidence' not in chunk.columns:
+            print(f"❌ Skipping chunk {i} due to missing signal/confidence")
+            continue
+
+        chunk.dropna(inplace=True)
+
+        cerebro = bt.Cerebro()
+        cerebro.adddata(SignalData(dataname=chunk))
+        cerebro.addstrategy(SignalStrategy)
+        cerebro.broker.setcash(10000)
+        cerebro.broker.setcommission(commission=0.001)
+        cerebro.addsizer(bt.sizers.PercentSizer, percents=95)
+
+        cerebro.run()  # run single chunk
+        print(f"✅ Completed chunk {i}")
+
+        # Save progress
+        with open(PROGRESS_FILE, 'w') as f:
+            f.write(str(i + 1))
+
+        # Optionally save results after each chunk
+        # e.g. plot or log metrics
+
+    print("✅ All chunks processed.")
 
     print("\n=== Starting Backtest ===")
     start_val = cerebro.broker.getvalue()
@@ -138,7 +176,9 @@ def run_backtest(csv_path='eth_signals.csv'):
     print("Sharpe Ratio:", strat.analyzers.sharpe.get_analysis())
     print("Max Drawdown:", strat.analyzers.drawdown.get_analysis().get('max', {}).get('drawdown', 'N/A'), "%")
 
+    cerebro.plot(style='candlestick')[0][0].savefig("backtest_plot.png")
+    print("📈 Plot saved to backtest_plot.png")
     cerebro.plot(style='candlestick')
 
 if __name__ == "__main__":
-    run_backtest()
+    run_backtest_in_chunks()

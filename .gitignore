@@ -11,3 +11,4 @@ __pycache__/
 labeled_chunks/
 model_meta.json
 .venv*
+*.txt
