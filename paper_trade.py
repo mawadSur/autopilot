@@ -1,31 +1,47 @@
 import os
-import pandas as pd
-import numpy as np
 import time
+import json
+import joblib
+import logging
+import numpy as np
+import pandas as pd
 from datetime import datetime
 from tensorflow.keras.models import load_model
 from binance.client import Client
 from binance.enums import *
-from train_model import focal_loss
 from dotenv import load_dotenv
-import logging
+from train_model import focal_loss
 from utils import compute_rsi
 
-# Load .env and credentials
+# ==== CONFIG ====
+WINDOW_SIZE = 150
+FIXED_BATCH_SIZE = 16
+CONF_THRESHOLD = 0.75  # fallback
+FEATURE_COLS = [
+    'open', 'high', 'low', 'close', 'body', 'range',
+    'upper_wick', 'lower_wick', 'return', 'sma_ratio',
+    'ema_20', 'macd', 'rsi_14', 'vol_change'
+]
+
+# ==== ENV & Logging ====
 load_dotenv()
 API_KEY = os.getenv("BINANCE_TESTNET_KEY")
 API_SECRET = os.getenv("BINANCE_TESTNET_SECRET")
-
 client = Client(API_KEY, API_SECRET)
 client.API_URL = 'https://testnet.binance.vision/api'
-
-# Logging
 logging.basicConfig(filename='paper_trade_log.txt', level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# Load trained model
-model = load_model('eth_lstm_model.h5', custom_objects={'loss': focal_loss()})
+# ==== Load Model and Scaler ====
+model = load_model('eth_lstm_model.h5', custom_objects={'loss': focal_loss()}, compile=False)
+scaler = joblib.load("scaler.pkl")
 
-# ---------- Feature Engineering ----------
+try:
+    with open("model_meta.json", "r") as f:
+        CONF_THRESHOLD = json.load(f).get("threshold", CONF_THRESHOLD)
+except Exception:
+    pass
+
+# ==== Feature Engineering ====
 def engineer_features(df):
     df['body'] = df['close'] - df['open']
     df['range'] = df['high'] - df['low']
@@ -42,18 +58,16 @@ def engineer_features(df):
     df.dropna(inplace=True)
     return df
 
-def prepare_input(df, window_size=60):
+def prepare_input(df):
     df = engineer_features(df)
-    feature_cols = [
-        'open', 'high', 'low', 'close', 'body', 'range',
-        'upper_wick', 'lower_wick', 'return', 'sma_ratio',
-        'ema_20', 'macd', 'rsi_14', 'vol_change'
-    ]
-    recent = df[feature_cols].values[-window_size:]
-    return np.expand_dims(recent, axis=0), df['close'].iloc[-1]
+    recent = df[FEATURE_COLS].values[-WINDOW_SIZE:]
+    recent_scaled = scaler.transform(recent)
+    X = np.array([recent_scaled] * FIXED_BATCH_SIZE)  # stateful batch
+    current_price = df['close'].iloc[-1]
+    return X, current_price, df[['close', 'macd', 'rsi_14', 'sma_ratio']].tail(3)
 
-# ---------- Binance Data Fetch ----------
-def fetch_eth_ohlcv(minutes=80):
+# ==== Fetch Binance OHLCV ====
+def fetch_eth_ohlcv(minutes=180):
     klines = client.get_klines(symbol='ETHUSDT', interval=KLINE_INTERVAL_1MINUTE, limit=minutes)
     df = pd.DataFrame(klines, columns=[
         'open_time', 'open', 'high', 'low', 'close', 'volume',
@@ -62,11 +76,10 @@ def fetch_eth_ohlcv(minutes=80):
     ])
     df['date'] = pd.to_datetime(df['open_time'], unit='ms')
     df.set_index('date', inplace=True)
-    print(df.index[-3:])
     df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
     return df
 
-# ---------- Trading Simulation ----------
+# ==== Paper Trading ====
 def run_multiple_trades(n=10, interval=60):
     total_profit = 0.0
     trade_count = 0
@@ -75,8 +88,9 @@ def run_multiple_trades(n=10, interval=60):
     for i in range(n):
         try:
             df = fetch_eth_ohlcv()
-            X, current_price = prepare_input(df)
-            prediction = model.predict(X)[0][0]
+            X, current_price, debug_tail = prepare_input(df)
+            prediction = model.predict(X, batch_size=FIXED_BATCH_SIZE).flatten()[0]
+            model.reset_states()
 
             new_close = df['close'].iloc[-1]
             if last_close == new_close:
@@ -85,11 +99,10 @@ def run_multiple_trades(n=10, interval=60):
                 continue
             last_close = new_close
 
-            print(df[['close', 'macd', 'rsi_14', 'sma_ratio']].tail(3))
+            print(debug_tail)
+            print(f"[{i+1}] Confidence: {prediction:.4f} | Threshold: {CONF_THRESHOLD:.2f} | Price: {current_price:.2f}")
 
-            print(f"[{i+1}] Prediction: {prediction:.4f} | Price: {current_price:.2f}")
-
-            if prediction > 0.7:
+            if prediction > CONF_THRESHOLD:
                 entry = current_price
                 simulated_exit = entry * 1.01
                 pnl = simulated_exit - entry
@@ -98,7 +111,7 @@ def run_multiple_trades(n=10, interval=60):
                 print(f"✅ Trade {i+1}: Buy {entry:.2f} → Sell {simulated_exit:.2f} | PnL: {pnl:.2f}")
                 logging.info(f"Trade {i+1} | Entry: {entry:.2f}, Exit: {simulated_exit:.2f}, PnL: {pnl:.2f}")
             else:
-                print(f"🚫 Trade {i+1}: Skipped (Confidence too low)")
+                print(f"🚫 Trade {i+1}: Skipped (Low confidence)")
 
         except Exception as e:
             print(f"❌ Error on trade {i+1}: {e}")
@@ -109,6 +122,6 @@ def run_multiple_trades(n=10, interval=60):
     print(f"\n📊 Trades completed: {trade_count}/{n}")
     print(f"💰 Total simulated PnL: {total_profit:.2f} USD")
 
-# ---------- Main ----------
+# ==== Entry ====
 if __name__ == "__main__":
-    run_multiple_trades(n=10, interval=60)  # every 60 seconds
+    run_multiple_trades(n=10, interval=60)
