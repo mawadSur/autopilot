@@ -14,3 +14,4 @@ model_meta.json
 tf-venv*
 *.deb*
 *.run
+*.txt

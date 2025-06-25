@@ -1,6 +1,9 @@
-import backtrader as bt
+import os
 import pandas as pd
+import backtrader as bt
 import json
+from tqdm import tqdm
+
 
 class SignalData(bt.feeds.PandasData):
     lines = ('signal', 'confidence',)
@@ -15,6 +18,7 @@ class SignalData(bt.feeds.PandasData):
         ('signal', -1),
         ('confidence', -1),
     )
+
 
 class SignalStrategy(bt.Strategy):
     params = (
@@ -33,7 +37,6 @@ class SignalStrategy(bt.Strategy):
         self.last_exit_bar = -999
 
         self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
-
         self.total_trades = 0
         self.total_wins = 0
         self.total_losses = 0
@@ -98,47 +101,62 @@ class SignalStrategy(bt.Strategy):
                     "result": result
                 })
 
-def run_backtest(csv_path='eth_signals.csv'):
-    df = pd.read_csv(csv_path, parse_dates=['date'], index_col='date')
-    if 'signal' not in df.columns or 'confidence' not in df.columns:
-        raise ValueError("CSV must include 'signal' and 'confidence' columns.")
-    df.dropna(inplace=True)
 
-    cerebro = bt.Cerebro()
-    cerebro.adddata(SignalData(dataname=df))
-    cerebro.addstrategy(SignalStrategy)
-    cerebro.broker.setcash(10000)
-    cerebro.broker.setcommission(commission=0.001)
-    cerebro.addsizer(bt.sizers.PercentSizer, percents=95)
+def run_backtest_in_chunks(csv_path='eth_signals.csv', chunk_size=1_000_000, progress_file='chunk_progress.txt'):
+    chunk_iter = pd.read_csv(csv_path, parse_dates=['date'], index_col='date', chunksize=chunk_size)
 
-    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
-    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+    start_chunk = 0
+    if os.path.exists(progress_file):
+        with open(progress_file, 'r') as f:
+            start_chunk = int(f.read().strip())
+        print(f"⏩ Resuming from chunk {start_chunk}")
 
-    print("\n=== Starting Backtest ===")
-    start_val = cerebro.broker.getvalue()
-    print(f"Start Portfolio Value: {start_val}")
+    for i, chunk in enumerate(tqdm(chunk_iter, desc="Backtesting Chunks", ncols=100)):
+        if i < start_chunk:
+            continue
 
-    strat = cerebro.run()[0]
-    end_val = cerebro.broker.getvalue()
-    print(f"Final Portfolio Value: {end_val}")
+        if 'signal' not in chunk.columns or 'confidence' not in chunk.columns:
+            print(f"❌ Skipping chunk {i} due to missing signal/confidence")
+            continue
 
-    print("\n=== Trade Log ===")
-    for trade in strat.log_list:
-        print(trade)
+        chunk.dropna(inplace=True)
 
-    print("\n=== Metrics ===")
-    print(f"Total Trades: {strat.total_trades}")
-    print(f"Wins: {strat.total_wins}")
-    print(f"Losses: {strat.total_losses}")
-    if strat.total_trades > 0:
-        print(f"Win Rate: {strat.total_wins / strat.total_trades * 100:.2f}%")
-    print(f"Total Return: {end_val - start_val:.2f} USD")
+        cerebro = bt.Cerebro()
+        cerebro.adddata(SignalData(dataname=chunk))
+        cerebro.addstrategy(SignalStrategy)
+        cerebro.broker.setcash(10000)
+        cerebro.broker.setcommission(commission=0.001)
+        cerebro.addsizer(bt.sizers.PercentSizer, percents=95)
 
-    print("\n=== Analyzers ===")
-    print("Sharpe Ratio:", strat.analyzers.sharpe.get_analysis())
-    print("Max Drawdown:", strat.analyzers.drawdown.get_analysis().get('max', {}).get('drawdown', 'N/A'), "%")
+        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
+        cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
 
-    cerebro.plot(style='candlestick')
+        print(f"\n=== Starting Chunk {i} ===")
+        start_val = cerebro.broker.getvalue()
+
+        strat = cerebro.run()[0]
+        end_val = cerebro.broker.getvalue()
+
+        print(f"Final Portfolio Value: {end_val}")
+        print("\n=== Trade Log ===")
+        for trade in strat.log_list:
+            print(trade)
+
+        print("\n=== Metrics ===")
+        print(f"Total Trades: {strat.total_trades}")
+        print(f"Wins: {strat.total_wins}")
+        print(f"Losses: {strat.total_losses}")
+        if strat.total_trades > 0:
+            print(f"Win Rate: {strat.total_wins / strat.total_trades * 100:.2f}%")
+        print(f"Total Return: {end_val - start_val:.2f} USD")
+
+        print("\n=== Analyzers ===")
+        print("Sharpe Ratio:", strat.analyzers.sharpe.get_analysis())
+        print("Max Drawdown:", strat.analyzers.drawdown.get_analysis().get('max', {}).get('drawdown', 'N/A'), "%")
+
+        with open(progress_file, 'w') as f:
+            f.write(str(i + 1))
+
 
 if __name__ == "__main__":
-    run_backtest()
+    run_backtest_in_chunks()
