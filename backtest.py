@@ -103,7 +103,7 @@ class SignalStrategy(bt.Strategy):
 
 
 def run_backtest_in_chunks(csv_path='eth_signals.csv', chunk_size=1_000_000, progress_file='chunk_progress.txt'):
-    chunk_iter = pd.read_csv(csv_path, parse_dates=['date'], index_col='date', chunksize=chunk_size)
+    chunk_iter = pd.read_csv(csv_path, chunksize=chunk_size)
 
     start_chunk = 0
     if os.path.exists(progress_file):
