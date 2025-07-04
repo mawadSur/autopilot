@@ -15,3 +15,6 @@ tf-venv*
 *.deb*
 *.run
 *.txt
+*.json
+eth_1m_data
+eth_1s_data
