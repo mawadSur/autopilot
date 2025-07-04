@@ -31,17 +31,31 @@ print(device_lib.list_local_devices())
 WINDOW_SIZE = 150
 BATCH_SIZE = 50000
 FIXED_BATCH_SIZE = 16
-EPOCHS_PER_CHUNK = 3  # ⬅️ adjust for shorter or longer training per chunk
-THRESHOLD = 0.005
+EPOCHS_PER_CHUNK = 3
+THRESHOLD = 0.002 # Corrected: A more realistic threshold
+LOOKAHEAD_PERIOD = 10 # Corrected: How many minutes to look into the future for a peak
+
+# --- CORRECTED: Added 'atr' for volatility measurement ---
 FEATURE_COLS = [
     'open', 'high', 'low', 'close', 'body', 'range',
     'upper_wick', 'lower_wick', 'return', 'sma_ratio',
-    'ema_20', 'macd', 'rsi_14', 'vol_change'
+    'ema_20', 'macd', 'rsi_14', 'vol_change', 'atr'
 ]
 
+# ==== Helper Function for ATR ====
+def compute_atr(df, period=14):
+    """Computes the Average True Range (ATR)."""
+    df['h-l'] = df['high'] - df['low']
+    df['h-pc'] = abs(df['high'] - df['close'].shift(1))
+    df['l-pc'] = abs(df['low'] - df['close'].shift(1))
+    df['tr'] = df[['h-l', 'h-pc', 'l-pc']].max(axis=1)
+    atr = df['tr'].rolling(period).mean()
+    return atr
+
 # ==== Preprocessing ====
-def preprocess_chunk(df, window_size=150, threshold=THRESHOLD, scaler=None):
+def preprocess_chunk(df, window_size=WINDOW_SIZE, threshold=THRESHOLD, scaler=None):
     df = df.copy()
+    # --- Feature Engineering ---
     df['body'] = df['close'] - df['open']
     df['range'] = df['high'] - df['low']
     df['upper_wick'] = df['high'] - df[['close', 'open']].max(axis=1)
@@ -54,12 +68,16 @@ def preprocess_chunk(df, window_size=150, threshold=THRESHOLD, scaler=None):
     df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
     df['rsi_14'] = compute_rsi(df['close'], 14)
     df['vol_change'] = df['volume'].pct_change()
+    df['atr'] = compute_atr(df) # CORRECTED: Added ATR feature
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
 
-    df['target'] = (df['close'].shift(-1) - df['close']) / df['close']
+    # --- CORRECTED: Switched to a more robust labeling strategy ---
+    future_highs = df['high'].rolling(window=LOOKAHEAD_PERIOD).max().shift(-LOOKAHEAD_PERIOD)
+    df['target'] = (future_highs - df['close']) / df['close']
     df['label'] = (df['target'] > threshold).astype(int)
+    
     print("🔍 Label distribution:", np.bincount(df['label']))
     print(f"✅ Positive ratio: {df['label'].mean():.4f}")
     df.dropna(inplace=True)
@@ -82,7 +100,7 @@ def preprocess_chunk(df, window_size=150, threshold=THRESHOLD, scaler=None):
 
     return X, y
 
-# ==== Loss ====
+# ==== Loss Function ====
 def focal_loss(gamma=2., alpha=0.25):
     def loss(y_true, y_pred):
         y_true = K.cast(y_true, dtype='float32')
@@ -110,7 +128,8 @@ def build_lstm_model(input_shape, batch_size):
 
 # ==== Training ====
 def train_model():
-    df = load_ohlc_chunks()
+    # --- CORRECTED: Load from the 1-minute data folder ---
+    df = load_ohlc_chunks(folder='eth_1m_data') 
     chunk_size = BATCH_SIZE + WINDOW_SIZE
     num_chunks = (len(df) - WINDOW_SIZE) // BATCH_SIZE
 
@@ -125,10 +144,11 @@ def train_model():
             start_chunk = checkpoint.get("last_completed_chunk", 0) + 1
         print(f"🔁 Resuming from chunk {start_chunk}")
 
-    # Fit and save scaler
-    sample_df = df.sample(min(100000, len(df)))
+    # Fit and save scaler on a sample of the data
+    sample_df = df.sample(min(200000, len(df))) # Increased sample size
     sample_X, _ = preprocess_chunk(sample_df)
     scaler = StandardScaler()
+    # Reshape to 2D for the scaler and back to 3D
     scaler.fit(sample_X.reshape(-1, sample_X.shape[-1]))
     joblib.dump(scaler, 'scaler.pkl')
     print("✅ Scaler saved to scaler.pkl")
@@ -141,15 +161,16 @@ def train_model():
         chunk = df.iloc[i * BATCH_SIZE: i * BATCH_SIZE + chunk_size].copy()
         X, y = preprocess_chunk(chunk, scaler=scaler)
 
-        # Fix batch size
+        # Ensure data length is a multiple of the batch size
         excess = len(X) % FIXED_BATCH_SIZE
         if excess > 0:
             X = X[:-excess]
             y = y[:-excess]
 
-        # Train/Val Split
+        # Train/Val Split, ensuring stratification
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, stratify=y)
-        # Trim to fixed batch size
+        
+        # Trim both sets to be multiples of the fixed batch size
         def trim_batch(X, y, batch_size):
             excess = len(X) % batch_size
             if excess > 0:
@@ -158,6 +179,7 @@ def train_model():
 
         X_train, y_train = trim_batch(X_train, y_train, FIXED_BATCH_SIZE)
         X_val, y_val = trim_batch(X_val, y_val, FIXED_BATCH_SIZE)
+        
         if model is None:
             print("📐 Building model...")
             model = build_lstm_model(input_shape=(X.shape[1], X.shape[2]), batch_size=FIXED_BATCH_SIZE)
@@ -177,38 +199,47 @@ def train_model():
                 shuffle=False,
                 verbose=1
             )
-            model.reset_states()
+            
+            # CORRECTED: Loop through layers to reset states individually
+            for layer in model.layers:
+                if hasattr(layer, 'reset_states'):
+                    layer.reset_states()
 
             model.save(model_file)
             with open(checkpoint_file, "w") as f:
                 json.dump({"last_completed_chunk": i}, f)
             print(f"✅ Checkpoint saved after chunk {i}")
 
-            # Confidence samples
-            sample_probs = model.predict(X_val[:FIXED_BATCH_SIZE], batch_size=FIXED_BATCH_SIZE).flatten()
-            all_probs.extend(sample_probs)
-            all_true.extend(y_val[:FIXED_BATCH_SIZE])
+            # Collect predictions on validation set for final evaluation
+            if len(X_val) > 0:
+                sample_probs = model.predict(X_val, batch_size=FIXED_BATCH_SIZE).flatten()
+                all_probs.extend(sample_probs)
+                all_true.extend(y_val)
 
         except tf.errors.ResourceExhaustedError as e:
-            print("❌ GPU OOM error:", e)
+            print(f"❌ GPU OOM error: {e}")
             break
 
-    # === Evaluation ===
+    # === Evaluation across all chunks ===
     if all_probs:
         probs = np.array(all_probs)
         y_test = np.array(all_true)
+        
+        # Find the threshold that gives the best balance between true positive and false positive rates
         fpr, tpr, thresholds = roc_curve(y_test, probs)
-        best_threshold = float(thresholds[np.argmax(tpr - fpr)])
+        best_idx = np.argmax(tpr - fpr)
+        best_threshold = float(thresholds[best_idx])
         y_pred = (probs > best_threshold).astype(int)
 
-        print("\n📊 Classification Report:")
+        print("\n📊 Final Validation Classification Report:")
+        print(f"(Using optimal threshold: {best_threshold:.4f})")
         print(classification_report(y_test, y_pred, zero_division=0))
         print("📦 Confusion Matrix:")
         print(confusion_matrix(y_test, y_pred))
 
         with open("model_meta.json", "w") as f:
             json.dump({"threshold": best_threshold}, f)
-        print("✅ Threshold saved.")
+        print(f"✅ Optimal threshold {best_threshold:.4f} saved to model_meta.json")
 
     else:
         print("⚠️ No predictions collected for evaluation.")

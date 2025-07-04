@@ -5,9 +5,10 @@ from tqdm.auto import tqdm
 from glob import glob
 from utils import compute_rsi
 
-def preprocess_and_save_batches(df, window_size=150, threshold=0.02, batch_size=500_000, out_dir="labeled_chunks"):
+def preprocess_and_save_batches(df, window_size=150, threshold=0.002, lookahead_period=10, batch_size=500_000, out_dir="labeled_chunks"):
     os.makedirs(out_dir, exist_ok=True)
 
+    # --- Feature Engineering ---
     df['body'] = df['close'] - df['open']
     df['range'] = df['high'] - df['low']
     df['upper_wick'] = df['high'] - df[['close', 'open']].max(axis=1)
@@ -22,9 +23,22 @@ def preprocess_and_save_batches(df, window_size=150, threshold=0.02, batch_size=
     df['vol_change'] = df['volume'].pct_change()
     df.dropna(inplace=True)
 
-    df['target'] = (df['close'].shift(-1) - df['close']) / df['close']
-    df['label'] = (df['target'] > threshold).astype(int)
-    df.dropna(inplace=True)
+    # --- New, more robust labeling strategy ---
+    # Find the peak price over the next 'lookahead_period' minutes.
+    future_highs = df['high'].rolling(window=lookahead_period).max().shift(-lookahead_period) #
+    
+    # The target is the potential return if we sell at that future peak.
+    df['target'] = (future_highs - df['close']) / df['close'] #
+    
+    # The label is 1 if that potential return exceeds our threshold.
+    df['label'] = (df['target'] > threshold).astype(int) #
+    
+    # Drop NaNs created by the lookahead shift.
+    df.dropna(inplace=True) #
+    
+    print("--- Label Distribution ---")
+    print(df['label'].value_counts(normalize=True))
+    print("--------------------------")
 
     feature_cols = [
         'open', 'high', 'low', 'close', 'body', 'range',
@@ -59,8 +73,8 @@ def preprocess_and_save_batches(df, window_size=150, threshold=0.02, batch_size=
 
     print(f"✅ Completed batching. Total batches: {batch_idx + 1}")
 
-def load_all_chunks(folder='eth_1s_data'):
-    files = sorted(glob(os.path.join(folder, '*.csv')))
+def load_all_chunks(folder='eth_1m_data'):
+    files = sorted(glob(os.path.join(folder, '*.csv'))) #
     if not files:
         raise ValueError(f"No CSV files found in directory: {folder}")
 
@@ -79,6 +93,12 @@ def load_all_chunks(folder='eth_1s_data'):
     combined = combined[~combined.index.duplicated()].sort_index()
     return combined
 
-if __name__ == "__main__":
+def generate_labels():
+    """
+    Main function to load historical data and generate labeled batches.
+    """
     df = load_all_chunks()
-    preprocess_and_save_batches(df, window_size=150, threshold=0.02)
+    preprocess_and_save_batches(df, window_size=150, threshold=0.002, lookahead_period=10)
+
+if __name__ == "__main__":
+    generate_labels()

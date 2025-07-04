@@ -1,8 +1,10 @@
 from glob import glob
 import os
 import pandas as pd
+import numpy as np
 
-def load_ohlc_chunks(folder='eth_1s_data'):
+def load_ohlc_chunks(folder='eth_1m_data'):
+    # --- CORRECTED: Updated glob pattern to find new 1-minute data files ---
     files = sorted(glob(os.path.join(folder, '*.csv')))
     
     if not files:
@@ -24,15 +26,19 @@ def load_ohlc_chunks(folder='eth_1s_data'):
     if not dfs:
         raise ValueError("No valid dataframes to concatenate. Please check your CSV files.")
 
+    # Concatenate, sort, and remove any potential duplicates from overlapping files
     df = pd.concat(dfs).sort_index()
-    df = df[~df.index.duplicated()]
+    df = df[~df.index.duplicated(keep='last')]
     return df
 
 def compute_rsi(series, period=14):
+    """Computes a more stable Relative Strength Index (RSI)."""
     delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    gain = delta.where(delta > 0, 0).rolling(period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(period).mean()
+    
+    # --- CORRECTED: Add epsilon to prevent division by zero ---
+    rs = gain / (loss + 1e-9) 
+    
+    rsi = 100 - (100 / (1 + rs))
+    return rsi

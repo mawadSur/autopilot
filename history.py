@@ -10,86 +10,70 @@ api_key = os.getenv("BINANCE_KEY")
 api_secret = os.getenv("BINANCE_SECRET")
 client = Client(api_key, api_secret)
 
-OUTPUT_DIR = "eth_1s_data"
+# --- CORRECTED: Changed to 1-minute data for consistency and noise reduction ---
+OUTPUT_DIR = "eth_1m_data"
 SYMBOL = "ETHUSDT"
-INTERVAL = Client.KLINE_INTERVAL_1SECOND
-CHUNK_SECONDS = 60 * 60 * 24  # 1 day = 86400 seconds
+INTERVAL = Client.KLINE_INTERVAL_1MINUTE
 LIMIT = 1000  # Max rows per Binance call
 
 def ensure_output_dir():
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
 
-def get_output_filename(start_ts):
-    dt = datetime.utcfromtimestamp(start_ts / 1000).strftime('%Y-%m-%d')
-    return os.path.join(OUTPUT_DIR, f"eth_1s_{dt}.csv")
+def get_output_filename(dt_object):
+    # --- CORRECTED: Changed filename format for clarity with monthly files ---
+    return os.path.join(OUTPUT_DIR, f"eth_1m_{dt_object.strftime('%Y-%m')}.csv")
 
-def file_already_exists(start_ts):
-    return os.path.exists(get_output_filename(start_ts))
-
-def fetch_chunk(start_ms, end_ms):
-    """Fetch one full day's worth of 1-second data."""
-    all_rows = []
-    current_ms = start_ms
-
-    while current_ms < end_ms:
-        try:
-            klines = client.get_klines(
-                symbol=SYMBOL,
-                interval=INTERVAL,
-                startTime=current_ms,
-                limit=LIMIT
-            )
-            if not klines:
-                break
-
-            for k in klines:
-                all_rows.append({
-                    "timestamp": k[0],
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4]),
-                    "volume": float(k[5])
-                })
-
-            last_ts = klines[-1][0]
-            current_ms = last_ts + 1000
-            time.sleep(0.25)
-
-        except Exception as e:
-            print(f"❌ Error during fetch: {e}")
-            time.sleep(2)
-
-    return all_rows
-
-def run_backfill(start_days_ago=365):
+def fetch_historical_data(start_days_ago=730): # Default to ~2 years
+    """
+    Fetches historical 1-minute data and saves it, appending to existing files.
+    """
     ensure_output_dir()
-    now = datetime.utcnow().replace(microsecond=0, second=0, minute=0)
+    now = datetime.utcnow()
     start_date = now - timedelta(days=start_days_ago)
+    
+    # Use the get_historical_klines generator for efficient fetching
+    klines = client.get_historical_klines_generator(SYMBOL, INTERVAL, start_date.strftime("%d %b, %Y"))
 
-    current = start_date
+    df = pd.DataFrame(klines, columns=[
+        'open_time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_asset_volume', 'num_trades',
+        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+    ])
+    
+    if df.empty:
+        print("⚠️ No data fetched. Please check your start date and symbol.")
+        return
 
-    while current < now:
-        start_ts = int(current.timestamp() * 1000)
-        end_ts = int((current + timedelta(days=1)).timestamp() * 1000)
-        out_path = get_output_filename(start_ts)
+    # --- Data Cleaning and Type Conversion ---
+    df['date'] = pd.to_datetime(df['open_time'], unit='ms')
+    df.drop(columns=['open_time', 'close_time', 'ignore'], inplace=True)
+    numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_asset_volume', 'num_trades', 
+                    'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume']
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col])
 
-        if file_already_exists(start_ts):
-            print(f"✅ Skipping existing: {out_path}")
+    df.set_index('date', inplace=True)
+    
+    # --- Save data into monthly chunks ---
+    df['year_month'] = df.index.strftime('%Y-%m')
+    
+    for month in df['year_month'].unique():
+        month_df = df[df['year_month'] == month].drop(columns=['year_month'])
+        out_path = os.path.join(OUTPUT_DIR, f"eth_1m_{month}.csv")
+        
+        # Append to existing file or create new one
+        if os.path.exists(out_path):
+            existing_df = pd.read_csv(out_path, index_col='date', parse_dates=True)
+            combined_df = pd.concat([existing_df, month_df])
+            combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
+            combined_df.sort_index(inplace=True)
+            combined_df.to_csv(out_path)
+            print(f"🔄 Appended {len(month_df)} rows to {out_path}")
         else:
-            print(f"📥 Fetching: {current.date()}...")
-            data = fetch_chunk(start_ts, end_ts)
-            if data:
-                df = pd.DataFrame(data)
-                df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
-                df.set_index('date', inplace=True)
-                df.to_csv(out_path)
-                print(f"✅ Saved {len(df)} rows → {out_path}")
-            else:
-                print(f"⚠️ No data for {current.date()}")
-
-        current += timedelta(days=1)
+            month_df.to_csv(out_path)
+            print(f"✅ Saved {len(month_df)} rows to {out_path}")
 
 if __name__ == "__main__":
-    run_backfill(start_days_ago=365)
+    # Fetch historical data, which is more efficient for backfilling
+    fetch_historical_data(start_days_ago=730)

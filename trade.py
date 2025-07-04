@@ -1,114 +1,94 @@
 import os
 import time
-import pandas as pd
-import numpy as np
-from datetime import datetime
-from tensorflow.keras.models import load_model
+import logging
 from binance.client import Client
 from binance.enums import *
-from utils import compute_rsi
+from dotenv import load_dotenv
+from run_live_check import SignalGenerator
 
-# === Binance Credentials ===
-API_KEY = os.getenv('BINANCE_API_KEY')
-API_SECRET = os.getenv('BINANCE_API_SECRET')
+# ==== CONFIG ====
+TRADE_SYMBOL = 'ETHUSDT'
+TRADE_QUANTITY_USDT = 15  # Example: trade with $15 worth of ETH
+
+# ==== ENV & Logging ====
+load_dotenv()
+API_KEY = os.getenv("BINANCE_KEY")
+API_SECRET = os.getenv("BINANCE_SECRET")
 client = Client(API_KEY, API_SECRET)
-
-# === Load Model ===
-model = load_model('eth_lstm_model.h5')
-
-# === Feature Engineering ===
+logging.basicConfig(filename='live_trade_log.txt', level=logging.INFO, format='%(asctime)s - %(message)s')
 
 
-def engineer_features(df):
-    df['body'] = df['close'] - df['open']
-    df['range'] = df['high'] - df['low']
-    df['upper_wick'] = df['high'] - df[['close', 'open']].max(axis=1)
-    df['lower_wick'] = df[['close', 'open']].min(axis=1) - df['low']
-    df['return'] = df['close'].pct_change()
-    df['sma_10'] = df['close'].rolling(10).mean()
-    df['sma_50'] = df['close'].rolling(50).mean()
-    df['sma_ratio'] = df['sma_10'] / df['sma_50'] - 1
-    df['ema_20'] = df['close'].ewm(span=20).mean()
-    df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
-    df['rsi_14'] = compute_rsi(df['close'], 14)
-    df['vol_change'] = df['volume'].pct_change()
-    df.dropna(inplace=True)
-    return df
+def trade_live(interval=60):
+    """
+    Runs the live trading bot using the SignalGenerator.
+    """
+    position_open = False
+    
+    # 1. Initialize the Signal Generator
+    print("Initializing Signal Generator for LIVE trading...")
+    signal_gen = SignalGenerator(
+        model_path='eth_lstm_model.h5', 
+        scaler_path='scaler.pkl', 
+        meta_path='model_meta.json'
+    )
+    
+    # 2. Pre-fill history buffer
+    print(f"Pre-filling history buffer with the last {signal_gen.history_size} minutes of data...")
+    klines = client.get_klines(symbol=TRADE_SYMBOL, interval=KLINE_INTERVAL_1MINUTE, limit=signal_gen.history_size)
+    for kline in klines:
+        kline_data = {
+            'open': float(kline[1]), 'high': float(kline[2]), 
+            'low': float(kline[3]), 'close': float(kline[4]), 
+            'volume': float(kline[5])
+        }
+        signal_gen.history.append(kline_data)
 
-def prepare_input(df, window_size=60):
-    df = engineer_features(df)
-    feature_cols = [
-        'open', 'high', 'low', 'close', 'body', 'range',
-        'upper_wick', 'lower_wick', 'return', 'sma_ratio',
-        'ema_20', 'macd', 'rsi_14', 'vol_change'
-    ]
-    recent = df[feature_cols].values[-window_size:]
-    return np.expand_dims(recent, axis=0), df['close'].iloc[-1]
+    print("✅ History buffer filled. Starting live trading loop...")
 
-# === Fetch ETH OHLCV ===
-def fetch_eth_ohlcv(minutes=80):
-    klines = client.get_klines(symbol='ETHUSDT', interval=KLINE_INTERVAL_1MINUTE, limit=minutes)
-    df = pd.DataFrame(klines, columns=[
-        'open_time', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_asset_volume', 'num_trades',
-        'taker_buy_base_volume', 'taker_buy_quote_volume', 'ignore'
-    ])
-    df['date'] = pd.to_datetime(df['open_time'], unit='ms')
-    df.set_index('date', inplace=True)
-    df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
-    return df
-
-# === Trade Handler ===
-def trade_live(log_path="trade_log.csv", portfolio_pct=0.1, iterations=20, interval=60):
-    account_info = client.get_account()
-    balances = {asset['asset']: float(asset['free']) for asset in account_info['balances']}
-    usdt_balance = balances.get('USDT', 0.0)
-
-    if usdt_balance == 0.0:
-        print("❌ No USDT available in your Binance account.")
-        return
-
-    df_log = []
-
-    for i in range(iterations):
+    while True:
         try:
-            df = fetch_eth_ohlcv()
-            X, current_price = prepare_input(df)
-            prediction = model.predict(X)[0][0]
+            # 3. Get the latest kline
+            latest_kline = client.get_klines(symbol=TRADE_SYMBOL, interval=KLINE_INTERVAL_1MINUTE, limit=1)[0]
+            new_kline_data = {
+                'open': float(latest_kline[1]), 'high': float(latest_kline[2]),
+                'low': float(latest_kline[3]), 'close': float(latest_kline[4]),
+                'volume': float(latest_kline[5])
+            }
 
-            print(f"[{i+1}] Prediction: {prediction:.4f} | Price: {current_price:.2f} | USDT Balance: ${usdt_balance:.2f}")
+            if not position_open:
+                # 4. Get signal if we are looking to enter a position
+                result = signal_gen.get_signal(new_kline_data)
+                
+                current_price = new_kline_data['close']
+                print(f"Price: {current_price:.2f} | Confidence: {result['confidence']} | Signal: {result['signal']}")
 
-            if prediction > 0.7:
-                usd_position = usdt_balance * portfolio_pct
-                eth_bought = usd_position / current_price
-                sell_price = current_price * 1.01  # simulate 1% gain
-                pnl = eth_bought * (sell_price - current_price)
-                usdt_balance += pnl
-
-                print(f"✅ BUY → SELL | Entry: {current_price:.2f} → Exit: {sell_price:.2f} | PnL: ${pnl:.2f}")
-                df_log.append({
-                    'iteration': i + 1,
-                    'entry_price': current_price,
-                    'exit_price': sell_price,
-                    'eth_traded': eth_bought,
-                    'prediction': prediction,
-                    'pnl': pnl,
-                    'balance': usdt_balance,
-                    'timestamp': datetime.utcnow()
-                })
+                if result.get("signal") == 1:
+                    # --- EXECUTE BUY ORDER ---
+                    print(f"🚀 BUY signal received! Executing market buy for {TRADE_QUANTITY_USDT} USDT...")
+                    # To place a real order, uncomment the following lines:
+                    # order = client.create_order(
+                    #     symbol=TRADE_SYMBOL,
+                    #     side=SIDE_BUY,
+                    #     type=ORDER_TYPE_MARKET,
+                    #     quoteOrderQty=TRADE_QUANTITY_USDT
+                    # )
+                    # logging.info(f"BUY ORDER PLACED: {order}")
+                    print("--- (Simulated Buy for Safety) ---")
+                    position_open = True
             else:
-                print(f"🚫 Skipped trade — confidence too low.")
+                # --- LOGIC TO CHECK FOR EXIT ---
+                # (You would add your take-profit/stop-loss logic here)
+                print("Position is open. Waiting for exit condition...")
+                # For this example, we'll just wait for the next interval.
+                # In a real system, you'd check if the price hit your TP/SL.
 
         except Exception as e:
-            print(f"❌ Error: {e}")
+            error_msg = f"An error occurred: {e}"
+            print(f"❌ {error_msg}")
+            logging.error(error_msg)
 
         time.sleep(interval)
 
-    # Save log
-    log_df = pd.DataFrame(df_log)
-    log_df.to_csv(log_path, index=False)
-    print(f"📦 Saved trade log to {log_path}")
-
-
-# === Main ===
-trade_live()
+# ==== Entry ====
+if __name__ == "__main__":
+    trade_live()
