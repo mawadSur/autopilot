@@ -31,15 +31,15 @@ print(device_lib.list_local_devices())
 WINDOW_SIZE = 150
 BATCH_SIZE = 50000
 FIXED_BATCH_SIZE = 16
-EPOCHS_PER_CHUNK = 3
-THRESHOLD = 0.002 # Corrected: A more realistic threshold
-LOOKAHEAD_PERIOD = 10 # Corrected: How many minutes to look into the future for a peak
+EPOCHS_PER_CHUNK = 100
+LOOKAHEAD_PERIOD = 10 # How many minutes to look into the future for a peak
 
-# --- CORRECTED: Added 'atr' for volatility measurement ---
+# --- UPDATED: Added new features for trend and volatility potential ---
 FEATURE_COLS = [
     'open', 'high', 'low', 'close', 'body', 'range',
     'upper_wick', 'lower_wick', 'return', 'sma_ratio',
-    'ema_20', 'macd', 'rsi_14', 'vol_change', 'atr'
+    'ema_20', 'macd', 'rsi_14', 'vol_change', 'atr',
+    'price_vs_hourly_trend', 'bb_width' # New features
 ]
 
 # ==== Helper Function for ATR ====
@@ -53,7 +53,7 @@ def compute_atr(df, period=14):
     return atr
 
 # ==== Preprocessing ====
-def preprocess_chunk(df, window_size=WINDOW_SIZE, threshold=THRESHOLD, scaler=None):
+def preprocess_chunk(df, window_size=WINDOW_SIZE, scaler=None):
     df = df.copy()
     # --- Feature Engineering ---
     df['body'] = df['close'] - df['open']
@@ -68,16 +68,31 @@ def preprocess_chunk(df, window_size=WINDOW_SIZE, threshold=THRESHOLD, scaler=No
     df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
     df['rsi_14'] = compute_rsi(df['close'], 14)
     df['vol_change'] = df['volume'].pct_change()
-    df['atr'] = compute_atr(df) # CORRECTED: Added ATR feature
+    df['atr'] = compute_atr(df)
+
+    # --- NEW: Multi-Timeframe and Volatility Features ---
+    # Resample to a longer timeframe to get the bigger trend
+    df_hourly = df['close'].resample('1H').mean()
+    hourly_ema = df_hourly.ewm(span=20).mean()
+    df['hourly_ema_20'] = hourly_ema.reindex(df.index, method='ffill')
+    df['price_vs_hourly_trend'] = (df['close'] - df['hourly_ema_20']) / df['hourly_ema_20']
+
+    # Bollinger Band Width to identify volatility "squeeze"
+    df['bb_std'] = df['close'].rolling(20).std()
+    df['bb_mid'] = df['close'].rolling(20).mean()
+    df['bb_width'] = ((df['bb_mid'] + 2 * df['bb_std']) - (df['bb_mid'] - 2 * df['bb_std'])) / df['bb_mid']
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
 
-    # --- CORRECTED: Switched to a more robust labeling strategy ---
+    # --- NEW: Volatility-Adjusted Labeling ---
+    atr_multiplier = 3.0 # Target a move of 3x the Average True Range
+    dynamic_threshold = df['atr'] * atr_multiplier / df['close']
+
     future_highs = df['high'].rolling(window=LOOKAHEAD_PERIOD).max().shift(-LOOKAHEAD_PERIOD)
     df['target'] = (future_highs - df['close']) / df['close']
-    df['label'] = (df['target'] > threshold).astype(int)
-    
+    df['label'] = (df['target'] > dynamic_threshold).astype(int)
+
     print("🔍 Label distribution:", np.bincount(df['label']))
     print(f"✅ Positive ratio: {df['label'].mean():.4f}")
     df.dropna(inplace=True)
@@ -128,15 +143,13 @@ def build_lstm_model(input_shape, batch_size):
 
 # ==== Training ====
 def train_model():
-    # --- CORRECTED: Load from the 1-minute data folder ---
-    df = load_ohlc_chunks(folder='eth_1m_data') 
+    df = load_ohlc_chunks(folder='eth_1m_data')
     chunk_size = BATCH_SIZE + WINDOW_SIZE
     num_chunks = (len(df) - WINDOW_SIZE) // BATCH_SIZE
 
     checkpoint_file = "training_checkpoint.json"
     model_file = "eth_lstm_model.h5"
 
-    # Load checkpoint
     start_chunk = 0
     if os.path.exists(checkpoint_file):
         with open(checkpoint_file, "r") as f:
@@ -144,11 +157,9 @@ def train_model():
             start_chunk = checkpoint.get("last_completed_chunk", 0) + 1
         print(f"🔁 Resuming from chunk {start_chunk}")
 
-    # Fit and save scaler on a sample of the data
-    sample_df = df.sample(min(200000, len(df))) # Increased sample size
+    sample_df = df.sample(min(200000, len(df)))
     sample_X, _ = preprocess_chunk(sample_df)
     scaler = StandardScaler()
-    # Reshape to 2D for the scaler and back to 3D
     scaler.fit(sample_X.reshape(-1, sample_X.shape[-1]))
     joblib.dump(scaler, 'scaler.pkl')
     print("✅ Scaler saved to scaler.pkl")
@@ -161,16 +172,13 @@ def train_model():
         chunk = df.iloc[i * BATCH_SIZE: i * BATCH_SIZE + chunk_size].copy()
         X, y = preprocess_chunk(chunk, scaler=scaler)
 
-        # Ensure data length is a multiple of the batch size
         excess = len(X) % FIXED_BATCH_SIZE
         if excess > 0:
             X = X[:-excess]
             y = y[:-excess]
 
-        # Train/Val Split, ensuring stratification
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, stratify=y)
         
-        # Trim both sets to be multiples of the fixed batch size
         def trim_batch(X, y, batch_size):
             excess = len(X) % batch_size
             if excess > 0:
@@ -200,7 +208,6 @@ def train_model():
                 verbose=1
             )
             
-            # CORRECTED: Loop through layers to reset states individually
             for layer in model.layers:
                 if hasattr(layer, 'reset_states'):
                     layer.reset_states()
@@ -210,7 +217,6 @@ def train_model():
                 json.dump({"last_completed_chunk": i}, f)
             print(f"✅ Checkpoint saved after chunk {i}")
 
-            # Collect predictions on validation set for final evaluation
             if len(X_val) > 0:
                 sample_probs = model.predict(X_val, batch_size=FIXED_BATCH_SIZE).flatten()
                 all_probs.extend(sample_probs)
@@ -220,12 +226,10 @@ def train_model():
             print(f"❌ GPU OOM error: {e}")
             break
 
-    # === Evaluation across all chunks ===
     if all_probs:
         probs = np.array(all_probs)
         y_test = np.array(all_true)
         
-        # Find the threshold that gives the best balance between true positive and false positive rates
         fpr, tpr, thresholds = roc_curve(y_test, probs)
         best_idx = np.argmax(tpr - fpr)
         best_threshold = float(thresholds[best_idx])
