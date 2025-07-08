@@ -6,5 +6,9 @@ pandas
 python-binance
 setuptools
 wheel
-tensorflow==2.15
 tqdm
+tensorflow
+numpy
+torch --index-url https://download.pytorch.org/whl/cpu
+typing-extensions>=4.7.0
+joblib

@@ -31,7 +31,7 @@ print(device_lib.list_local_devices())
 WINDOW_SIZE = 150
 BATCH_SIZE = 50000
 FIXED_BATCH_SIZE = 16
-EPOCHS_PER_CHUNK = 100
+EPOCHS_PER_CHUNK = 3
 LOOKAHEAD_PERIOD = 10 # How many minutes to look into the future for a peak
 
 # --- UPDATED: Added new features for trend and volatility potential ---
@@ -72,7 +72,7 @@ def preprocess_chunk(df, window_size=WINDOW_SIZE, scaler=None):
 
     # --- NEW: Multi-Timeframe and Volatility Features ---
     # Resample to a longer timeframe to get the bigger trend
-    df_hourly = df['close'].resample('1H').mean()
+    df_hourly = df['close'].resample('1h').mean()
     hourly_ema = df_hourly.ewm(span=20).mean()
     df['hourly_ema_20'] = hourly_ema.reindex(df.index, method='ffill')
     df['price_vs_hourly_trend'] = (df['close'] - df['hourly_ema_20']) / df['hourly_ema_20']

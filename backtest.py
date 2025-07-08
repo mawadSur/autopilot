@@ -11,7 +11,10 @@ def run_signal_generation(output_path='eth_signals.csv'):
     print("📈 Starting signal generation process...")
     
     # 1. Load all historical data
-    df_full = load_ohlc_chunks()
+    # This should match the path used in launch_sagemaker_job.py.
+    local_data_path = 'eth_1m_data' 
+    data_generator = load_ohlc_chunks(folder=local_data_path, chunk_mode=True)
+    df_full = pd.concat(data_generator, ignore_index=True)
     
     # 2. Initialize the Signal Generator
     signal_gen = SignalGenerator(
