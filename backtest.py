@@ -1,52 +1,50 @@
+# backtest.py
+import os
 import pandas as pd
 from tqdm import tqdm
-from utils import load_ohlc_chunks
-from run_live_check import SignalGenerator
+
+# --- CORRECTED IMPORTS ---
+from utils import load_ohlc_chunks, SignalGenerator
 
 def run_signal_generation(output_path='eth_signals.csv'):
     """
-    Loads historical data, generates signals for each timestep, 
+    Loads historical data, generates signals for each timestep using the SageMaker endpoint,
     and saves the combined data to a CSV for backtesting.
     """
     print("📈 Starting signal generation process...")
     
     # 1. Load all historical data
-    # This should match the path used in launch_sagemaker_job.py.
     local_data_path = 'eth_1m_data' 
     data_generator = load_ohlc_chunks(folder=local_data_path, chunk_mode=True)
     df_full = pd.concat(data_generator, ignore_index=True)
     
-    # 2. Initialize the Signal Generator
-    signal_gen = SignalGenerator(
-        model_path='eth_lstm_model.h5', 
-        scaler_path='scaler.pkl', 
-        meta_path='model_meta.json'
-    )
+    # --- CORRECTED INITIALIZATION ---
+    # 2. Initialize the Signal Generator to use the SageMaker Endpoint
+    # !!! IMPORTANT: Replace this with your actual endpoint name !!!
+    ENDPOINT_NAME = os.getenv("ENDPOINT_NAME")
+    signal_gen = SignalGenerator(endpoint_name=ENDPOINT_NAME)
     
     results = []
     
-    # 3. Iterate through the historical data and generate signals
     print(f"Generating signals for {len(df_full)} data points. This may take a while...")
     
-    # Use tqdm for a progress bar
+    # 3. Iterate through the historical data and generate signals
     for index, row in tqdm(df_full.iterrows(), total=df_full.shape[0]):
+        # The SignalGenerator needs a dictionary with these keys
         kline_data = {
-            'open': row['open'], 'high': row['high'],
-            'low': row['low'], 'close': row['close'],
+            'date': row['date'], # Pass the date for feature engineering
+            'open': row['open'], 
+            'high': row['high'],
+            'low': row['low'], 
+            'close': row['close'],
             'volume': row['volume']
         }
         
-        # Get signal for the current kline
         signal_result = signal_gen.get_signal(kline_data)
         
-        # Append results
         results.append({
-            'date': index,
-            'open': row['open'],
-            'high': row['high'],
-            'low': row['low'],
+            'date': row['date'],
             'close': row['close'],
-            'volume': row['volume'],
             'signal': signal_result.get('signal', 0),
             'confidence': signal_result.get('confidence')
         })
@@ -60,7 +58,7 @@ def run_signal_generation(output_path='eth_signals.csv'):
     
     print(f"✅ Signal generation complete. File saved to {output_path}.")
     print("\n--- Signal Distribution ---")
-    print(df_results['signal'].value_counts())
+    print(df_results['signal'].value_counts(normalize=True))
     print("--------------------------")
 
 if __name__ == '__main__':

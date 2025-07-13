@@ -52,7 +52,7 @@ def preprocess_data(df, feature_cols, window_size, lookahead_period):
     df['sma_ratio'] = df['sma_10'] / df['sma_50'] - 1; df['ema_20'] = df['close'].ewm(span=20).mean()
     df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
     df['rsi_14'] = compute_rsi(df['close'], 14); df['vol_change'] = df['volume'].pct_change()
-    df['atr'] = compute_atr(df); df_hourly = df['close'].resample('1H').mean()
+    df['atr'] = compute_atr(df); df_hourly = df['close'].resample('1h').mean()
     hourly_ema = df_hourly.ewm(span=20).mean()
     df['hourly_ema_20'] = hourly_ema.reindex(df.index, method='ffill')
     df['price_vs_hourly_trend'] = (df['close'] - df['hourly_ema_20']) / df['hourly_ema_20']
