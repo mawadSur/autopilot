@@ -12,3 +12,7 @@ numpy
 torch --index-url https://download.pytorch.org/whl/cpu
 typing-extensions>=4.7.0
 joblib
+sagemaker
+boto3
+uvicorn
+fastapi
