@@ -30,19 +30,22 @@ def compute_atr(df, period=14):
     return df['tr'].rolling(period).mean()
 
 def preprocess_data(df, feature_cols, window_size, lookahead_period):
-    df = df.copy() # This line requires df to be a DataFrame, not a generator
+    df = df.copy()
     timestamp_column = 'date'
     
-    # --- PERMANENT FIX STARTS HERE ---
-    # 1. Coerce errors: Turn any un-parseable dates into 'NaT' (Not a Time) instead of crashing.
+    # Coerce errors: Turn any un-parseable dates into 'NaT' (Not a Time).
     df[timestamp_column] = pd.to_datetime(df[timestamp_column], errors='coerce')
     
-    # 2. Drop rows with 'NaT' in the date column, effectively removing bad data.
+    # Drop rows with 'NaT' in the date column.
     original_rows = len(df)
     df.dropna(subset=[timestamp_column], inplace=True)
     if len(df) < original_rows:
         print(f"Dropped {original_rows - len(df)} rows with invalid date formats.")
-    # --- PERMANENT FIX ENDS HERE ---
+    
+    # --- FIX: Check if data remains after cleaning ---
+    if df.empty:
+        raise ValueError("All rows were dropped due to invalid date formats. Halting training. Please check your source CSV files in 'eth_1m_data'.")
+
     df.set_index(timestamp_column, inplace=True)
     df['body'] = df['close'] - df['open']; df['range'] = df['high'] - df['low']
     df['upper_wick'] = df['high'] - df[['close', 'open']].max(axis=1)
@@ -63,11 +66,21 @@ def preprocess_data(df, feature_cols, window_size, lookahead_period):
     df['target'] = (future_highs - df['close']) / df['close']
     df['label'] = (df['target'] > dynamic_threshold).astype(int)
     df.replace([np.inf, -np.inf], 0, inplace=True); df.dropna(inplace=True)
+
+    # --- FIX: Check if data remains after feature engineering ---
+    if df.empty:
+        raise ValueError("All rows were dropped after feature engineering (due to NaNs in rolling windows). Halting training. You may need more initial data.")
+        
     scaler = StandardScaler(); df[feature_cols] = scaler.fit_transform(df[feature_cols])
     X, y = [], []
     for i in range(len(df) - window_size):
         X.append(df.iloc[i:i+window_size][feature_cols].values)
         y.append(df.iloc[i+window_size-1]['label'])
+
+    # --- FIX: Check if any sequences were created ---
+    if not X:
+        raise ValueError(f"Not enough data to create sequences of window size {window_size}. Data length after cleaning is {len(df)}. Halting training.")
+
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32), scaler
 
 def debug_date_parsing(df):
@@ -124,7 +137,6 @@ def main(args):
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
-    # Early Stopping Initialization
     best_val_loss = float('inf')
     patience_counter = 0
     best_model_path = os.path.join(args.model_dir, "best_model.pth")
@@ -140,7 +152,6 @@ def main(args):
             loss.backward()
             optimizer.step()
 
-        # Validation Loop
         model.eval()
         val_loss, val_correct, val_total = 0, 0, 0
         with torch.no_grad():
@@ -156,7 +167,6 @@ def main(args):
         val_accuracy = (val_correct / val_total) * 100
         print(f"Epoch [{epoch+1}/{args.epochs}], Validation Loss: {avg_val_loss:.4f}, Validation Accuracy: {val_accuracy:.2f}%")
 
-        # Early Stopping Check
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
@@ -170,7 +180,6 @@ def main(args):
             print("Early stopping triggered.")
             break
 
-    # Final Evaluation on Test Set
     print("\nTraining finished. Evaluating best model on the test set...")
     model.load_state_dict(torch.load(best_model_path))
     model.eval()

@@ -2,8 +2,7 @@
 import os
 import pandas as pd
 from tqdm import tqdm
-
-# --- CORRECTED IMPORTS ---
+from dotenv import load_dotenv
 from utils import load_ohlc_chunks, SignalGenerator
 
 def run_signal_generation(output_path='eth_signals.csv'):
@@ -17,11 +16,25 @@ def run_signal_generation(output_path='eth_signals.csv'):
     local_data_path = 'eth_1m_data' 
     data_generator = load_ohlc_chunks(folder=local_data_path, chunk_mode=True)
     df_full = pd.concat(data_generator, ignore_index=True)
+
+    # --- FIX: Robust Date Parsing ---
+    # Handle potentially mixed date formats from different CSV files.
+    # 'coerce' will turn any unparseable dates into NaT (Not a Time).
+    print("Standardizing date formats...")
+    df_full['date'] = pd.to_datetime(df_full['date'], errors='coerce')
+
+    # Drop any rows that had unparseable dates to prevent errors downstream
+    original_rows = len(df_full)
+    df_full.dropna(subset=['date'], inplace=True)
+    if len(df_full) < original_rows:
+        print(f"⚠️ Dropped {original_rows - len(df_full)} rows with invalid date formats.")
     
-    # --- CORRECTED INITIALIZATION ---
     # 2. Initialize the Signal Generator to use the SageMaker Endpoint
-    # !!! IMPORTANT: Replace this with your actual endpoint name !!!
+    load_dotenv()
     ENDPOINT_NAME = os.getenv("ENDPOINT_NAME")
+    if not ENDPOINT_NAME:
+        raise ValueError("ENDPOINT_NAME environment variable not set. Please set it to your SageMaker endpoint name.")
+        
     signal_gen = SignalGenerator(endpoint_name=ENDPOINT_NAME)
     
     results = []

@@ -60,13 +60,19 @@ def predict_fn(input_data, model_artifacts):
     scaler = model_artifacts["scaler"]
     device = model_artifacts["device"]
     
-    input_data = input_data.to(device)
+    # --- FIX: Convert tensor to numpy before scaling ---
+    # The scaler.transform() function expects a numpy array, not a torch tensor.
+    # We must convert the tensor to a numpy array first.
+    numpy_input = input_data.cpu().numpy()
     
     # Reshape for scaling, scale, and reshape back
-    num_timesteps, num_features = input_data.shape[1], input_data.shape[2]
-    reshaped_input = input_data.reshape(-1, num_features)
+    num_timesteps, num_features = numpy_input.shape[1], numpy_input.shape[2]
+    reshaped_input = numpy_input.reshape(-1, num_features)
     scaled_input = scaler.transform(reshaped_input)
-    input_tensor = torch.from_numpy(scaled_input).reshape(1, num_timesteps, num_features).to(device)
+    
+    # Convert back to a tensor for the model
+    input_tensor = torch.from_numpy(scaled_input).reshape(1, num_timesteps, num_features).to(torch.float32)
+    input_tensor = input_tensor.to(device)
 
     with torch.no_grad():
         prediction = model(input_tensor)
