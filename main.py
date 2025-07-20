@@ -161,7 +161,7 @@ async def run_paper_trade_simulation(job_id: str, params: PaperTradeRequest):
     """
     This function runs in the background to simulate paper trading.
     """
-    client = Client() # Testnet or live client can be configured here
+    client = get_client_binance() # Testnet or live client can be configured here
     job = paper_trade_jobs[job_id]
     
     position_open = False
@@ -241,7 +241,7 @@ async def websocket_signal_stream(websocket: WebSocket):
     Streams the latest signal and confidence level every 5 seconds.
     """
     await websocket.accept()
-    client = Client()
+    client = get_client_binance()
     try:
         while True:
             klines = client.get_klines(symbol='ETHUSDT', interval=Client.KLINE_INTERVAL_1MINUTE, limit=200)

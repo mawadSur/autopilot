@@ -6,13 +6,13 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from binance.client import Client
 from dotenv import load_dotenv
-from utils import SignalGenerator
+from utils import SignalGenerator, get_client_binance
 
 # --- Setup ---
 load_dotenv()
 ENDPOINT_NAME = os.getenv("ENDPOINT_NAME")
 signal_gen = SignalGenerator(endpoint_name=ENDPOINT_NAME)
-client = Client()
+client = get_client_binance()
 
 # --- Pre-fill history buffer ---
 print("Pre-filling history buffer...")
