@@ -2,142 +2,188 @@ import os
 import argparse
 import pandas as pd
 import numpy as np
+import joblib
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-import joblib
-import json
+from sklearn.preprocessing import StandardScaler
 
-from utils import load_ohlc_chunks, compute_rsi
+# ==============================================================================
+# 1. DATA LOADING & PREPROCESSING
+# ==============================================================================
 
-# --- Model and Preprocessing ---
+def load_ohlc_chunks(folder, chunk_mode=False):
+    """Loads and concatenates CSV files from a directory."""
+    print(f"[DEBUG] Loading data from: {folder}")
+    files = []
+    for dirpath, _, filenames in os.walk(folder):
+        for f in filenames:
+            if f.endswith('.csv'):
+                files.append(os.path.join(dirpath, f))
+
+    if not files:
+        raise FileNotFoundError(f"No .csv files found recursively in folder: {folder}")
+
+    column_names = ['date', 'open', 'high', 'low', 'close', 'volume']
+    numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+    
+    all_dfs = []
+    for f in sorted(files):
+        try:
+            df = pd.read_csv(f, header=None, names=column_names)
+            for col in numeric_cols:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            df.dropna(inplace=True)
+            
+            if not df.empty:
+                if chunk_mode:
+                    yield df
+                else:
+                    all_dfs.append(df)
+        except Exception as e:
+            print(f"[ERROR] Could not process file {f}: {e}")
+
+    if not chunk_mode:
+        if not all_dfs:
+            return pd.DataFrame() 
+        return pd.concat(all_dfs, ignore_index=True)
+
+def debug_date_parsing(df):
+    """Helper to debug date parsing issues."""
+    df['date'] = pd.to_datetime(df['date'], unit='ms', errors='coerce')
+    if df['date'].isnull().any():
+        print("Warning: Null dates found after parsing.")
+        df.dropna(subset=['date'], inplace=True)
+    df.set_index('date', inplace=True)
+    df.sort_index(inplace=True)
+    if not df.index.is_monotonic_increasing:
+        print("Warning: Index is not monotonically increasing.")
+        df = df[~df.index.duplicated(keep='first')]
+    return df.reset_index()
+
+def compute_rsi(series, period=14):
+    """Compute RSI."""
+    delta = series.diff(1)
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / (loss + 1e-9)
+    return 100 - (100 / (1 + rs))
+
+def compute_atr(df, period=14):
+    """Compute ATR."""
+    df['h-l'] = df['high'] - df['low']
+    df['h-pc'] = abs(df['high'] - df['close'].shift(1))
+    df['l-pc'] = abs(df['low'] - df['close'].shift(1))
+    df['tr'] = df[['h-l', 'h-pc', 'l-pc']].max(axis=1)
+    return df['tr'].rolling(period).mean()
+
+def preprocess_data(df, feature_cols, window_size, lookahead_period):
+    """
+    Engineers features, creates labels based on risk/reward, scales data,
+    and creates windowed sequences for the LSTM.
+    """
+    print("Preprocessing data...")
+    # --- Feature Engineering ---
+    df['body'] = df['close'] - df['open']
+    df['range'] = df['high'] - df['low']
+    df['upper_wick'] = df['high'] - df[['close', 'open']].max(axis=1)
+    df['lower_wick'] = df[['close', 'open']].min(axis=1) - df['low']
+    df['return'] = df['close'].pct_change()
+    df['sma_10'] = df['close'].rolling(10).mean()
+    df['sma_50'] = df['close'].rolling(50).mean()
+    df['sma_ratio'] = df['sma_10'] / (df['sma_50'] + 1e-9) - 1
+    df['ema_20'] = df['close'].ewm(span=20).mean()
+    df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
+    df['rsi_14'] = compute_rsi(df['close'], 14)
+    df['vol_change'] = df['volume'].pct_change()
+    df['atr'] = compute_atr(df, period=14)
+    df_hourly = df['close'].resample('h').mean()
+    hourly_ema = df_hourly.ewm(span=20).mean()
+    df['hourly_ema_20'] = hourly_ema.reindex(df.index, method='ffill')
+    df['price_vs_hourly_trend'] = (df['close'] - df['hourly_ema_20']) / (df['hourly_ema_20'] + 1e-9)
+    df['bb_std'] = df['close'].rolling(20).std()
+    df['bb_mid'] = df['close'].rolling(20).mean()
+    df['bb_width'] = ((df['bb_mid'] + 2 * df['bb_std']) - (df['bb_mid'] - 2 * df['bb_std'])) / (df['bb_mid'] + 1e-9)
+    
+    # --- OPTIMIZED LABELING STRATEGY (RISK/REWARD) ---
+    # Find the highest high and lowest low in the future window
+    future_highs = df['high'].rolling(window=lookahead_period).max().shift(-lookahead_period)
+    future_lows = df['low'].rolling(window=lookahead_period).min().shift(-lookahead_period)
+
+    # Calculate potential profit and potential loss from the current close
+    potential_profit = future_highs - df['close']
+    potential_loss = df['close'] - future_lows
+
+    # Define a label where profit is > 0.1% and profit is 1.5x greater than the risk
+    profit_threshold = 0.001  # 0.1%
+    risk_reward_ratio = 1.5
+    df['label'] = ((potential_profit > profit_threshold) & (potential_profit > risk_reward_ratio * potential_loss)).astype(int)
+    
+    # --- Data Cleaning & Scaling ---
+    df.replace([np.inf, -np.inf], 0, inplace=True)
+    df.dropna(inplace=True)
+    
+    scaler = StandardScaler()
+    df[feature_cols] = scaler.fit_transform(df[feature_cols])
+
+    # --- Create Windowed Data ---
+    X_list, y_list = [], []
+    features = df[feature_cols].values
+    labels = df['label'].values
+    for i in range(len(features) - window_size):
+        X_list.append(features[i:i+window_size])
+        y_list.append(labels[i+window_size])
+        
+    return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.float32).reshape(-1, 1), scaler
+
+# ==============================================================================
+# 2. MODEL DEFINITION
+# ==============================================================================
+
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_size, dropout_rate):
         super(LSTMModel, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=True)
         self.dropout = nn.Dropout(dropout_rate)
-        self.fc = nn.Linear(hidden_size * 2, output_size)
+        self.fc = nn.Linear(hidden_size * 2, output_size) # *2 for bidirectional
 
     def forward(self, x):
-        out, _ = self.lstm(x); out = self.dropout(out[:, -1, :]); out = self.fc(out)
+        out, _ = self.lstm(x)
+        out = self.dropout(out[:, -1, :])
+        out = self.fc(out)
         return out
 
-def compute_atr(df, period=14):
-    df['h-l'] = df['high'] - df['low']; df['h-pc'] = abs(df['high'] - df['close'].shift(1))
-    df['l-pc'] = abs(df['low'] - df['close'].shift(1)); df['tr'] = df[['h-l', 'h-pc', 'l-pc']].max(axis=1)
-    return df['tr'].rolling(period).mean()
+# ==============================================================================
+# 3. TRAINING LOOP
+# ==============================================================================
 
-def preprocess_data(df, feature_cols, window_size, lookahead_period):
-    df = df.copy()
-    timestamp_column = 'date'
-    
-    # Coerce errors: Turn any un-parseable dates into 'NaT' (Not a Time).
-    df[timestamp_column] = pd.to_datetime(df[timestamp_column], errors='coerce')
-    
-    # Drop rows with 'NaT' in the date column.
-    original_rows = len(df)
-    df.dropna(subset=[timestamp_column], inplace=True)
-    if len(df) < original_rows:
-        print(f"Dropped {original_rows - len(df)} rows with invalid date formats.")
-    
-    # --- FIX: Check if data remains after cleaning ---
-    if df.empty:
-        raise ValueError("All rows were dropped due to invalid date formats. Halting training. Please check your source CSV files in 'eth_1m_data'.")
-
-    df.set_index(timestamp_column, inplace=True)
-    df['body'] = df['close'] - df['open']; df['range'] = df['high'] - df['low']
-    df['upper_wick'] = df['high'] - df[['close', 'open']].max(axis=1)
-    df['lower_wick'] = df[['close', 'open']].min(axis=1) - df['low']
-    df['return'] = df['close'].pct_change()
-    df['sma_10'] = df['close'].rolling(10).mean(); df['sma_50'] = df['close'].rolling(50).mean()
-    df['sma_ratio'] = df['sma_10'] / df['sma_50'] - 1; df['ema_20'] = df['close'].ewm(span=20).mean()
-    df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
-    df['rsi_14'] = compute_rsi(df['close'], 14); df['vol_change'] = df['volume'].pct_change()
-    df['atr'] = compute_atr(df); df_hourly = df['close'].resample('1h').mean()
-    hourly_ema = df_hourly.ewm(span=20).mean()
-    df['hourly_ema_20'] = hourly_ema.reindex(df.index, method='ffill')
-    df['price_vs_hourly_trend'] = (df['close'] - df['hourly_ema_20']) / df['hourly_ema_20']
-    df['bb_std'] = df['close'].rolling(20).std(); df['bb_mid'] = df['close'].rolling(20).mean()
-    df['bb_width'] = ((df['bb_mid'] + 2 * df['bb_std']) - (df['bb_mid'] - 2 * df['bb_std'])) / df['bb_mid']
-    atr_multiplier = 3.0; dynamic_threshold = df['atr'] * atr_multiplier / df['close']
-    future_highs = df['high'].rolling(window=lookahead_period).max().shift(-lookahead_period)
-    df['target'] = (future_highs - df['close']) / df['close']
-    df['label'] = (df['target'] > dynamic_threshold).astype(int)
-    df.replace([np.inf, -np.inf], 0, inplace=True); df.dropna(inplace=True)
-
-    # --- FIX: Check if data remains after feature engineering ---
-    if df.empty:
-        raise ValueError("All rows were dropped after feature engineering (due to NaNs in rolling windows). Halting training. You may need more initial data.")
-        
-    scaler = StandardScaler(); df[feature_cols] = scaler.fit_transform(df[feature_cols])
-    X, y = [], []
-    for i in range(len(df) - window_size):
-        X.append(df.iloc[i:i+window_size][feature_cols].values)
-        y.append(df.iloc[i+window_size-1]['label'])
-
-    # --- FIX: Check if any sequences were created ---
-    if not X:
-        raise ValueError(f"Not enough data to create sequences of window size {window_size}. Data length after cleaning is {len(df)}. Halting training.")
-
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32), scaler
-
-def debug_date_parsing(df):
-    """
-    A helper function to find rows with un-parseable dates.
-    """
-    print("--- Running Date Parsing Debug ---")
-    bad_rows = []
-    for index, value in df['date'].items():
-        try:
-            pd.to_datetime(value)
-        except (ValueError, TypeError):
-            bad_rows.append((index, value))
-    
-    if bad_rows:
-        print(f"🚫 Found {len(bad_rows)} rows with bad date formats.")
-        # Print the first 5 bad rows for inspection
-        for i, (idx, val) in enumerate(bad_rows[:5]):
-            print(f"  - Bad Value: '{val}' in row index: {idx}")
-    else:
-        print("✅ All dates appear to be in a valid format.")
-    print("--- Finished Date Parsing Debug ---")
-
-# --- Main Training Function ---
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    full_df = pd.concat(load_ohlc_chunks(folder=args.train, chunk_mode=True), ignore_index=True)
     
-    debug_date_parsing(full_df) 
+    full_df = pd.concat(load_ohlc_chunks(folder=args.train, chunk_mode=True), ignore_index=True)
+    full_df = debug_date_parsing(full_df)
 
     feature_cols = [
         'open', 'high', 'low', 'close', 'body', 'range', 'upper_wick', 'lower_wick', 'return',
         'sma_ratio', 'ema_20', 'macd', 'rsi_14', 'vol_change', 'atr', 'price_vs_hourly_trend', 'bb_width'
     ]
     X, y, scaler = preprocess_data(full_df, feature_cols, args.window_size, args.lookahead_period)
+    
     scaler_path = os.path.join(args.model_dir, "scaler.pkl")
     joblib.dump(scaler, scaler_path)
     print(f"Scaler saved to {scaler_path}")
 
-    # Count the occurrences of each class (0s and 1s)
+    # --- Handle Class Imbalance ---
     neg_count = np.sum(y == 0)
     pos_count = np.sum(y == 1)
-
-    if pos_count == 0:
-        # Avoid division by zero if there are no positive samples
-        pos_weight_value = 1.0
-    else:
-        pos_weight_value = neg_count / pos_count
-
-    # Convert the weight to a tensor for the loss function
+    pos_weight_value = neg_count / pos_count if pos_count > 0 else 1.0
     pos_weight_tensor = torch.tensor([pos_weight_value], device=device)
-    print(f"Dataset is imbalanced. Negative (0): {neg_count}, Positive (1): {pos_count}")
-    print(f"Applying a positive class weight of: {pos_weight_value:.2f}")
+    print(f"Dataset balanced. Negative (0): {neg_count}, Positive (1): {pos_count}. Weight: {pos_weight_value:.2f}")
 
-    # Create train, validation, and test sets
+    # --- Data Splitting and Loading ---
     X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp)
 
@@ -148,79 +194,60 @@ def main(args):
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=args.batch_size)
     test_loader = DataLoader(test_data, batch_size=args.batch_size)
-
+    
+    # --- Model, Loss, Optimizer ---
     model = LSTMModel(len(feature_cols), 128, 3, 1, 0.5).to(device)
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
+    # --- Training Loop ---
     best_val_loss = float('inf')
-    patience_counter = 0
-    best_model_path = os.path.join(args.model_dir, "best_model.pth")
-
-    print("Starting training with early stopping...")
     for epoch in range(args.epochs):
         model.train()
-        for batch_X, batch_y in train_loader:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device).unsqueeze(1)
+        total_train_loss = 0
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+            total_train_loss += loss.item()
 
         model.eval()
-        val_loss, val_correct, val_total = 0, 0, 0
+        total_val_loss = 0
         with torch.no_grad():
-            for batch_X, batch_y in val_loader:
-                batch_X, batch_y = batch_X.to(device), batch_y.to(device).unsqueeze(1)
-                outputs = model(batch_X)
-                val_loss += criterion(outputs, batch_y).item()
-                predicted = (torch.sigmoid(outputs) > 0.5)
-                val_total += batch_y.size(0)
-                val_correct += (predicted == batch_y).sum().item()
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                total_val_loss += loss.item()
 
-        avg_val_loss = val_loss / len(val_loader)
-        val_accuracy = (val_correct / val_total) * 100
-        print(f"Epoch [{epoch+1}/{args.epochs}], Validation Loss: {avg_val_loss:.4f}, Validation Accuracy: {val_accuracy:.2f}%")
+        avg_train_loss = total_train_loss / len(train_loader)
+        avg_val_loss = total_val_loss / len(val_loader)
+        print(f"Epoch {epoch+1}/{args.epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            patience_counter = 0
+            best_model_path = os.path.join(args.model_dir, "best_model.pth")
             torch.save(model.state_dict(), best_model_path)
-            print(f"Validation loss improved. Saving best model to {best_model_path}")
-        else:
-            patience_counter += 1
-            print(f"Validation loss did not improve. Patience: {patience_counter}/{args.patience}")
+            print(f"  -> Best model saved to {best_model_path}")
+            
+    print("Training complete.")
 
-        if patience_counter >= args.patience:
-            print("Early stopping triggered.")
-            break
-
-    print("\nTraining finished. Evaluating best model on the test set...")
-    model.load_state_dict(torch.load(best_model_path))
-    model.eval()
-    test_correct, test_total = 0, 0
-    with torch.no_grad():
-        for batch_X, batch_y in test_loader:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device).unsqueeze(1)
-            outputs = model(batch_X)
-            predicted = (torch.sigmoid(outputs) > 0.5)
-            test_total += batch_y.size(0)
-            test_correct += (predicted == batch_y).sum().item()
-    
-    test_accuracy = (test_correct / test_total) * 100
-    print(f"\nFinal Test Accuracy: {test_accuracy:.2f}%")
-
+# ==============================================================================
+# 4. SCRIPT ENTRYPOINT
+# ==============================================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument('--train', type=str, default=os.environ.get('SM_CHANNEL_TRAIN'))
     parser.add_argument('--model-dir', type=str, default=os.environ.get('SM_MODEL_DIR'))
-    parser.add_argument('--train', type=str, default=os.environ.get('SM_CHANNEL_TRAINING'))
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--patience', type=int, default=10)
-    parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument('--batch-size', type=int, default=1024)
     parser.add_argument('--learning-rate', type=float, default=0.001)
     parser.add_argument('--window-size', type=int, default=150)
     parser.add_argument('--lookahead-period', type=int, default=10)
+    
     args = parser.parse_args()
     main(args)
