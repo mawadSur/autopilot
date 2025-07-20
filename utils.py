@@ -1,6 +1,5 @@
-# utils.py
-
 import os
+import time
 import pandas as pd
 import numpy as np
 from collections import deque
@@ -8,6 +7,9 @@ import sagemaker
 from sagemaker.predictor import Predictor
 from sagemaker.serializers import JSONSerializer
 from sagemaker.deserializers import JSONDeserializer
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
 
 def load_ohlc_chunks(folder, chunk_mode=False):
     """
@@ -82,18 +84,58 @@ class SignalGenerator:
             'open', 'high', 'low', 'close', 'body', 'range', 'upper_wick', 'lower_wick', 'return',
             'sma_ratio', 'ema_20', 'macd', 'rsi_14', 'vol_change', 'atr', 'price_vs_hourly_trend', 'bb_width'
         ]
-        
+
+        config = Config(
+            read_timeout=180,
+            connect_timeout=180,
+            retries={"max_attempts": 0}
+        )
+        sm_runtime_client = boto3.client("sagemaker-runtime", config=config)
+        sagemaker_session = sagemaker.Session(sagemaker_runtime_client=sm_runtime_client)
+
         self.predictor = Predictor(
             endpoint_name=self.endpoint_name,
-            sagemaker_session=sagemaker.Session(),
+            sagemaker_session=sagemaker_session,
             serializer=JSONSerializer(),
             deserializer=JSONDeserializer()
         )
-        
-        self.history_size = self.window_size + 100 
+
+        self.history_size = self.window_size + 100
         self.history = deque(maxlen=self.history_size)
-        self.threshold = 0.5 # Default threshold
+        self.threshold = 0.5
+
+        # --- NEW: Call warmup function on initialization ---
+        self._warmup_endpoint()
+
         print(f"✅ Signal Generator ready. Connected to endpoint: {self.endpoint_name}")
+
+    def _warmup_endpoint(self, retries=3, delay_seconds=10):
+            """
+            Sends a light, fake request to the endpoint to warm it up and avoid cold start timeouts.
+            """
+            print("🔥 Warming up the SageMaker endpoint... (this may take a minute)")
+            # Create a fake payload with the correct shape (window_size, num_features)
+            fake_input = np.zeros((self.window_size, len(self.feature_cols))).tolist()
+            payload = {'inputs': fake_input}
+            
+            for i in range(retries):
+                try:
+                    self.predictor.predict(payload)
+                    print("✅ Endpoint is warm and responding.")
+                    return
+                except ClientError as e:
+                    if "ModelError" in str(e) or "invocation timed out" in str(e).lower():
+                        print(f"Attempt {i+1}/{retries}: Endpoint is still warming up. Retrying in {delay_seconds}s...")
+                        time.sleep(delay_seconds)
+                    else:
+                        print(f"❌ An unexpected client error occurred during warmup: {e}")
+                        raise e
+                except Exception as e:
+                    print(f"❌ An unexpected error occurred during warmup: {e}")
+                    raise e
+            
+            raise RuntimeError(f"Endpoint did not become ready after {retries} attempts.")
+
 
     def _engineer_features(self, df):
         df_out = df.copy()

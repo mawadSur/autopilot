@@ -5,12 +5,14 @@ from collections import deque
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from binance.client import Client
+from dotenv import load_dotenv
 from utils import SignalGenerator
 
 # --- Setup ---
-ENDPOINT_NAME ="pytorch-training-2025-07-08-06-10-58-197"
-client = Client()
+load_dotenv()
+ENDPOINT_NAME = os.getenv("ENDPOINT_NAME")
 signal_gen = SignalGenerator(endpoint_name=ENDPOINT_NAME)
+client = Client()
 
 # --- Pre-fill history buffer ---
 print("Pre-filling history buffer...")
