@@ -86,7 +86,8 @@ print("\nTraining job finished. Deploying model to a real-time endpoint...")
 
 predictor = pytorch_estimator.deploy(
     initial_instance_count=1,
-    instance_type='ml.g4dn.xlarge'
+    instance_type='ml.g4dn.xlarge',
+    entry_point='inference.py'  # <-- ADD THIS LINE
 )
 
 print(f"✅ Model deployed successfully. Endpoint name is: {predictor.endpoint_name}")

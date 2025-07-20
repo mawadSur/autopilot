@@ -29,7 +29,7 @@ def run_paper_trading(n=10, interval_seconds=60):
     if not ENDPOINT_NAME:
         raise ValueError("ENDPOINT_NAME environment variable not set. Please check your .env file.")
     
-    signal_gen = SignalGenerator(endpoint_name=ENDPOINT_NAME) # <-- CORRECTED INITIALIZATION
+    signal_gen = SignalGenerator(endpoint_name=ENDPOINT_NAME) 
     
     # 2. Pre-fill history buffer for feature calculation
     print(f"Pre-filling history buffer with the last {signal_gen.history_size} minutes of data...")
