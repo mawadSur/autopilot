@@ -10,6 +10,18 @@ from sagemaker.deserializers import JSONDeserializer
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from binance.client import Client
+from dotenv import load_dotenv
+load_dotenv()
+
+def get_client_binance():
+    print("[DEBUG] Getting Binance client...")
+    if os.getenv("TESTNET"):
+        print("[DEBUG] Using testnet")
+        return Client(os.getenv("BINANCE_TESTNET_KEY"), os.getenv("BINANCE_TESTNET_SECRET"), testnet=True)
+    else:
+        print("[DEBUG] Using live")
+        return Client(os.getenv("BINANCE_KEY"), os.getenv("BINANCE_SECRET"))
 
 def load_ohlc_chunks(folder, chunk_mode=False):
     """

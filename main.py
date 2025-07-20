@@ -7,7 +7,7 @@ from typing import List, Dict
 
 # --- Local Imports (for data processing and simulation) ---
 # Ensure these files are in the same directory or a sub-directory
-from utils import load_ohlc_chunks, compute_rsi, compute_atr
+from utils import get_client_binance, load_ohlc_chunks, compute_rsi, compute_atr
 from aws_train_model import preprocess_data, LSTMModel # Re-using your preprocessing and model class
 
 # --- PyTorch and ML Imports ---
@@ -228,7 +228,7 @@ async def get_latest_signal():
     Fetches the latest market data for ETH/USDT and returns a single
     BUY or HOLD signal based on the trained model.
     """
-    client = Client()
+    client = get_client_binance()
     # Fetch enough historical data for feature calculation (e.g., last 200 minutes)
     klines = client.get_klines(symbol='ETHUSDT', interval=Client.KLINE_INTERVAL_1MINUTE, limit=200)
     
