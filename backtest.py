@@ -31,7 +31,7 @@ def run_signal_generation(output_path='eth_signals.csv'):
     
     # 2. Initialize the Signal Generator to use the SageMaker Endpoint
     load_dotenv()
-    ENDPOINT_NAME = os.getenv("ENDPOINT_NAME")
+    ENDPOINT_NAME = os.getenv("ENDPOINT_NAME") 
     if not ENDPOINT_NAME:
         raise ValueError("ENDPOINT_NAME environment variable not set. Please set it to your SageMaker endpoint name.")
         

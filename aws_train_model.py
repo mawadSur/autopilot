@@ -122,6 +122,21 @@ def main(args):
     joblib.dump(scaler, scaler_path)
     print(f"Scaler saved to {scaler_path}")
 
+    # Count the occurrences of each class (0s and 1s)
+    neg_count = np.sum(y == 0)
+    pos_count = np.sum(y == 1)
+
+    if pos_count == 0:
+        # Avoid division by zero if there are no positive samples
+        pos_weight_value = 1.0
+    else:
+        pos_weight_value = neg_count / pos_count
+
+    # Convert the weight to a tensor for the loss function
+    pos_weight_tensor = torch.tensor([pos_weight_value], device=device)
+    print(f"Dataset is imbalanced. Negative (0): {neg_count}, Positive (1): {pos_count}")
+    print(f"Applying a positive class weight of: {pos_weight_value:.2f}")
+
     # Create train, validation, and test sets
     X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp)

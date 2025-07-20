@@ -17,7 +17,7 @@ client = Client(api_key, api_secret, {"timeout": 30})
 OUTPUT_DIR = "eth_1m_data"
 SYMBOL = "ETHUSDT"
 INTERVAL = Client.KLINE_INTERVAL_1MINUTE
-CHUNK_SIZE = 50000 # Process data in chunks of this size
+CHUNK_SIZE = 50000 
 
 def ensure_output_dir():
     if not os.path.exists(OUTPUT_DIR):
@@ -65,36 +65,57 @@ def process_and_save_chunk(chunk):
 
 def fetch_historical_data(start_days_ago=730):
     """
-    Fetches historical 1-minute data in chunks to be memory-efficient and respectful of API limits,
-    and saves it, appending to existing files.
+    Fetches historical 1-minute data month-by-month.
+    Checks if a file for a specific month already exists and skips it to avoid re-downloading.
     """
     ensure_output_dir()
     now = datetime.utcnow()
     start_date = now - timedelta(days=start_days_ago)
-
-    print(f"Fetching historical data for {SYMBOL} from {start_date.strftime('%Y-%m-%d')}...")
     
-    klines_generator = client.get_historical_klines_generator(SYMBOL, INTERVAL, start_date.strftime("%d %b, %Y"))
+    # Create a date range for the first day of each month to be processed
+    months_to_process = pd.date_range(start_date, now, freq='MS').to_pydatetime().tolist()
 
-    chunk = []
-    for kline in tqdm(klines_generator, desc="Downloading historical data"):
-        chunk.append(kline)
-        if len(chunk) >= CHUNK_SIZE:
-            print(f"\nProcessing chunk of {len(chunk)} records...")
-            process_and_save_chunk(chunk)
-            chunk = []  # Reset the chunk
-            time.sleep(0.5) # Be polite to the API
+    print(f"Starting data check for {SYMBOL} from {start_date.strftime('%Y-%m-%d')} to {now.strftime('%Y-%m-%d')}")
 
-    # Process the final remaining chunk
-    if chunk:
-        print(f"\nProcessing final chunk of {len(chunk)} records...")
-        process_and_save_chunk(chunk)
+    for month_start in tqdm(months_to_process, desc="Processing months"):
+        year_month_str = month_start.strftime('%Y-%m')
+        file_path = os.path.join(OUTPUT_DIR, f"eth_1m_{year_month_str}.csv")
+
+        # --- MODIFICATION ---
+        # Check if the file for the month already exists. If so, skip it.
+        if os.path.exists(file_path):
+            tqdm.write(f"Skipping {year_month_str}: File already exists.")
+            continue
+
+        tqdm.write(f"Fetching data for {year_month_str}...")
+
+        # Define the start and end strings for the API call
+        start_str = month_start.strftime("%d %b, %Y")
+        
+        try:
+            # Use the generator to fetch all klines for the current month
+            klines_generator = client.get_historical_klines_generator(SYMBOL, INTERVAL, start_str)
+            
+            # Process the downloaded data in chunks (usually one chunk per month)
+            chunk = list(klines_generator)
+            if chunk:
+                tqdm.write(f"Processing {len(chunk)} records for {year_month_str}...")
+                process_and_save_chunk(chunk)
+            
+            time.sleep(1) # Be polite to the API
+
+        except BinanceAPIException as e:
+            tqdm.write(f"Binance API Error for {year_month_str}: {e}")
+            time.sleep(10) # Wait longer after an API error
+        except Exception as e:
+            tqdm.write(f"An unexpected error occurred for {year_month_str}: {e}")
 
     print("\n✅ Historical data fetch complete.")
 
 if __name__ == "__main__":
     try:
-        fetch_historical_data(start_days_ago=360)
+        # Fetches data for the last year, skipping months that are already saved.
+        fetch_historical_data(start_days_ago=1000)
     except BinanceAPIException as e:
         print(f"Binance API Error: {e}")
     except Exception as e:
