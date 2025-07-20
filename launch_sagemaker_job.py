@@ -64,7 +64,7 @@ pytorch_estimator = PyTorch(
     sagemaker_session=sagemaker_session,
     hyperparameters={
         'epochs': 100,
-        'patience': 10,
+        'patience': 5,
         'batch-size': 64,
         'learning-rate': 0.001,
         'window-size': 150,
