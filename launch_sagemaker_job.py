@@ -3,17 +3,34 @@ import boto3
 import sagemaker
 from sagemaker.pytorch import PyTorch
 from sagemaker.tuner import HyperparameterTuner, ContinuousParameter
+from botocore.exceptions import ClientError
 
 def upload_to_s3(local_folder, s3_bucket, s3_prefix):
-    """Uploads a directory to an S3 bucket."""
+    """
+    Uploads a directory to an S3 bucket, skipping files that already exist.
+    """
+    # Use the S3 resource object which is often easier for object-level operations
     s3 = boto3.client('s3')
+    
     for dirpath, _, filenames in os.walk(local_folder):
         for f in filenames:
             if f.endswith('.csv'):
                 local_path = os.path.join(dirpath, f)
                 s3_key = os.path.join(s3_prefix, f)
-                print(f"Uploading {local_path} to s3://{s3_bucket}/{s3_key}")
-                s3.upload_file(local_path, s3_bucket, s3_key)
+                
+                # Check if the file already exists in S3
+                try:
+                    s3.head_object(Bucket=s3_bucket, Key=s3_key)
+                    print(f"File already exists, skipping: s3://{s3_bucket}/{s3_key}")
+                except ClientError as e:
+                    # If a 404 error is raised, the file does not exist and should be uploaded
+                    if e.response['Error']['Code'] == '404':
+                        print(f"Uploading {local_path} to s3://{s3_bucket}/{s3_key}")
+                        s3.upload_file(local_path, s3_bucket, s3_key)
+                    else:
+                        # Reraise the exception if it's a different error (e.g., permissions)
+                        raise
+                        
     return f"s3://{s3_bucket}/{s3_prefix}"
 
 # ==============================================================================
@@ -28,7 +45,7 @@ IAM_ROLE_NAME = "SageMakerExecutionRole"
 # Get SageMaker execution role ARN
 sagemaker_session = sagemaker.Session()
 try:
-    role = sagemaker.get_execution_role()
+    role = 'arn:aws:iam::469090608362:role/SageMakerExecutionRole'
 except ValueError:
     iam = boto3.client('iam')
     role = iam.get_role(RoleName=IAM_ROLE_NAME)['Role']['Arn']
@@ -49,10 +66,10 @@ pytorch_estimator = PyTorch(
     framework_version='1.13',      # Use a specific PyTorch version
     py_version='py39',
     hyperparameters={
-        'epochs': 50, # Can be lower for tuning jobs to save time
-        'batch-size': 1024,
-        'window-size': 150,
-        'lookahead-period': 10
+        'epochs': '50',
+        'batch-size': '1024',
+        'window-size': '150',
+        'lookahead-period': '10'
     }
 )
 
@@ -83,15 +100,18 @@ tuner = HyperparameterTuner(
 print("\nStarting SageMaker Hyperparameter Tuning job...")
 tuner.fit({'train': s3_data_path})
 tuner.wait()
-print("✅ Hyperparameter Tuning job finished.")
 
-# 5. --- DEPLOY THE BEST MODEL ---
-print("\nDeploying the best model found by the tuning job...")
-# The tuner object knows which training job was best and deploys that model.
-predictor = tuner.deploy(
+best_job_name = tuner.best_training_job()
+print(f"🏆 Best training job: {best_job_name}")
+
+# Attach an estimator to that job
+best_estimator = PyTorch.attach(best_job_name)
+
+# Deploy using the best estimator
+predictor = best_estimator.deploy(
     initial_instance_count=1,
     instance_type='ml.g4dn.xlarge',
-    entry_point='inference.py' # Use our dedicated inference script
+    entry_point='inference.py'
 )
 
 print(f"✅ Best model deployed successfully. Endpoint name is: {predictor.endpoint_name}")

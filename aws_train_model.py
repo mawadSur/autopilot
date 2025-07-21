@@ -108,17 +108,14 @@ def preprocess_data(df, feature_cols, window_size, lookahead_period):
     df['bb_width'] = ((df['bb_mid'] + 2 * df['bb_std']) - (df['bb_mid'] - 2 * df['bb_std'])) / (df['bb_mid'] + 1e-9)
     
     # --- OPTIMIZED LABELING STRATEGY (RISK/REWARD) ---
-    # Find the highest high and lowest low in the future window
     future_highs = df['high'].rolling(window=lookahead_period).max().shift(-lookahead_period)
     future_lows = df['low'].rolling(window=lookahead_period).min().shift(-lookahead_period)
-
-    # Calculate potential profit and potential loss from the current close
     potential_profit = future_highs - df['close']
     potential_loss = df['close'] - future_lows
-
-    # Define a label where profit is > 0.1% and profit is 1.5x greater than the risk
-    profit_threshold = 0.001  # 0.1%
+    profit_threshold = 0.001
     risk_reward_ratio = 1.5
+    
+    # --- THIS IS THE CORRECTED LINE ---
     df['label'] = ((potential_profit > profit_threshold) & (potential_profit > risk_reward_ratio * potential_loss)).astype(int)
     
     # --- Data Cleaning & Scaling ---
@@ -176,14 +173,12 @@ def main(args):
     joblib.dump(scaler, scaler_path)
     print(f"Scaler saved to {scaler_path}")
 
-    # --- Handle Class Imbalance ---
     neg_count = np.sum(y == 0)
     pos_count = np.sum(y == 1)
     pos_weight_value = neg_count / pos_count if pos_count > 0 else 1.0
     pos_weight_tensor = torch.tensor([pos_weight_value], device=device)
     print(f"Dataset balanced. Negative (0): {neg_count}, Positive (1): {pos_count}. Weight: {pos_weight_value:.2f}")
 
-    # --- Data Splitting and Loading ---
     X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp)
 
@@ -195,12 +190,11 @@ def main(args):
     val_loader = DataLoader(val_data, batch_size=args.batch_size)
     test_loader = DataLoader(test_data, batch_size=args.batch_size)
     
-    # --- Model, Loss, Optimizer ---
-    model = LSTMModel(len(feature_cols), 128, 3, 1, 0.5).to(device)
+    model = LSTMModel(len(feature_cols), 128, 3, 1, args.dropout_rate).to(device)
+    
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
-    # --- Training Loop ---
     best_val_loss = float('inf')
     for epoch in range(args.epochs):
         model.train()
@@ -241,13 +235,16 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    
     parser.add_argument('--train', type=str, default=os.environ.get('SM_CHANNEL_TRAIN'))
     parser.add_argument('--model-dir', type=str, default=os.environ.get('SM_MODEL_DIR'))
+    
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch-size', type=int, default=1024)
     parser.add_argument('--learning-rate', type=float, default=0.001)
     parser.add_argument('--window-size', type=int, default=150)
     parser.add_argument('--lookahead-period', type=int, default=10)
+    parser.add_argument('--dropout-rate', type=float, default=0.5)
     
     args = parser.parse_args()
     main(args)
