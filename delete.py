@@ -1,46 +1,60 @@
-# delete.py
-
 import boto3
+import time
 
 sagemaker = boto3.client('sagemaker')
 
-def delete_trial_components():
+def delete_sagemaker_experiments():
     """
-    Finds and deletes SageMaker Trial Components.
+    Deletes all SageMaker Trials and then all Trial Components.
     """
-    print("Starting trial component cleanup...")
-    paginator = sagemaker.get_paginator('list_trial_components')
-    for page in paginator.paginate():
-        for summary in page.get('TrialComponentSummaries', []):
-            name = summary['TrialComponentName']
-            arn = summary['TrialComponentArn']
-            print(f"\nProcessing Trial Component: {name}")
+    # --- 1. DELETE ALL TRIALS FIRST ---
+    print("\n🧹 Starting SageMaker Trial cleanup...")
+    try:
+        paginator = sagemaker.get_paginator('list_trials')
+        for page in paginator.paginate():
+            for trial_summary in page.get('TrialSummaries', []):
+                trial_name = trial_summary['TrialName']
+                print(f"  - Deleting Trial: {trial_name}")
+                try:
+                    # Clean up associations first
+                    for component_summary in sagemaker.list_trial_components(TrialName=trial_name)['TrialComponentSummaries']:
+                         sagemaker.disassociate_trial_component(TrialName=trial_name, TrialComponentName=component_summary['TrialComponentName'])
+                    
+                    sagemaker.delete_trial(TrialName=trial_name)
+                except Exception as e:
+                    print(f"    ❌ ERROR deleting trial {trial_name}: {str(e)}")
+    except Exception as e:
+        print(f"Could not list or delete trials: {e}")
 
-            associations = sagemaker.list_associations(SourceArn=arn)
-            for assoc in associations.get('AssociationSummaries', []):
-                trial_name = assoc['SourceName']
-                print(f"  Disassociating from trial: {trial_name}")
-                sagemaker.disassociate_trial_component(
-                    TrialComponentName=name,
-                    TrialName=trial_name
-                )
-            try:
-                sagemaker.delete_trial_component(TrialComponentName=name)
-                print(f"  Deleted trial component: {name}")
-            except Exception as e:
-                print(f"  ERROR deleting {name}: {str(e)}")
+    # --- 2. WAIT FOR DELETION TO PROCESS ---
+    print("\n⏳ Waiting 30 seconds for AWS to process trial deletions...")
+    time.sleep(30)
+
+    # --- 3. DELETE ALL TRIAL COMPONENTS ---
+    print("\n🧹 Starting SageMaker Trial Component cleanup...")
+    try:
+        paginator = sagemaker.get_paginator('list_trial_components')
+        for page in paginator.paginate():
+            for summary in page.get('TrialComponentSummaries', []):
+                name = summary['TrialComponentName']
+                print(f"  - Deleting Trial Component: {name}")
+                try:
+                    sagemaker.delete_trial_component(TrialComponentName=name)
+                except Exception as e:
+                    print(f"    ❌ ERROR deleting component {name}: {str(e)}")
+    except Exception as e:
+         print(f"Could not list or delete trial components: {e}")
 
 
 def delete_endpoints():
     """
-    Finds and deletes all SageMaker Endpoints that are not already deleting.
+    Finds and deletes all SageMaker Endpoints and their associated configs.
     """
     print("\n🗑️ Starting endpoint cleanup...")
 
     paginator = sagemaker.get_paginator('list_endpoints')
     endpoints_found = 0
     
-    # Iterate through all pages of endpoints
     for page in paginator.paginate():
         for ep in page.get('Endpoints', []):
             endpoints_found += 1
@@ -48,17 +62,13 @@ def delete_endpoints():
             ep_status = ep['EndpointStatus']
             print(f"Found endpoint: {ep_name} (status: {ep_status})")
 
-            # Only attempt to delete if it's not already in the 'Deleting' state
             if ep_status != 'Deleting':
                 try:
-                    # Delete the associated endpoint config first
                     ep_config_name = sagemaker.describe_endpoint(EndpointName=ep_name)['EndpointConfigName']
-                    sagemaker.delete_endpoint_config(EndpointConfigName=ep_config_name)
-                    print(f"  - Deleted endpoint config: {ep_config_name}")
-
-                    # Now delete the endpoint
                     sagemaker.delete_endpoint(EndpointName=ep_name)
                     print(f"  - Deleting endpoint: {ep_name}")
+                    sagemaker.delete_endpoint_config(EndpointConfigName=ep_config_name)
+                    print(f"  - Deleting endpoint config: {ep_config_name}")
                 except Exception as e:
                     print(f"  ❌ ERROR deleting {ep_name}: {str(e)}")
     
@@ -67,7 +77,6 @@ def delete_endpoints():
 
 
 if __name__ == "__main__":
-    # The script will now clean up both trials and endpoints
-    delete_trial_components()
+    delete_sagemaker_experiments()
     delete_endpoints()
     print("\n✅ SageMaker cleanup completed.")

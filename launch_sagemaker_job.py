@@ -2,7 +2,7 @@ import os
 import boto3
 import sagemaker
 from sagemaker.pytorch import PyTorch
-from sagemaker.tuner import HyperparameterTuner, ContinuousParameter
+from sagemaker.tuner import HyperparameterTuner, ContinuousParameter, LogarithmicParameter
 from botocore.exceptions import ClientError
 
 def upload_to_s3(local_folder, s3_bucket, s3_prefix):
@@ -62,7 +62,7 @@ pytorch_estimator = PyTorch(
     entry_point='aws_train_model.py',
     role=role,
     instance_count=1,
-    instance_type='ml.g4dn.xlarge', # GPU instance for faster training
+    instance_type='ml.g4dn.2xlarge', # GPU instance for faster training
     framework_version='1.13',      # Use a specific PyTorch version
     py_version='py39',
     hyperparameters={
@@ -76,8 +76,8 @@ pytorch_estimator = PyTorch(
 # 3. --- CONFIGURE THE HYPERPARAMETER TUNER ---
 # Define the range of hyperparameters you want to test.
 hyperparameter_ranges = {
-    'learning-rate': ContinuousParameter(0.0001, 0.01),
-    'dropout_rate': ContinuousParameter(0.2, 0.6) # Passed to your model via args
+    'learning-rate': LogarithmicParameter(0.0001, 0.01), 
+    'dropout-rate': ContinuousParameter(0.2, 0.6) # Passed to your model via args
 }
 
 # Define the objective metric to optimize.
@@ -91,8 +91,8 @@ tuner = HyperparameterTuner(
     objective_metric_name=objective_metric_name,
     hyperparameter_ranges=hyperparameter_ranges,
     metric_definitions=metric_definitions,
-    max_jobs=10,  # Total number of training jobs to run
-    max_parallel_jobs=1,  # Number of jobs to run in parallel
+    max_jobs=20,  # Total number of training jobs to run
+    max_parallel_jobs=2,  # Number of jobs to run in parallel
     objective_type='Minimize'
 )
 
@@ -110,7 +110,7 @@ best_estimator = PyTorch.attach(best_job_name)
 # Deploy using the best estimator
 predictor = best_estimator.deploy(
     initial_instance_count=1,
-    instance_type='ml.g4dn.xlarge',
+    instance_type='ml.g4dn.2xlarge',
     entry_point='inference.py'
 )
 

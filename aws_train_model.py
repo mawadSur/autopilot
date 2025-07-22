@@ -6,7 +6,7 @@ import joblib
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
@@ -61,7 +61,7 @@ def debug_date_parsing(df):
     if not df.index.is_monotonic_increasing:
         print("Warning: Index is not monotonically increasing.")
         df = df[~df.index.duplicated(keep='first')]
-    return df.reset_index()
+    return df
 
 def compute_rsi(series, period=14):
     """Compute RSI."""
@@ -79,10 +79,10 @@ def compute_atr(df, period=14):
     df['tr'] = df[['h-l', 'h-pc', 'l-pc']].max(axis=1)
     return df['tr'].rolling(period).mean()
 
-def preprocess_data(df, feature_cols, window_size, lookahead_period):
+def preprocess_data(df, feature_cols, lookahead_period,  risk_reward_ratio, profit_threshold_pct):
     """
-    Engineers features, creates labels based on risk/reward, scales data,
-    and creates windowed sequences for the LSTM.
+    Engineers features, creates labels, and scales data.
+    This version DOES NOT create windowed numpy arrays to save memory.
     """
     print("Preprocessing data...")
     # --- Feature Engineering ---
@@ -112,11 +112,14 @@ def preprocess_data(df, feature_cols, window_size, lookahead_period):
     future_lows = df['low'].rolling(window=lookahead_period).min().shift(-lookahead_period)
     potential_profit = future_highs - df['close']
     potential_loss = df['close'] - future_lows
-    profit_threshold = 0.001
-    risk_reward_ratio = 1.5
     
-    # --- THIS IS THE CORRECTED LINE ---
-    df['label'] = ((potential_profit > profit_threshold) & (potential_profit > risk_reward_ratio * potential_loss)).astype(int)
+    profit_threshold_dynamic = df['close'] * (profit_threshold_pct / 100.0)
+
+    df['label'] = (
+        (potential_profit > profit_threshold_dynamic)  &
+        (potential_loss > 0) &
+        (potential_profit > risk_reward_ratio * potential_loss)
+    ).astype(int)
     
     # --- Data Cleaning & Scaling ---
     df.replace([np.inf, -np.inf], 0, inplace=True)
@@ -125,26 +128,40 @@ def preprocess_data(df, feature_cols, window_size, lookahead_period):
     scaler = StandardScaler()
     df[feature_cols] = scaler.fit_transform(df[feature_cols])
 
-    # --- Create Windowed Data ---
-    X_list, y_list = [], []
-    features = df[feature_cols].values
-    labels = df['label'].values
-    for i in range(len(features) - window_size):
-        X_list.append(features[i:i+window_size])
-        y_list.append(labels[i+window_size])
-        
-    return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.float32).reshape(-1, 1), scaler
+    # ✅ Return the processed DataFrames and the scaler
+    return df[feature_cols], df['label'], scaler
 
 # ==============================================================================
 # 2. MODEL DEFINITION
 # ==============================================================================
+
+class CustomTimeSeriesDataset(Dataset):
+    """
+    Custom PyTorch Dataset to handle large time-series data efficiently.
+    Generates windows on-the-fly to avoid storing them all in memory.
+    """
+    def __init__(self, features_df, labels_series, window_size):
+        self.features = features_df.values
+        self.labels = labels_series.values
+        self.window_size = window_size
+
+    def __len__(self):
+        # Return the total number of samples that can be generated
+        return len(self.features) - self.window_size
+
+    def __getitem__(self, idx):
+        # This is called by the DataLoader to get one sample
+        feature_window = self.features[idx : idx + self.window_size]
+        label = self.labels[idx + self.window_size]
+        return torch.tensor(feature_window, dtype=torch.float32), torch.tensor(label, dtype=torch.float32).view(1)
+
 
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_size, dropout_rate):
         super(LSTMModel, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=True)
         self.dropout = nn.Dropout(dropout_rate)
-        self.fc = nn.Linear(hidden_size * 2, output_size) # *2 for bidirectional
+        self.fc = nn.Linear(hidden_size * 2, output_size)
 
     def forward(self, x):
         out, _ = self.lstm(x)
@@ -167,24 +184,48 @@ def main(args):
         'open', 'high', 'low', 'close', 'body', 'range', 'upper_wick', 'lower_wick', 'return',
         'sma_ratio', 'ema_20', 'macd', 'rsi_14', 'vol_change', 'atr', 'price_vs_hourly_trend', 'bb_width'
     ]
-    X, y, scaler = preprocess_data(full_df, feature_cols, args.window_size, args.lookahead_period)
+    
+    # ✅ Preprocess data without creating windowed arrays
+    features_df, labels_series, scaler = preprocess_data(
+        full_df, 
+        feature_cols, 
+        args.lookahead_period,
+        args.risk_reward_ratio,
+        args.profit_threshold_pct
+    )
     
     scaler_path = os.path.join(args.model_dir, "scaler.pkl")
     joblib.dump(scaler, scaler_path)
     print(f"Scaler saved to {scaler_path}")
 
-    neg_count = np.sum(y == 0)
-    pos_count = np.sum(y == 1)
+    # ✅ Use the Custom Dataset for memory efficiency
+    full_dataset = CustomTimeSeriesDataset(features_df, labels_series, args.window_size)
+    
+    # --- Stratified splitting using indices to save memory ---
+    all_labels_for_split = labels_series.values[args.window_size:]
+    indices = list(range(len(all_labels_for_split)))
+    
+    try:
+        train_indices, temp_indices, _, _ = train_test_split(indices, all_labels_for_split, test_size=0.2, random_state=42, stratify=all_labels_for_split)
+        temp_labels_for_split = all_labels_for_split[temp_indices]
+        val_indices, test_indices, _, _ = train_test_split(temp_indices, temp_labels_for_split, test_size=0.5, random_state=42, stratify=temp_labels_for_split)
+    except ValueError:
+        # Fallback for extreme class imbalance where stratification is not possible
+        print("Warning: Stratification failed due to extreme class imbalance. Using a random split.")
+        train_indices, temp_indices = train_test_split(indices, test_size=0.2, random_state=42)
+        val_indices, test_indices = train_test_split(temp_indices, test_size=0.5, random_state=42)
+
+    train_data = Subset(full_dataset, train_indices)
+    val_data = Subset(full_dataset, val_indices)
+    test_data = Subset(full_dataset, test_indices)
+
+    # --- Calculate class weights from the training set labels ---
+    train_labels = all_labels_for_split[train_indices]
+    neg_count = np.sum(train_labels == 0)
+    pos_count = np.sum(train_labels == 1)
     pos_weight_value = neg_count / pos_count if pos_count > 0 else 1.0
     pos_weight_tensor = torch.tensor([pos_weight_value], device=device)
     print(f"Dataset balanced. Negative (0): {neg_count}, Positive (1): {pos_count}. Weight: {pos_weight_value:.2f}")
-
-    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp)
-
-    train_data = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
-    val_data = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val))
-    test_data = TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_test))
 
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=args.batch_size)
@@ -196,6 +237,9 @@ def main(args):
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
     best_val_loss = float('inf')
+    epochs_no_improve = 0
+    patience = 10  
+
     for epoch in range(args.epochs):
         model.train()
         total_train_loss = 0
@@ -220,13 +264,20 @@ def main(args):
         avg_train_loss = total_train_loss / len(train_loader)
         avg_val_loss = total_val_loss / len(val_loader)
         print(f"Epoch {epoch+1}/{args.epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        print(f"Val Loss: {avg_val_loss:.4f}")
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             best_model_path = os.path.join(args.model_dir, "best_model.pth")
             torch.save(model.state_dict(), best_model_path)
             print(f"  -> Best model saved to {best_model_path}")
+            epochs_no_improve = 0  # ✅ RESET COUNTER
+        else:
+            epochs_no_improve += 1 # ✅ INCREMENT COUNTER
             
+        if epochs_no_improve >= patience:
+            print(f"Early stopping triggered after {patience} epochs with no improvement.")
+            break
     print("Training complete.")
 
 # ==============================================================================
@@ -246,5 +297,8 @@ if __name__ == "__main__":
     parser.add_argument('--lookahead-period', type=int, default=10)
     parser.add_argument('--dropout-rate', type=float, default=0.5)
     
+    parser.add_argument('--risk-reward-ratio', type=float, default=2.0)
+    parser.add_argument('--profit-threshold-pct', type=float, default=0.5)
+
     args = parser.parse_args()
     main(args)
