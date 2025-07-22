@@ -13,8 +13,6 @@ from botocore.exceptions import ClientError
 from binance.client import Client
 from dotenv import load_dotenv
 load_dotenv()
-# The functions load_ohlc_chunks, compute_rsi, and compute_atr do not need changes.
-# They are copied here from the original utils.py for completeness.
 
 def get_client_binance():
     print("[DEBUG] Getting Binance client...")
@@ -73,7 +71,7 @@ def compute_atr(df, period=14):
     return df['tr'].rolling(period).mean()
 
 class SignalGenerator:
-    def __init__(self, endpoint_name, window_size=150):
+    def __init__(self, endpoint_name, window_size=150, threshold=0.8):
         print("⚙️ Initializing Signal Generator for SageMaker Endpoint...")
         self.endpoint_name = endpoint_name
         self.window_size = window_size
@@ -92,7 +90,7 @@ class SignalGenerator:
         )
         self.history_size = self.window_size + 100
         self.history = deque(maxlen=self.history_size)
-        self.threshold = 0.5
+        self.threshold = threshold # Use a configurable, validated threshold
         self._warmup_endpoint()
         print(f"✅ Signal Generator ready. Connected to endpoint: {self.endpoint_name}")
 
@@ -119,7 +117,7 @@ class SignalGenerator:
         function in aws_train_model.py.
         """
         df_out = df.copy()
-        df_out['date'] = pd.to_datetime(df_out['date'])
+        df_out['date'] = pd.to_datetime(df_out['date'], unit='ms') # Ensure datetime conversion if needed
         df_out.set_index('date', inplace=True)
 
         df_out['body'] = df_out['close'] - df_out['open']
@@ -136,11 +134,13 @@ class SignalGenerator:
         df_out['vol_change'] = df_out['volume'].pct_change()
         df_out['atr'] = compute_atr(df_out, period=14)
 
+        # ✅ CORRECTED: Non-leaking hourly trend calculation
         if len(df_out) >= 60:
-            df_hourly = df_out['close'].resample('h').mean()
+            hourly_index = df_out.index.floor('h')
+            df_hourly = df_out['close'].groupby(hourly_index).mean()
             hourly_ema = df_hourly.ewm(span=20).mean()
-            df_out['hourly_ema_20'] = hourly_ema.reindex(df_out.index, method='ffill')
-            df_out['price_vs_hourly_trend'] = (df_out['close'] - df_out['hourly_ema_20']) / df_out['hourly_ema_20']
+            df_out['hourly_ema_20'] = hourly_ema.reindex(hourly_index, method='ffill').values
+            df_out['price_vs_hourly_trend'] = (df_out['close'] - df_out['hourly_ema_20']) / (df_out['hourly_ema_20'] + 1e-9)
         else:
             df_out['price_vs_hourly_trend'] = 0
 
@@ -148,7 +148,6 @@ class SignalGenerator:
         df_out['bb_mid'] = df_out['close'].rolling(20).mean()
         df_out['bb_width'] = ((df_out['bb_mid'] + 2 * df_out['bb_std']) - (df_out['bb_mid'] - 2 * df_out['bb_std'])) / (df_out['bb_mid'] + 1e-9)
         
-        # This cleanup logic now exactly matches the training script
         df_out.replace([np.inf, -np.inf], 0, inplace=True)
         df_out.dropna(inplace=True)
 
@@ -170,7 +169,8 @@ class SignalGenerator:
         result = self.predictor.predict(payload)
 
         confidence = result.get('probability')
-        signal = result.get('signal')
+        # Use the class's threshold for a more robust signal
+        signal = 1 if confidence is not None and confidence > self.threshold else 0
 
         return {
             "confidence": round(float(confidence), 5) if confidence is not None else None,

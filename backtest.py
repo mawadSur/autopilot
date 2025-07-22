@@ -39,28 +39,26 @@ def run_backtest(df, signal_gen):
         current_high = current_row['high']
         current_low = current_row['low']
         
-        # --- EXIT LOGIC ---
-        # First, check if we need to exit our current position
+        # ✅ CORRECTED EXIT LOGIC
         if in_position:
-            # Check for Take-Profit
-            if current_high >= take_profit_price:
+            # 1. Check for Stop-Loss first (conservative, "worst-first" approach)
+            if current_low <= stop_loss_price:
+                exit_price = stop_loss_price
+                pnl = ((exit_price - entry_price) / entry_price) * 100 - (2 * TRADING_FEE_PCT)
+                trades.append(pnl)
+                print(f"\n❌ STOP LOSS at {exit_price:.2f}. PnL: {pnl:.3f}%")
+                in_position = False 
+
+            # 2. Only if not stopped out, check for Take-Profit
+            elif current_high >= take_profit_price:
                 exit_price = take_profit_price
                 pnl = ((exit_price - entry_price) / entry_price) * 100 - (2 * TRADING_FEE_PCT)
                 trades.append(pnl)
                 winning_trades += 1
                 print(f"\n✅ TAKE PROFIT at {exit_price:.2f}. PnL: {pnl:.3f}%")
-                in_position = False # Reset for next trade
-
-            # Check for Stop-Loss
-            elif current_low <= stop_loss_price:
-                exit_price = stop_loss_price
-                pnl = ((exit_price - entry_price) / entry_price) * 100 - (2 * TRADING_FEE_PCT)
-                trades.append(pnl)
-                print(f"\n❌ STOP LOSS at {exit_price:.2f}. PnL: {pnl:.3f}%")
-                in_position = False # Reset for next trade
+                in_position = False
 
         # --- ENTRY LOGIC ---
-        # If we are not in a position, check for a new buy signal
         if not in_position:
             result = signal_gen.get_signal(current_row.to_dict())
             signal = result.get('signal')

@@ -1,5 +1,6 @@
 import os
 import argparse
+import json
 import pandas as pd
 import numpy as np
 import joblib
@@ -82,7 +83,6 @@ def compute_atr(df, period=14):
 def preprocess_data(df, feature_cols, lookahead_period,  risk_reward_ratio, profit_threshold_pct):
     """
     Engineers features, creates labels, and scales data.
-    This version DOES NOT create windowed numpy arrays to save memory.
     """
     print("Preprocessing data...")
     # --- Feature Engineering ---
@@ -99,15 +99,18 @@ def preprocess_data(df, feature_cols, lookahead_period,  risk_reward_ratio, prof
     df['rsi_14'] = compute_rsi(df['close'], 14)
     df['vol_change'] = df['volume'].pct_change()
     df['atr'] = compute_atr(df, period=14)
-    df_hourly = df['close'].resample('h').mean()
+
+    hourly_index = df.index.floor('h')
+    df_hourly = df['close'].groupby(hourly_index).mean()
     hourly_ema = df_hourly.ewm(span=20).mean()
-    df['hourly_ema_20'] = hourly_ema.reindex(df.index, method='ffill')
+    df['hourly_ema_20'] = hourly_ema.reindex(hourly_index, method='ffill').values
     df['price_vs_hourly_trend'] = (df['close'] - df['hourly_ema_20']) / (df['hourly_ema_20'] + 1e-9)
+
     df['bb_std'] = df['close'].rolling(20).std()
     df['bb_mid'] = df['close'].rolling(20).mean()
     df['bb_width'] = ((df['bb_mid'] + 2 * df['bb_std']) - (df['bb_mid'] - 2 * df['bb_std'])) / (df['bb_mid'] + 1e-9)
     
-    # --- OPTIMIZED LABELING STRATEGY (RISK/REWARD) ---
+    # --- Labeling Strategy ---
     future_highs = df['high'].rolling(window=lookahead_period).max().shift(-lookahead_period)
     future_lows = df['low'].rolling(window=lookahead_period).min().shift(-lookahead_period)
     potential_profit = future_highs - df['close']
@@ -121,14 +124,12 @@ def preprocess_data(df, feature_cols, lookahead_period,  risk_reward_ratio, prof
         (potential_profit > risk_reward_ratio * potential_loss)
     ).astype(int)
     
-    # --- Data Cleaning & Scaling ---
     df.replace([np.inf, -np.inf], 0, inplace=True)
     df.dropna(inplace=True)
     
     scaler = StandardScaler()
     df[feature_cols] = scaler.fit_transform(df[feature_cols])
 
-    # ✅ Return the processed DataFrames and the scaler
     return df[feature_cols], df['label'], scaler
 
 # ==============================================================================
@@ -136,21 +137,15 @@ def preprocess_data(df, feature_cols, lookahead_period,  risk_reward_ratio, prof
 # ==============================================================================
 
 class CustomTimeSeriesDataset(Dataset):
-    """
-    Custom PyTorch Dataset to handle large time-series data efficiently.
-    Generates windows on-the-fly to avoid storing them all in memory.
-    """
     def __init__(self, features_df, labels_series, window_size):
         self.features = features_df.values
         self.labels = labels_series.values
         self.window_size = window_size
 
     def __len__(self):
-        # Return the total number of samples that can be generated
         return len(self.features) - self.window_size
 
     def __getitem__(self, idx):
-        # This is called by the DataLoader to get one sample
         feature_window = self.features[idx : idx + self.window_size]
         label = self.labels[idx + self.window_size]
         return torch.tensor(feature_window, dtype=torch.float32), torch.tensor(label, dtype=torch.float32).view(1)
@@ -185,7 +180,6 @@ def main(args):
         'sma_ratio', 'ema_20', 'macd', 'rsi_14', 'vol_change', 'atr', 'price_vs_hourly_trend', 'bb_width'
     ]
     
-    # ✅ Preprocess data without creating windowed arrays
     features_df, labels_series, scaler = preprocess_data(
         full_df, 
         feature_cols, 
@@ -198,10 +192,8 @@ def main(args):
     joblib.dump(scaler, scaler_path)
     print(f"Scaler saved to {scaler_path}")
 
-    # ✅ Use the Custom Dataset for memory efficiency
     full_dataset = CustomTimeSeriesDataset(features_df, labels_series, args.window_size)
     
-    # --- Stratified splitting using indices to save memory ---
     all_labels_for_split = labels_series.values[args.window_size:]
     indices = list(range(len(all_labels_for_split)))
     
@@ -210,16 +202,13 @@ def main(args):
         temp_labels_for_split = all_labels_for_split[temp_indices]
         val_indices, test_indices, _, _ = train_test_split(temp_indices, temp_labels_for_split, test_size=0.5, random_state=42, stratify=temp_labels_for_split)
     except ValueError:
-        # Fallback for extreme class imbalance where stratification is not possible
         print("Warning: Stratification failed due to extreme class imbalance. Using a random split.")
         train_indices, temp_indices = train_test_split(indices, test_size=0.2, random_state=42)
         val_indices, test_indices = train_test_split(temp_indices, test_size=0.5, random_state=42)
 
     train_data = Subset(full_dataset, train_indices)
     val_data = Subset(full_dataset, val_indices)
-    test_data = Subset(full_dataset, test_indices)
-
-    # --- Calculate class weights from the training set labels ---
+    
     train_labels = all_labels_for_split[train_indices]
     neg_count = np.sum(train_labels == 0)
     pos_count = np.sum(train_labels == 1)
@@ -229,12 +218,21 @@ def main(args):
 
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=args.batch_size)
-    test_loader = DataLoader(test_data, batch_size=args.batch_size)
     
     model = LSTMModel(len(feature_cols), 128, 3, 1, args.dropout_rate).to(device)
     
+    # ✅ ADDED: Save model configuration for robust deployment
+    model_config = {
+        "input_size": len(feature_cols), "hidden_size": 128, "num_layers": 3,
+        "output_size": 1, "dropout_rate": args.dropout_rate
+    }
+    config_path = os.path.join(args.model_dir, "model_config.json")
+    with open(config_path, 'w') as f:
+        json.dump(model_config, f)
+    print(f"Model config saved to {config_path}")
+
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
 
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -254,26 +252,35 @@ def main(args):
 
         model.eval()
         total_val_loss = 0
+        all_labels = []
+        all_preds = []
         with torch.no_grad():
             for inputs, labels in val_loader:
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
                 total_val_loss += loss.item()
+                # ✅ ADDED: Collect predictions and labels for accuracy calculation
+                preds = torch.sigmoid(outputs) > 0.5
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
 
         avg_train_loss = total_train_loss / len(train_loader)
         avg_val_loss = total_val_loss / len(val_loader)
-        print(f"Epoch {epoch+1}/{args.epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-        print(f"Val Loss: {avg_val_loss:.4f}")
+        # ✅ ADDED: Calculate and print validation accuracy
+        val_accuracy = np.mean(np.array(all_preds) == np.array(all_labels)) * 100
+        print(f"Epoch {epoch+1}/{args.epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}%")
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             best_model_path = os.path.join(args.model_dir, "best_model.pth")
             torch.save(model.state_dict(), best_model_path)
             print(f"  -> Best model saved to {best_model_path}")
-            epochs_no_improve = 0  # ✅ RESET COUNTER
+            epochs_no_improve = 0
         else:
-            epochs_no_improve += 1 # ✅ INCREMENT COUNTER
+            epochs_no_improve += 1
+            # ✅ ADDED: Print patience counter for better logging
+            print(f"  -> No improvement. Patience: {epochs_no_improve}/{patience}")
             
         if epochs_no_improve >= patience:
             print(f"Early stopping triggered after {patience} epochs with no improvement.")

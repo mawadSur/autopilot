@@ -25,7 +25,6 @@ def run_paper_trader():
     if not endpoint_name:
         raise ValueError("ENDPOINT_NAME not set in .env file.")
     
-    # Ensure TESTNET=true in your .env file to use the testnet client
     try:
         client = get_client_binance() 
         print("✅ Successfully connected to Binance Testnet API.")
@@ -59,7 +58,6 @@ def run_paper_trader():
     # --- Main Trading Loop ---
     while True:
         try:
-            # Fetch the latest completed kline (candle)
             latest_kline = client.get_klines(symbol=SYMBOL, interval=client.KLINE_INTERVAL_1MINUTE, limit=1)[0]
             kline_data = {
                 'date': pd.to_datetime(latest_kline[0], unit='ms'),
@@ -75,23 +73,22 @@ def run_paper_trader():
 
             print(f"\rChecking {kline_data['date']} | Price: ${current_price:.2f} | In Position: {in_position}", end="")
 
-            # --- EXIT LOGIC ---
+            # ✅ CORRECTED EXIT LOGIC
             if in_position:
                 pnl = 0.0
                 exit_reason = ""
 
-                # Check for Take-Profit
-                if current_high >= take_profit_price:
+                # 1. Check for Stop-Loss first (conservative, "worst-first" approach)
+                if current_low <= stop_loss_price:
+                    pnl = -STOP_LOSS_PCT - (2 * TRADING_FEE_PCT)
+                    exit_reason = f"❌ SELL (STOP LOSS) at ~${stop_loss_price:.2f}"
+                
+                # 2. Only if not stopped out, check for Take-Profit
+                elif current_high >= take_profit_price:
                     pnl = TAKE_PROFIT_PCT - (2 * TRADING_FEE_PCT)
                     winning_trades += 1
                     exit_reason = f"✅ SELL (TAKE PROFIT) at ~${take_profit_price:.2f}"
-                
-                # Check for Stop-Loss
-                elif current_low <= stop_loss_price:
-                    pnl = -STOP_LOSS_PCT - (2 * TRADING_FEE_PCT)
-                    exit_reason = f"❌ SELL (STOP LOSS) at ~${stop_loss_price:.2f}"
 
-                # If an exit condition was met, log the trade
                 if exit_reason:
                     total_pnl_pct += pnl
                     log_msg = f"{exit_reason} | PnL: {pnl:.3f}%"
