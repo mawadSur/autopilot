@@ -9,13 +9,11 @@ __pycache__/
 *.whl
 *.csv
 labeled_chunks/
-model_meta.json
 .venv*
 tf-venv*
 *.deb*
 *.run
 *.txt
-*.json
 eth_1m_data
 eth_1s_data
 

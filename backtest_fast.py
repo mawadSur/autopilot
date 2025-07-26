@@ -159,9 +159,18 @@ def main():
         predictions = model(input_tensor)
     
     probabilities = torch.sigmoid(predictions).cpu().numpy().flatten()
-    
+        # --- ADD THIS DIAGNOSTIC CODE ---
+    print("\n--- Prediction Diagnostics ---")
+    if len(probabilities) > 0:
+        print(f"Max probability predicted: {np.max(probabilities):.4f}")
+        print(f"Average probability predicted: {np.mean(probabilities):.4f}")
+        print(f"Number of predictions > 0.6: {np.sum(probabilities > 0.6)}")
+    else:
+        print("No probabilities were generated.")
+    print("----------------------------\n")
+    # --------------------------------
     # Generate signals based on a threshold (e.g., 0.8)
-    signals_raw = (probabilities > 0.8).astype(int)
+    signals_raw = (probabilities > 0.6).astype(int)
     
     # Align signals with the main dataframe (signals correspond to the *end* of each window)
     signals = np.zeros(len(df_features))
