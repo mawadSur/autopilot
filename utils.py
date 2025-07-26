@@ -15,6 +15,39 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+def load_ohlc_chunks(folder, chunk_mode=False):
+    print(f"[DEBUG] Loading data from: {folder}")
+    files = []
+    for dirpath, _, filenames in os.walk(folder):
+        for f in filenames:
+            if f.endswith('.csv'):
+                files.append(os.path.join(dirpath, f))
+
+    if not files:
+        raise FileNotFoundError(f"No .csv files found recursively in folder: {folder}")
+
+    column_names = ['date', 'open', 'high', 'low', 'close', 'volume']
+    numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+    all_dfs = []
+    for f in sorted(files):
+        try:
+            df = pd.read_csv(f, header=None, names=column_names)
+            for col in numeric_cols:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            df.dropna(inplace=True)
+            if not df.empty:
+                if chunk_mode:
+                    yield df
+                else:
+                    all_dfs.append(df)
+        except Exception as e:
+            print(f"[ERROR] Could not process file {f}: {e}")
+
+    if not chunk_mode:
+        if not all_dfs:
+            return pd.DataFrame()
+        return pd.concat(all_dfs)
+
 def get_client_binance():
     """Initializes and returns a Binance client based on environment variables."""
     if os.getenv("TESTNET", "false").lower() == "true":
