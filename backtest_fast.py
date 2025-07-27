@@ -64,30 +64,34 @@ def compute_technical_indicators(df):
     df.dropna(inplace=True)
     return df
 
-def run_fast_backtest(df, signals):
+def run_chunk_backtest(df, signals):
     """
-    Runs the backtest using the pre-computed signals. This loop is very fast.
+    Runs the backtest on a single chunk of data and returns the results.
     """
-    print("\n📈 Starting fast backtest...")
+    # --- CORRECTED: Realistic trading parameters ---
     TRADING_FEE_PCT = 0.01
-    TAKE_PROFIT_PCT = 0.1
-    STOP_LOSS_PCT = 5000.0
+    TAKE_PROFIT_PCT = 20.00
+    STOP_LOSS_PCT = 0.5
 
     in_position = False
     entry_price = 0.0
+    take_profit_price = 0.0
+    stop_loss_price = 0.0
+    
     trades = []
     winning_trades = 0
 
-    for i in tqdm(range(len(df)), desc="Backtesting"):
+    for i in range(len(df)):
         current_row = df.iloc[i]
-        current_price = current_row['close']
         
         if in_position:
             if current_row['low'] <= stop_loss_price:
+                # Use the constant SL percentage for PnL
                 pnl = -STOP_LOSS_PCT - (2 * TRADING_FEE_PCT)
                 trades.append(pnl)
                 in_position = False 
             elif current_row['high'] >= take_profit_price:
+                # Use the constant TP percentage for PnL
                 pnl = TAKE_PROFIT_PCT - (2 * TRADING_FEE_PCT)
                 trades.append(pnl)
                 winning_trades += 1
@@ -95,44 +99,17 @@ def run_fast_backtest(df, signals):
 
         if not in_position and signals[i] == 1:
             in_position = True
-            entry_price = current_price
+            entry_price = current_row['close']
             take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT / 100)
             stop_loss_price = entry_price * (1 - STOP_LOSS_PCT / 100)
 
-    # --- SUMMARY ---
-    total_trades = len(trades)
-    print("\n--- Backtest Summary ---")
-    if total_trades > 0:
-        win_rate = (winning_trades / total_trades) * 100
-        total_pnl = sum(trades)
-        print(f"Total Trades Executed: {total_trades}")
-        print(f"Win Rate: {win_rate:.2f}%")
-        print(f"Total Net PnL: {total_pnl:.2f}%")
-    else:
-        print("No trades were executed.")
-    print("------------------------")
+    return trades, winning_trades
 
 def main():
     """Main function to load data, run batch predictions, and start the backtest."""
-    # Define paths to your model artifacts
     MODEL_DIR = "./output" # Assumes artifacts are in an 'output' folder
-    print("Loading historical data...")
-    df = pd.concat(load_ohlc_chunks(folder='eth_1m_data', chunk_mode=True), ignore_index=True)
-    df['date'] = pd.to_datetime(df['date'], unit='ms')
-    df.set_index('date', inplace=True)
-    if df.empty:
-        print("No data found.")
-        return
-
-    print("1. Computing features for the entire dataset...")
-    df_features = compute_technical_indicators(df.copy())
     
-    feature_cols = [
-        'open', 'high', 'low', 'close', 'body', 'range', 'upper_wick', 'lower_wick', 'return',
-        'sma_ratio', 'ema_20', 'macd', 'rsi_14', 'vol_change', 'atr', 'price_vs_hourly_trend', 'bb_width'
-    ]
-    
-    print("2. Loading scaler and model...")
+    print("Loading model and scaler once...")
     scaler = joblib.load(os.path.join(MODEL_DIR, "scaler.pkl"))
     with open(os.path.join(MODEL_DIR, "model_config.json"), 'r') as f:
         model_config = json.load(f)
@@ -142,43 +119,69 @@ def main():
     model.load_state_dict(torch.load(os.path.join(MODEL_DIR, "best_model.pth"), map_location=device))
     model.eval()
 
-    print("3. Getting batch predictions for all data points...")
-    # Scale features
-    scaled_features = scaler.transform(df_features[feature_cols])
-    
-    # Create sliding windows for model input
+    feature_cols = [
+        'open', 'high', 'low', 'close', 'body', 'range', 'upper_wick', 'lower_wick', 'return',
+        'sma_ratio', 'ema_20', 'macd', 'rsi_14', 'vol_change', 'atr', 'price_vs_hourly_trend', 'bb_width'
+    ]
     window_size = model_config['input_size']
-    windows = []
-    for i in range(len(scaled_features) - window_size + 1):
-        windows.append(scaled_features[i:i + window_size])
     
-    input_tensor = torch.tensor(np.array(windows), dtype=torch.float32).to(device)
+    # --- MODIFIED: Process data in chunks to save memory ---
+    all_trades = []
+    total_winning_trades = 0
     
-    # Get all predictions at once
-    with torch.no_grad():
-        predictions = model(input_tensor)
+    data_chunks = load_ohlc_chunks(folder='eth_1m_data', chunk_mode=True)
     
-    probabilities = torch.sigmoid(predictions).cpu().numpy().flatten()
-        # --- ADD THIS DIAGNOSTIC CODE ---
-    print("\n--- Prediction Diagnostics ---")
-    if len(probabilities) > 0:
-        print(f"Max probability predicted: {np.max(probabilities):.4f}")
-        print(f"Average probability predicted: {np.mean(probabilities):.4f}")
-        print(f"Number of predictions > 0.6: {np.sum(probabilities > 0.6)}")
-    else:
-        print("No probabilities were generated.")
-    print("----------------------------\n")
-    # --------------------------------
-    # Generate signals based on a threshold (e.g., 0.8)
-    signals_raw = (probabilities > 0.6).astype(int)
-    
-    # Align signals with the main dataframe (signals correspond to the *end* of each window)
-    signals = np.zeros(len(df_features))
-    signals[window_size-1:] = signals_raw
-    df_features['signal'] = signals
+    for df_chunk in tqdm(data_chunks, desc="Processing monthly chunks"):
+        df_chunk['date'] = pd.to_datetime(df_chunk['date'], unit='ms')
+        df_chunk.set_index('date', inplace=True)
+        if df_chunk.empty:
+            continue
 
-    # Run the fast backtest
-    run_fast_backtest(df_features, df_features['signal'].values)
+        # 1. Compute features for the current chunk
+        df_features = compute_technical_indicators(df_chunk.copy())
+        if len(df_features) <= window_size:
+            continue
+
+        # 2. Scale features and create windows
+        scaled_features = scaler.transform(df_features[feature_cols])
+        
+        # A more memory-efficient way to create windows might be needed for very low-RAM systems
+        # but this is generally fine for chunk-based processing.
+        windows = [scaled_features[i:i + window_size] for i in range(len(scaled_features) - window_size + 1)]
+        input_tensor = torch.tensor(np.array(windows), dtype=torch.float32).to(device)
+        
+        # 3. Get predictions for the chunk
+        with torch.no_grad():
+            predictions = model(input_tensor)
+        
+        probabilities = torch.sigmoid(predictions).cpu().numpy().flatten()
+        signals_raw = (probabilities > 0.65).astype(int) # Using a more realistic threshold
+        
+        # 4. Align signals and run backtest for the chunk
+        signals = np.zeros(len(df_features))
+        signals[window_size-1:] = signals_raw
+        
+        chunk_trades, chunk_wins = run_chunk_backtest(df_features, signals)
+        
+        # 5. Aggregate results
+        all_trades.extend(chunk_trades)
+        total_winning_trades += chunk_wins
+
+    # --- FINAL SUMMARY ---
+    total_trades = len(all_trades)
+    print("\n--- Overall Backtest Summary ---")
+    if total_trades > 0:
+        win_rate = (total_winning_trades / total_trades) * 100
+        total_pnl = sum(all_trades)
+        print(f"Total Trades Executed: {total_trades}")
+        print(f"Winning Trades: {total_winning_trades}")
+        print(f"Win Rate: {win_rate:.2f}%")
+        print(f"Total Net PnL: {total_pnl:.2f}%")
+        print(f"Average PnL per Trade: {total_pnl / total_trades:.3f}%")
+    else:
+        print("No trades were executed during the entire backtest.")
+    print("---------------------------------")
+
 
 if __name__ == "__main__":
     main()
