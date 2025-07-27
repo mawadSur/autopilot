@@ -69,9 +69,9 @@ def run_fast_backtest(df, signals):
     Runs the backtest using the pre-computed signals. This loop is very fast.
     """
     print("\n📈 Starting fast backtest...")
-    TRADING_FEE_PCT = 0.075
-    TAKE_PROFIT_PCT = 1.5
-    STOP_LOSS_PCT = 0.75
+    TRADING_FEE_PCT = 0.01
+    TAKE_PROFIT_PCT = 0.1
+    STOP_LOSS_PCT = 5000.0
 
     in_position = False
     entry_price = 0.0
@@ -115,7 +115,7 @@ def run_fast_backtest(df, signals):
 def main():
     """Main function to load data, run batch predictions, and start the backtest."""
     # Define paths to your model artifacts
-    MODEL_DIR = "./output" # Assumes artifacts are in an 'output' folder
+    MODEL_DIR = ".\\output" # Assumes artifacts are in an 'output' folder
     print("Loading historical data...")
     df = pd.concat(load_ohlc_chunks(folder='eth_1m_data', chunk_mode=True), ignore_index=True)
     df['date'] = pd.to_datetime(df['date'], unit='ms')
