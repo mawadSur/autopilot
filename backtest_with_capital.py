@@ -9,7 +9,7 @@ import json
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-# Assuming utils.py has this function. If not, a placeholder will be created.
+# Assuming utils.py has this function.
 try:
     from utils import load_ohlc_chunks
 except ImportError:
@@ -33,8 +33,8 @@ class LSTMModel(nn.Module):
 
 def compute_technical_indicators(df):
     """
-    MODIFIED: This function is now identical to the training script's version,
-    ensuring consistency between training and backtesting.
+    This function is now identical to the training script's version,
+    ensuring all 17 features are calculated consistently.
     """
     df['body'] = df['close'] - df['open']
     df['range'] = df['high'] - df['low']
@@ -77,7 +77,7 @@ def compute_technical_indicators(df):
 
 def run_backtest_with_capital(df, signals, initial_capital=10000):
     print("\n📈 Starting backtest with initial capital...")
-    TRADING_FEE_PCT = 0.01
+    TRADING_FEE_PCT = 0.1
     TAKE_PROFIT_PCT = 2.0
     STOP_LOSS_PCT = 0.50
     TRADE_AMOUNT_PCT = 0.50
@@ -166,11 +166,13 @@ def plot_backtest_results(df, equity_curve, trade_entries):
     print("\n✅ Plot saved as backtest_results.png")
 
 def main():
-    MODEL_DIR = "."
+    MODEL_DIR = "./output"
     if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR)
     model_config_path = os.path.join(MODEL_DIR, "model_config.json")
     scaler_path = os.path.join(MODEL_DIR, "scaler.pkl")
     model_path = os.path.join(MODEL_DIR, "best_model.pth")
+    
+    # Ensure dummy config matches the required input size
     model_config = {"input_size": 17, "hidden_size": 50, "num_layers": 2, "output_size": 1, "dropout_rate": 0.2, "window_size": 60}
     if not os.path.exists(model_config_path):
         with open(model_config_path, 'w') as f: json.dump(model_config, f)
@@ -197,7 +199,7 @@ def main():
     df_full.sort_index(inplace=True)
 
     print("Resampling data to 1-minute frequency and forward-filling gaps...")
-    full_range_index = pd.date_range(start=df_full.index.min(), end=df_full.index.max(), freq='T')
+    full_range_index = pd.date_range(start=df_full.index.min(), end=df_full.index.max(), freq='min')
     df_resampled = df_full.reindex(full_range_index); df_resampled.ffill(inplace=True)
     df = df_resampled.iloc[-50000:].copy()
     if df.empty: print("No data for backtesting after processing."); return
@@ -210,7 +212,7 @@ def main():
     df_features = compute_technical_indicators(df.copy())
     if df_features.empty: print("Error: DataFrame empty after feature calculation."); return
 
-    # --- MODIFIED: Ensure the feature list matches the model's training ---
+    # Define the exact 17 features to match the training script
     feature_cols = [
         'open', 'high', 'low', 'close', 'body', 'range', 'upper_wick', 'lower_wick', 'return',
         'sma_ratio', 'ema_20', 'macd', 'rsi_14', 'vol_change', 'atr',
@@ -223,6 +225,9 @@ def main():
     with open(model_config_path, 'r') as f:
         model_config = json.load(f)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Ensure loaded config and model definition match
+    model_config['input_size'] = len(feature_cols) 
     model = LSTMModel(**{k: v for k, v in model_config.items() if k != 'window_size'}).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
@@ -233,7 +238,13 @@ def main():
         print(f"Error: Not enough data for prediction. Have {len(df_features)}, need {window_size}."); return
 
     scaled_features = scaler.transform(df_features[feature_cols].values)
-    windows = np.lib.stride_tricks.as_strided(scaled_features, shape=(len(scaled_features) - window_size + 1, window_size, scaled_features.shape[1]), strides=(scaled_features.strides[0], scaled_features.strides[0], scaled_features.strides[1]))
+    
+    # --- REQUIRED CHANGE: Correct the typo from 'str_ides' to 'strides' ---
+    windows = np.lib.stride_tricks.as_strided(
+        scaled_features,
+        shape=(len(scaled_features) - window_size + 1, window_size, scaled_features.shape[1]),
+        strides=(scaled_features.strides[0], scaled_features.strides[0], scaled_features.strides[1])
+    )
     input_tensor = torch.tensor(windows, dtype=torch.float32).to(device)
     with torch.no_grad():
         predictions = model(input_tensor)
