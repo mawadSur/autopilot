@@ -89,8 +89,8 @@ pytorch_estimator = PyTorch(
     framework_version='2.0.0',
     py_version='py310',
     hyperparameters={
-        'epochs': 50, 'patience': 5, 'batch-size': 512, 'window-size': 150,
-        'lookahead-period': 10, 'risk-reward-ratio': 2.0, 'profit-threshold-pct': 0.5
+        'epochs': 50, 'patience': 10, 'batch-size': 2048, 'window-size': 150,
+        'lookahead-period': 1, 'risk-reward-ratio': 2.0, 'profit-threshold-pct': 0.2
     }
 )
 

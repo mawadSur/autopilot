@@ -115,7 +115,7 @@ def run_fast_backtest(df, signals):
 def main():
     """Main function to load data, run batch predictions, and start the backtest."""
     # Define paths to your model artifacts
-    MODEL_DIR = ".\\output" # Assumes artifacts are in an 'output' folder
+    MODEL_DIR = "./output" # Assumes artifacts are in an 'output' folder
     print("Loading historical data...")
     df = pd.concat(load_ohlc_chunks(folder='eth_1m_data', chunk_mode=True), ignore_index=True)
     df['date'] = pd.to_datetime(df['date'], unit='ms')
