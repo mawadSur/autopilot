@@ -7,8 +7,8 @@ from typing import List, Dict
 
 # --- Local Imports (for data processing and simulation) ---
 # Ensure these files are in the same directory or a sub-directory
-from utils import get_client_binance, load_ohlc_chunks, compute_rsi, compute_atr
-from aws_train_model import preprocess_data, LSTMModel # Re-using your preprocessing and model class
+from utils import get_client_binance, compute_rsi, compute_atr
+from aws_train_model import LSTMModel # Re-using your preprocessing and model class
 
 # --- PyTorch and ML Imports ---
 import torch
