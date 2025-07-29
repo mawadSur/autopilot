@@ -9,6 +9,7 @@ from typing import List, Dict
 # Ensure these files are in the same directory or a sub-directory
 from utils import get_client_binance, compute_rsi, compute_atr
 from aws_train_model import LSTMModel # Re-using your preprocessing and model class
+from fastapi.middleware.cors import CORSMiddleware
 
 # --- PyTorch and ML Imports ---
 import torch
@@ -25,6 +26,13 @@ from binance.client import Client
 
 app = FastAPI(title="AI Trading API", version="1.0.0")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Or ["http://localhost:3000"] for a React frontend, etc.
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # --- Global State & Model Cache ---
 # This dictionary will hold our loaded model and scaler to avoid reloading them.
 model_cache = {}
