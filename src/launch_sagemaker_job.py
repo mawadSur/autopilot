@@ -80,7 +80,7 @@ print(f"Data uploaded to: {s3_data_path}")
 
 estimator = PyTorch(
     entry_point='aws_train_model.py',
-    source_dir='.',
+    source_dir='src',
     role=IAM_ROLE_ARN,
     framework_version='2.0.0',
     py_version='py310',
