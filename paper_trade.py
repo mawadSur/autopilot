@@ -1,127 +1,162 @@
 import os
 import time
-import json
-import joblib
-import logging
-import numpy as np
 import pandas as pd
-from datetime import datetime
-from tensorflow.keras.models import load_model
-from binance.client import Client
-from binance.enums import *
+import logging
 from dotenv import load_dotenv
-from train_model import focal_loss
-from utils import compute_rsi
+from utils import SignalGenerator, get_client_binance
 
-# ==== CONFIG ====
-WINDOW_SIZE = 150
-FIXED_BATCH_SIZE = 16
-CONF_THRESHOLD = 0.75  # fallback
-FEATURE_COLS = [
-    'open', 'high', 'low', 'close', 'body', 'range',
-    'upper_wick', 'lower_wick', 'return', 'sma_ratio',
-    'ema_20', 'macd', 'rsi_14', 'vol_change'
-]
+def run_paper_trader():
+    """
+    Runs a paper trading bot that manages a simulated account balance.
+    """
+    print("🚀 Starting Paper Trading Bot (Testnet)...")
+    load_dotenv()
 
-# ==== ENV & Logging ====
-load_dotenv()
-API_KEY = os.getenv("BINANCE_TESTNET_KEY")
-API_SECRET = os.getenv("BINANCE_TESTNET_SECRET")
-client = Client(API_KEY, API_SECRET)
-client.API_URL = 'https://testnet.binance.vision/api'
-logging.basicConfig(filename='paper_trade_log.txt', level=logging.INFO, format='%(asctime)s - %(message)s')
+    # --- Setup Logging ---
+    logging.basicConfig(
+        filename='paper_trade.log',
+        level=logging.INFO,
+        format='%(asctime)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
 
-# ==== Load Model and Scaler ====
-model = load_model('eth_lstm_model.h5', custom_objects={'loss': focal_loss()}, compile=False)
-scaler = joblib.load("scaler.pkl")
+    # --- Get Environment Variables & Initialize Clients ---
+    endpoint_name = os.getenv("ENDPOINT_NAME")
+    if not endpoint_name:
+        raise ValueError("ENDPOINT_NAME not set in .env file.")
 
-try:
-    with open("model_meta.json", "r") as f:
-        CONF_THRESHOLD = json.load(f).get("threshold", CONF_THRESHOLD)
-except Exception:
-    pass
+    try:
+        client = get_client_binance()
+        print("✅ Successfully connected to Binance Testnet API.")
+    except Exception as e:
+        print(f"❌ Error connecting to Binance: {e}")
+        logging.error(f"Error connecting to Binance: {e}")
+        return
 
-# ==== Feature Engineering ====
-def engineer_features(df):
-    df['body'] = df['close'] - df['open']
-    df['range'] = df['high'] - df['low']
-    df['upper_wick'] = df['high'] - df[['close', 'open']].max(axis=1)
-    df['lower_wick'] = df[['close', 'open']].min(axis=1) - df['low']
-    df['return'] = df['close'].pct_change()
-    df['sma_10'] = df['close'].rolling(10).mean()
-    df['sma_50'] = df['close'].rolling(50).mean()
-    df['sma_ratio'] = df['sma_10'] / df['sma_50'] - 1
-    df['ema_20'] = df['close'].ewm(span=20).mean()
-    df['macd'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
-    df['rsi_14'] = compute_rsi(df['close'], 14)
-    df['vol_change'] = df['volume'].pct_change()
-    df.dropna(inplace=True)
-    return df
+    signal_gen = SignalGenerator(endpoint_name=endpoint_name)
 
-def prepare_input(df):
-    df = engineer_features(df)
-    recent = df[FEATURE_COLS].values[-WINDOW_SIZE:]
-    recent_scaled = scaler.transform(recent)
-    X = np.array([recent_scaled] * FIXED_BATCH_SIZE)  # stateful batch
-    current_price = df['close'].iloc[-1]
-    return X, current_price, df[['close', 'macd', 'rsi_14', 'sma_ratio']].tail(3)
+    # --- Trading Parameters ---
+    SYMBOL = 'ETHUSDT'
+    TRADING_FEE_PCT = 0.075
+    SLIPPAGE_PCT = 0.02
+    ATR_MULTIPLIER_TP = 2.5
+    ATR_MULTIPLIER_SL = 1.5
 
-# ==== Fetch Binance OHLCV ====
-def fetch_eth_ohlcv(minutes=180):
-    klines = client.get_klines(symbol='ETHUSDT', interval=KLINE_INTERVAL_1MINUTE, limit=minutes)
-    df = pd.DataFrame(klines, columns=[
-        'open_time', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_asset_volume', 'num_trades',
-        'taker_buy_base_volume', 'taker_buy_quote_volume', 'ignore'
-    ])
-    df['date'] = pd.to_datetime(df['open_time'], unit='ms')
-    df.set_index('date', inplace=True)
-    df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
-    return df
+    # --- Account and Position Sizing ---
+    STARTING_BALANCE_USDT = 10000.0
+    current_balance_usdt = STARTING_BALANCE_USDT
+    asset_quantity = 0.0
 
-# ==== Paper Trading ====
-def run_multiple_trades(n=10, interval=60):
-    total_profit = 0.0
+    # --- Trading State & Performance Tracking ---
+    in_position = False
+    entry_price = 0.0
+    take_profit_price = 0.0
+    stop_loss_price = 0.0
+
     trade_count = 0
-    last_close = None
+    winning_trades = 0
 
-    for i in range(n):
+    print(f"Trading Parameters: Start Balance=${STARTING_BALANCE_USDT}, ATR TP={ATR_MULTIPLIER_TP}x, SL={ATR_MULTIPLIER_SL}x")
+    logging.info(f"--- Starting New Paper Trading Session ---")
+    logging.info(f"Parameters: Start Balance=${STARTING_BALANCE_USDT}, ATR TP={ATR_MULTIPLIER_TP}x, SL={ATR_MULTIPLIER_SL}x, Fee={TRADING_FEE_PCT}%, Slippage={SLIPPAGE_PCT}%")
+
+    # --- Main Trading Loop ---
+    while True:
         try:
-            df = fetch_eth_ohlcv()
-            X, current_price, debug_tail = prepare_input(df)
-            prediction = model.predict(X, batch_size=FIXED_BATCH_SIZE).flatten()[0]
-            model.reset_states()
+            latest_kline = client.get_klines(symbol=SYMBOL, interval=client.KLINE_INTERVAL_1MINUTE, limit=1)[0]
+            kline_data = {
+                'date': latest_kline[0],
+                'open': float(latest_kline[1]), 'high': float(latest_kline[2]),
+                'low': float(latest_kline[3]), 'close': float(latest_kline[4]),
+                'volume': float(latest_kline[5])
+            }
+            current_price = kline_data['close']
+            current_high = kline_data['high']
+            current_low = kline_data['low']
+            current_time_display = pd.to_datetime(kline_data['date'], unit='ms')
 
-            new_close = df['close'].iloc[-1]
-            if last_close == new_close:
-                print(f"[{i+1}] Waiting for fresh data...")
-                time.sleep(interval)
-                continue
-            last_close = new_close
+            # Get signal data before printing status
+            result = signal_gen.get_signal(kline_data)
 
-            print(debug_tail)
-            print(f"[{i+1}] Confidence: {prediction:.4f} | Threshold: {CONF_THRESHOLD:.2f} | Price: {current_price:.2f}")
+            # --- MODIFIED: Verbose Console Logging ---
+            # This block creates a detailed status update for the console only.
+            status_log = [f"\n--- [ {current_time_display} ] ---"]
+            status_log.append(f"  📈 Price:         ${current_price:<8.2f}")
+            status_log.append(f"  💰 Balance:       ${current_balance_usdt:.2f}")
+            status_log.append(f"  🧠 Model Output:    {result}")
 
-            if prediction > CONF_THRESHOLD:
-                entry = current_price
-                simulated_exit = entry * 1.01
-                pnl = simulated_exit - entry
-                total_profit += pnl
-                trade_count += 1
-                print(f"✅ Trade {i+1}: Buy {entry:.2f} → Sell {simulated_exit:.2f} | PnL: {pnl:.2f}")
-                logging.info(f"Trade {i+1} | Entry: {entry:.2f}, Exit: {simulated_exit:.2f}, PnL: {pnl:.2f}")
+            if in_position:
+                status_log.append(f"  🎯 Position Active: TP @ ${take_profit_price:.2f}, SL @ ${stop_loss_price:.2f}")
             else:
-                print(f"🚫 Trade {i+1}: Skipped (Low confidence)")
+                status_log.append("  ⏳ Status:          Awaiting signal...")
+            print("\n".join(status_log))
+
+
+            # --- EXIT LOGIC ---
+            if in_position:
+                exit_price = 0.0
+                exit_reason = ""
+
+                if current_low <= stop_loss_price:
+                    exit_price = stop_loss_price
+                    exit_reason = f"❌ SELL (STOP LOSS)"
+                elif current_high >= take_profit_price:
+                    exit_price = take_profit_price
+                    winning_trades += 1
+                    exit_reason = f"✅ SELL (TAKE PROFIT)"
+
+                if exit_reason:
+                    actual_exit_price = exit_price * (1 - SLIPPAGE_PCT / 100)
+                    position_value = asset_quantity * actual_exit_price
+                    entry_cost = asset_quantity * entry_price
+                    entry_fee = entry_cost * (TRADING_FEE_PCT / 100)
+                    exit_fee = position_value * (TRADING_FEE_PCT / 100)
+                    pnl_usdt = position_value - entry_cost - entry_fee - exit_fee
+                    current_balance_usdt += pnl_usdt
+
+                    # Trade action logs are printed to console AND saved to the .log file
+                    log_msg = f"{exit_reason} at ~${exit_price:.2f} | Profit: ${pnl_usdt:+.2f}"
+                    print(f"\n{log_msg}")
+                    logging.info(log_msg)
+
+                    in_position = False
+                    asset_quantity = 0.0
+
+                    win_rate = (winning_trades / trade_count) * 100 if trade_count > 0 else 0
+                    total_pnl_pct = ((current_balance_usdt / STARTING_BALANCE_USDT) - 1) * 100
+                    summary_msg = (f"SUMMARY: Trades={trade_count}, Win Rate={win_rate:.2f}%, "
+                                   f"Current Balance=${current_balance_usdt:.2f} (Total PnL: {total_pnl_pct:.2f}%)")
+                    print(summary_msg)
+                    logging.info(summary_msg)
+
+            # --- ENTRY LOGIC ---
+            if not in_position:
+                signal = result.get('signal')
+                latest_atr = result.get('atr')
+
+                if signal == 1 and latest_atr is not None:
+                    trade_count += 1
+                    entry_price = current_price * (1 + SLIPPAGE_PCT / 100)
+                    trade_size_usdt = current_balance_usdt * 0.995
+                    asset_quantity = trade_size_usdt / entry_price
+                    take_profit_price = entry_price + (ATR_MULTIPLIER_TP * latest_atr)
+                    stop_loss_price = entry_price - (ATR_MULTIPLIER_SL * latest_atr)
+                    in_position = True
+
+                    # Trade action logs are printed to console AND saved to the .log file
+                    log_msg = (f"📈 BUY #{trade_count} ({asset_quantity:.5f} ETH) at ~${entry_price:.2f} | "
+                               f"TP: {take_profit_price:.2f}, SL: {stop_loss_price:.2f}")
+                    print(f"\n{log_msg}")
+                    logging.info(log_msg)
+
+            # --- MODIFIED: Set update frequency to 1 minute ---
+            time.sleep(60)
 
         except Exception as e:
-            print(f"❌ Error on trade {i+1}: {e}")
-            logging.error(f"Error on trade {i+1}: {e}")
+            error_msg = f"An error occurred in the main loop: {e}"
+            print(f"\n{error_msg}")
+            logging.error(error_msg)
+            time.sleep(60)
 
-        time.sleep(interval)
-
-    print(f"\n📊 Trades completed: {trade_count}/{n}")
-    print(f"💰 Total simulated PnL: {total_profit:.2f} USD")
-
-# ==== Entry ====
 if __name__ == "__main__":
-    run_multiple_trades(n=10, interval=60)
+    run_paper_trader()
