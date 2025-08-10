@@ -24,36 +24,21 @@ class LSTMModel(nn.Module):
 
 def model_fn(model_dir):
     """
-    Loads the saved model, scaler, and configuration from the model_dir.
-    The model is now loaded dynamically based on the saved config.
+    Loads the saved model and scaler from the model_dir.
     """
-    print("--- Loading model, scaler, and config for inference ---")
+    print("--- Loading model and scaler for inference ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load the model configuration
-    config_path = os.path.join(model_dir, "model_config.json")
-    with open(config_path, 'r') as f:
-        model_config = json.load(f)
-    
-    # Instantiate the model with the loaded configuration
-    model = LSTMModel(
-        input_size=model_config['input_size'],
-        hidden_size=model_config['hidden_size'],
-        num_layers=model_config['num_layers'],
-        output_size=model_config['output_size'],
-        dropout_rate=model_config['dropout_rate']
-    )
+    model = LSTMModel(input_size=17, hidden_size=128, num_layers=3, output_size=1, dropout_rate=0.5)
 
-    # Load the model's learned weights
     model_path = os.path.join(model_dir, "best_model.pth")
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.to(device).eval()
 
-    # Load the scaler
     scaler_path = os.path.join(model_dir, "scaler.pkl")
     scaler = joblib.load(scaler_path)
 
-    print("--- Model, scaler, and config loaded successfully ---")
+    print("--- Model and scaler loaded successfully ---")
     return {"model": model, "scaler": scaler, "device": device}
 
 def input_fn(request_body, request_content_type):
@@ -62,8 +47,12 @@ def input_fn(request_body, request_content_type):
     """
     if request_content_type == "application/json":
         data = json.loads(request_body)
-        # Ensure input is a numpy array for the scaler
-        return np.array(data['inputs'], dtype=np.float32)
+        inputs = data.get("inputs", None)
+        if inputs is None:
+            raise ValueError("JSON must have a key 'inputs'")
+        # Expecting shape: (window, features)
+        arr = np.array(inputs, dtype=np.float32)
+        return arr
     raise ValueError(f"Unsupported content type: {request_content_type}")
 
 def predict_fn(input_data, model_artifacts):
@@ -74,10 +63,7 @@ def predict_fn(input_data, model_artifacts):
     scaler = model_artifacts["scaler"]
     device = model_artifacts["device"]
 
-    # The scaler expects a 2D array (n_samples, n_features), which input_data already is.
     scaled_input = scaler.transform(input_data)
-    
-    # Add a batch dimension for the LSTM model and send to the correct device
     input_tensor = torch.from_numpy(scaled_input).unsqueeze(0).to(device)
 
     with torch.no_grad():
@@ -87,12 +73,12 @@ def predict_fn(input_data, model_artifacts):
 
 def output_fn(prediction, response_content_type):
     """
-    Serializes the prediction output.
-    Returns only the probability, leaving the final signal decision to the client.
+    Serializes the prediction output into a JSON response.
     """
     if response_content_type == "application/json":
         probability = torch.sigmoid(prediction).item()
         return json.dumps({
-            "probability": probability
+            "probability": probability,
+            "signal": 1 if probability > float(os.getenv("PROB_THRESHOLD", "0.5")) else 0
         })
     raise ValueError(f"Unsupported content type: {response_content_type}")

@@ -1,214 +1,185 @@
-import os
-import time
-import pandas as pd
+# utils.py
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Dict, Any, Iterator
+import glob, os
 import numpy as np
-from collections import deque
-import sagemaker
-from sagemaker.predictor import Predictor
-from sagemaker.serializers import JSONSerializer
-from sagemaker.deserializers import JSONDeserializer
-import boto3
-from botocore.config import Config
-from botocore.exceptions import ClientError
-from binance.client import Client
-from dotenv import load_dotenv
+import pandas as pd
+import json
 
-load_dotenv()
+# ---------- Feature spec ----------
+@dataclass(frozen=True)
+class FeatureSpec:
+    feature_cols: List[str]
+    window_size: int = 150
 
-def load_ohlc_chunks(folder, chunk_mode=False):
-    print(f"[DEBUG] Loading data from: {folder}")
-    files = []
-    for dirpath, _, filenames in os.walk(folder):
-        for f in filenames:
-            if f.endswith('.csv'):
-                files.append(os.path.join(dirpath, f))
+DEFAULT_FEATURE_COLS: List[str] = [
+    "open","high","low","close",
+    "body","range","upper_wick","lower_wick","return",
+    "sma_ratio","ema_20","macd","rsi_14","vol_change",
+    "atr","price_vs_hourly_trend","bb_width",
+]
+DEFAULT_FEATURE_SPEC = FeatureSpec(DEFAULT_FEATURE_COLS, 150)
 
-    if not files:
-        raise FileNotFoundError(f"No .csv files found recursively in folder: {folder}")
 
-    column_names = ['date', 'open', 'high', 'low', 'close', 'volume']
-    numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-    all_dfs = []
-    for f in sorted(files):
-        try:
-            df = pd.read_csv(f, header=None, names=column_names)
-            for col in numeric_cols:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            df.dropna(inplace=True)
-            if not df.empty:
-                if chunk_mode:
-                    yield df
-                else:
-                    all_dfs.append(df)
-        except Exception as e:
-            print(f"[ERROR] Could not process file {f}: {e}")
-
-    if not chunk_mode:
-        if not all_dfs:
-            return pd.DataFrame()
-        return pd.concat(all_dfs)
-
-def get_client_binance():
-    """Initializes and returns a Binance client based on environment variables."""
-    if os.getenv("TESTNET", "false").lower() == "true":
-        print("--- Using Binance Testnet ---")
-        api_key = os.getenv("BINANCE_TESTNET_KEY")
-        api_secret = os.getenv("BINANCE_TESTNET_SECRET")
-        testnet = True
-    else:
-        print("--- Using Live Binance API ---")
-        api_key = os.getenv("BINANCE_KEY")
-        api_secret = os.getenv("BINANCE_SECRET")
-        testnet = False
-        
-    if not api_key or not api_secret:
-        raise ValueError("Binance API key and secret must be set in the .env file.")
-        
-    return Client(api_key, api_secret, testnet=testnet)
-
-def compute_rsi(series, period=14):
-    """Computes the Relative Strength Index (RSI)."""
-    delta = series.diff(1)
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / (loss + 1e-9)
-    return 100 - (100 / (1 + rs))
-
-def compute_atr(df, period=14):
-    """Computes the Average True Range (ATR)."""
-    tr_df = pd.DataFrame(index=df.index)
-    tr_df['h-l'] = df['high'] - df['low']
-    tr_df['h-pc'] = abs(df['high'] - df['close'].shift(1))
-    tr_df['l-pc'] = abs(df['low'] - df['close'].shift(1))
-    return tr_df.max(axis=1).rolling(period).mean()
-
-class SignalGenerator:
-    """
-    Manages live data, generates features, and gets predictions from a SageMaker endpoint.
-    """
-    def __init__(self, endpoint_name, window_size=150, threshold=0.8):
-        print("⚙️  Initializing Signal Generator...")
-        self.endpoint_name = endpoint_name
-        self.window_size = window_size
-        self.threshold = threshold
-        self.feature_cols = [
-            'open', 'high', 'low', 'close', 'body', 'range', 'upper_wick', 'lower_wick', 'return',
-            'sma_ratio', 'ema_20', 'macd', 'rsi_14', 'vol_change', 'atr', 'price_vs_hourly_trend', 'bb_width'
-        ]
-        
-        # Configure a longer timeout for the SageMaker client
-        config = Config(read_timeout=90, connect_timeout=90, retries={"max_attempts": 0})
-        sm_runtime_client = boto3.client("sagemaker-runtime", config=config)
-        sagemaker_session = sagemaker.Session(sagemaker_runtime_client=sm_runtime_client)
-        
-        self.predictor = Predictor(
-            endpoint_name=self.endpoint_name,
-            sagemaker_session=sagemaker_session,
-            serializer=JSONSerializer(),
-            deserializer=JSONDeserializer()
-        )
-        
-        # Use a deque for an efficient rolling data history
-        self.history_size = self.window_size + 100 # Keep extra data for rolling calculations
-        self.history = deque(maxlen=self.history_size)
-        
-        self._warmup_endpoint()
-        print(f"✅  Signal Generator ready. Connected to endpoint: {self.endpoint_name}")
-
-    def _warmup_endpoint(self, retries=3, delay_seconds=10):
-        """Sends a dummy payload to the endpoint to prevent cold start delays."""
-        print("🔥  Warming up the SageMaker endpoint...")
-        # The endpoint expects unscaled features
-        fake_input = np.random.rand(self.window_size, len(self.feature_cols)).tolist()
-        payload = {'inputs': fake_input}
-        
-        for i in range(retries):
-            try:
-                self.predictor.predict(payload)
-                print("✅  Endpoint is warm and responding.")
-                return
-            except ClientError as e:
-                if "ModelError" in str(e) or "invocation timed out" in str(e).lower():
-                    print(f"Attempt {i+1}/{retries}: Endpoint is still warming up. Retrying in {delay_seconds}s...")
-                    time.sleep(delay_seconds)
-                else:
-                    raise e
-        raise RuntimeError(f"Endpoint did not become ready after {retries} attempts.")
-
-    def _engineer_features(self, df):
-        """
-        Generates features for a given DataFrame of historical data.
-        This logic is an exact mirror of the feature engineering in the training script.
-        """
-        df_out = df.copy()
-        df_out['date'] = pd.to_datetime(df_out['date'], unit='ms')
-        df_out.set_index('date', inplace=True)
-
-        # Basic candle features
-        df_out['body'] = df_out['close'] - df_out['open']
-        df_out['range'] = df_out['high'] - df_out['low']
-        df_out['upper_wick'] = df_out['high'] - df_out[['close', 'open']].max(axis=1)
-        df_out['lower_wick'] = df_out[['close', 'open']].min(axis=1) - df_out['low']
-        df_out['return'] = df_out['close'].pct_change()
-        
-        # Moving Averages
-        df_out['sma_10'] = df_out['close'].rolling(10).mean()
-        df_out['sma_50'] = df_out['close'].rolling(50).mean()
-        df_out['sma_ratio'] = df_out['sma_10'] / (df_out['sma_50'] + 1e-9) - 1
-        
-        # --- ✅ CRITICAL FIX: Added adjust=False to all .ewm() calls ---
-        df_out['ema_20'] = df_out['close'].ewm(span=20, adjust=False).mean()
-        df_out['macd'] = df_out['close'].ewm(span=12, adjust=False).mean() - df_out['close'].ewm(span=26, adjust=False).mean()
-
-        # Momentum and Volatility
-        df_out['rsi_14'] = compute_rsi(df_out['close'], 14)
-        df_out['vol_change'] = df_out['volume'].pct_change()
-        df_out['atr'] = compute_atr(df_out, period=14)
-
-        # Trend Analysis
-        if len(df_out) >= 60: # Need enough data for hourly grouping
-            hourly_index = df_out.index.floor('h')
-            df_hourly = df_out['close'].groupby(hourly_index).mean()
-            hourly_ema = df_hourly.ewm(span=20, adjust=False).mean() # ✅ Fixed
-            df_out['hourly_ema_20'] = hourly_ema.reindex(hourly_index, method='ffill').values
-            df_out['price_vs_hourly_trend'] = (df_out['close'] - df_out['hourly_ema_20']) / (df_out['hourly_ema_20'] + 1e-9)
-        else:
-            df_out['price_vs_hourly_trend'] = 0
-
-        # Bollinger Bands
-        bb_mid = df_out['close'].rolling(20).mean()
-        bb_std = df_out['close'].rolling(20).std()
-        df_out['bb_width'] = ((bb_mid + 2 * bb_std) - (bb_mid - 2 * bb_std)) / (bb_mid + 1e-9)
-        
-        df_out.replace([np.inf, -np.inf], 0, inplace=True)
-        df_out.dropna(inplace=True)
-
-        return df_out
-
-    def get_signal(self, new_kline_data):
-        """
-        Takes new kline data, updates history, generates features, and returns a trading signal.
-        """
-        self.history.append(new_kline_data)
-        if len(self.history) < self.history_size:
-            return {"confidence": None, "signal": 0, "reason": "History buffer is not full."}
-
-        # Create a DataFrame from the entire history for feature calculation
-        df_history = pd.DataFrame(list(self.history))
-        df_features = self._engineer_features(df_history)
-        model_input_df = df_features.tail(self.window_size)
-
-        if len(model_input_df) < self.window_size:
-            return {"confidence": None, "signal": 0, "reason": "Not enough processed data for a full window."}
-
-        payload = {'inputs': model_input_df[self.feature_cols].values.tolist()}
-        result = self.predictor.predict(payload)
-
-        confidence = result.get('probability')
-        signal = 1 if confidence is not None and confidence > self.threshold else 0
-
+# ---------- Meta ----------
+def load_meta(path: str = "model_meta.json") -> Dict[str, Any]:
+    if not os.path.exists(path):
         return {
-            "confidence": round(float(confidence), 5) if confidence is not None else None,
-            "signal": signal,
-            "threshold": self.threshold
+            "feature_cols": DEFAULT_FEATURE_COLS,
+            "window_size": 150,
+            "buy_threshold": 0.5,
+            "sell_threshold": 0.5,
+            "hidden_size": 64,
+            "num_layers": 2,
+            "dropout": 0.1,
+            "bidirectional": False,
         }
+    with open(path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    meta.setdefault("feature_cols", DEFAULT_FEATURE_COLS)
+    meta.setdefault("window_size", 150)
+    meta.setdefault("buy_threshold", 0.5)
+    meta.setdefault("sell_threshold", 0.5)
+    return meta
+
+
+# ---------- IO: stream OHLCV files ----------
+def load_ohlc_chunks(
+    folder: str,
+    pattern: str = "*.csv",
+    required_cols: Tuple[str, ...] = ("open","high","low","close","volume"),
+) -> Iterator[pd.DataFrame]:
+    """
+    Yields OHLCV dataframes (monthly or otherwise) with a tz-aware DatetimeIndex.
+    Accepts files that either have a 'timestamp'/'date' column, or already have an index.
+    """
+    paths = sorted(glob.glob(os.path.join(folder, pattern)))
+    for p in paths:
+        df = pd.read_csv(p)
+        # normalize time index
+        if "timestamp" in df.columns:
+            ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        elif "date" in df.columns:
+            ts = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        else:
+            # assume index is a timestamp-like column name saved by to_csv(index=True)
+            idx_name = df.columns[0]
+            ts = pd.to_datetime(df[idx_name], utc=True, errors="coerce")
+        df["__ts__"] = ts
+        df = df.dropna(subset=["__ts__"]).set_index("__ts__").sort_index()
+
+        # column subset + dtype
+        missing = set(required_cols) - set(df.columns)
+        if missing:
+            # try lower/upper case accidental variants
+            for m in list(missing):
+                if m.title() in df.columns:  # e.g. Open
+                    df[m] = pd.to_numeric(df[m.title()], errors="coerce")
+                    missing.remove(m)
+            if missing:
+                raise ValueError(f"{p} is missing columns: {missing}")
+
+        for c in required_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        # keep only what's needed (plus 'close' is used later)
+        yield df[["open","high","low","close","volume"]].dropna().sort_index()
+
+
+# ---------- TA helpers ----------
+def _ensure_dt_index_utc(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index, utc=True)
+    else:
+        if out.index.tz is None:
+            out.index = out.index.tz_localize("UTC")
+    return out.sort_index()
+
+def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    up = delta.clip(lower=0.0)
+    down = (-delta).clip(lower=0.0)
+    roll_up = up.ewm(alpha=1/period, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([(high-low),(high-prev_close).abs(),(low-prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+
+# ---------- Feature pipeline (single source of truth) ----------
+def build_features(raw_df: pd.DataFrame, *, add_hourly_trend: bool = True,
+                   compat_inf_to_zero: bool = False, keep_helper_cols: bool = False) -> pd.DataFrame:
+    df = _ensure_dt_index_utc(raw_df).copy()
+
+    df["body"] = df["close"] - df["open"]
+    df["range"] = df["high"] - df["low"]
+    df["upper_wick"] = df["high"] - df[["close","open"]].max(axis=1)
+    df["lower_wick"] = df[["close","open"]].min(axis=1) - df["low"]
+
+    df["return"] = df["close"].pct_change()
+    df["vol_change"] = df["volume"].pct_change()
+
+    df["sma_10"] = df["close"].rolling(10, min_periods=10).mean()
+    df["sma_50"] = df["close"].rolling(50, min_periods=50).mean()
+    df["sma_ratio"] = (df["sma_10"]/df["sma_50"]) - 1.0
+
+    df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["macd"] = df["close"].ewm(span=12, adjust=False).mean() - df["close"].ewm(span=26, adjust=False).mean()
+
+    df["rsi_14"] = compute_rsi(df["close"], 14)
+    df["atr"] = compute_atr(df, 14)
+
+    if add_hourly_trend:
+        hourly = df["close"].resample("1h").mean()
+        hourly_ema20 = hourly.ewm(span=20, adjust=False).mean()
+        df["hourly_ema_20"] = hourly_ema20.reindex(df.index, method="ffill")
+        denom = df["hourly_ema_20"].replace(0, np.nan)
+        df["price_vs_hourly_trend"] = (df["close"] - df["hourly_ema_20"]) / denom
+    else:
+        df["price_vs_hourly_trend"] = np.nan
+
+    bb_std = df["close"].rolling(20, min_periods=20).std()
+    bb_mid = df["close"].rolling(20, min_periods=20).mean()
+    df["bb_width"] = (4.0 * bb_std) / (bb_mid.replace(0, np.nan))
+
+    df.replace([np.inf, -np.inf], 0 if compat_inf_to_zero else np.nan, inplace=True)
+    df.dropna(inplace=True)
+
+    if not keep_helper_cols:
+        for c in ("sma_10","sma_50","hourly_ema_20"):
+            if c in df.columns: df.drop(columns=c, inplace=True)
+    return df
+
+
+def make_model_window(
+    feat_df: pd.DataFrame,
+    spec: FeatureSpec,
+    scaler=None,
+) -> Tuple[Optional[np.ndarray], Optional[float]]:
+    missing = [c for c in spec.feature_cols if c not in feat_df.columns]
+    if missing:
+        raise ValueError(f"Missing features: {missing}")
+    if len(feat_df) < spec.window_size:
+        price = float(feat_df["close"].iloc[-1]) if len(feat_df) else None
+        return None, price
+    mat = feat_df[spec.feature_cols].tail(spec.window_size).to_numpy(dtype=np.float32)
+    if scaler is not None:
+        mat = scaler.transform(mat)
+    X = np.expand_dims(mat, axis=0)
+    return X, float(feat_df["close"].iloc[-1])
+
+
+def proba_to_signal(p: float, buy_threshold: float, sell_threshold: float) -> tuple[str, float]:
+    if p >= buy_threshold: return "BUY", float(p)
+    if p <= sell_threshold: return "SELL", float(1.0 - p)
+    mid = 0.5 * (buy_threshold + sell_threshold)
+    span = max(buy_threshold - mid, 1e-9)
+    conf = 1.0 - (abs(p - mid) / span)
+    return "HOLD", float(max(0.0, min(1.0, conf)))

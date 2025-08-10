@@ -1,49 +1,35 @@
 import os
+import logging
 import sagemaker
 from sagemaker.pytorch import PyTorchModel
-import logging
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# --- Configuration ---
+MODEL_S3_PATH = os.getenv("MODEL_S3_PATH")  # e.g., s3://bucket/path/to/model.tar.gz
+ENDPOINT_NAME = os.getenv("ENDPOINT_NAME", "eth-price-prediction-endpoint")
+ROLE_ARN = os.getenv("SAGEMAKER_ROLE_ARN")  # optional; if not set, try get_execution_role()
 
-# 1. PASTE THE S3 PATH TO YOUR MODEL ARTIFACT HERE
-model_s3_path = "s3://sagemaker-us-east-1-469090608362/pytorch-training-250726-0525-010-0e6c69e0/output/model.tar.gz"
+if not MODEL_S3_PATH:
+    raise ValueError("Set MODEL_S3_PATH env var to your model artifact S3 URI.")
 
-# 2. CHOOSE A NAME FOR YOUR ENDPOINT
-endpoint_name = "eth-price-prediction-endpoint-v1"
+try:
+    role = ROLE_ARN or sagemaker.get_execution_role()
+except Exception:
+    raise RuntimeError("Could not resolve SageMaker execution role. Set SAGEMAKER_ROLE_ARN.")
 
-# 3. SPECIFY YOUR AWS ACCOUNT ID AND ROLE NAME
-#    Replace 'YOUR_AWS_ACCOUNT_ID' with your actual 12-digit account number.
-AWS_ACCOUNT_ID = "469090608362" # Example: "123456789012"
-IAM_ROLE_NAME = "SageMakerExecutionRole"
-
-# --- KEY FIX: Construct the role ARN directly ---
-# This is the robust way to specify the role when running from a local machine.
-role = f"arn:aws:iam::{AWS_ACCOUNT_ID}:role/{IAM_ROLE_NAME}"
-logger.info(f"Using IAM Role ARN: {role}")
-
-
-# --- Create a SageMaker PyTorchModel object ---
-# This points to your trained model data and the inference code.
 pytorch_model = PyTorchModel(
-    model_data=model_s3_path,
+    model_data=MODEL_S3_PATH,
     role=role,
-    entry_point='inference.py',   # Your inference script
-    framework_version='2.0.0',    # Must match the training script
-    py_version='py310'            # Must match the training script
+    framework_version='2.0.0',
+    py_version='py310',
+    entry_point='inference.py',
 )
 
-logger.info("✅ PyTorchModel object created.")
-
-# --- Deploy the model to an endpoint ---
-logger.info(f"🚀 Deploying model to endpoint: {endpoint_name}...")
-
+log.info(f"🚀 Deploying to endpoint: {ENDPOINT_NAME}")
 predictor = pytorch_model.deploy(
-    initial_instance_count=1,
-    instance_type='ml.t2.medium', # Use a cost-effective instance type for inference
-    endpoint_name=endpoint_name
+    initial_instance_count=int(os.getenv("ENDPOINT_INSTANCES", "1")),
+    instance_type=os.getenv("ENDPOINT_INSTANCE_TYPE", "ml.t2.medium"),
+    endpoint_name=ENDPOINT_NAME,
 )
-
-logger.info(f"✅ Deployment successful. Endpoint is live at: {predictor.endpoint_name}")
+log.info(f"✅ Deployment complete. Endpoint: {predictor.endpoint_name}")

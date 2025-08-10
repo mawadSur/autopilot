@@ -1,328 +1,184 @@
-import os
-import argparse
-import json
-import pandas as pd
+import os, argparse, json, random, glob
 import numpy as np
-import joblib
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+import pandas as pd
+import torch, torch.nn as nn
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from joblib import dump
+from utils import build_features, FeatureSpec, load_meta, DEFAULT_FEATURE_COLS
+from typing import Tuple 
+SM_TRAIN_DIR = os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train")
+SM_MODEL_DIR = os.environ.get("SM_MODEL_DIR", "/opt/ml/model")
 
-# ==============================================================================
-# 1. DATA LOADING & PREPROCESSING
-# ==============================================================================
-
-def load_ohlc_data(folder):
-    """Loads and concatenates all CSV files from a directory into a single DataFrame."""
-    print(f"--- Loading data from: {folder} ---")
-    files = [os.path.join(dp, f) for dp, dn, fn in os.walk(folder) for f in fn if f.endswith('.csv')]
-    if not files:
-        raise FileNotFoundError(f"No .csv files found in folder: {folder}")
-
-    df_list = []
-    for f in sorted(files):
-        try:
-            # Assuming files have no header
-            df = pd.read_csv(f, header=None, names=['date', 'open', 'high', 'low', 'close', 'volume'])
-            df_list.append(df)
-        except Exception as e:
-            print(f"[Warning] Could not process file {f}: {e}")
-            
-    if not df_list:
-        raise ValueError("No data could be loaded from the provided files.")
-
-    full_df = pd.concat(df_list, ignore_index=True)
-    
-    # --- Data Cleaning and Date Handling ---
-    full_df['date'] = pd.to_datetime(full_df['date'], unit='ms', errors='coerce')
-    full_df.dropna(subset=['date'], inplace=True)
-    full_df.set_index('date', inplace=True)
-    full_df.drop_duplicates(inplace=True)
-    full_df.sort_index(inplace=True)
-    
-    numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-    full_df[numeric_cols] = full_df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-    full_df.dropna(inplace=True)
-
-    print(f"--- Data loaded successfully. Shape: {full_df.shape} ---")
-    return full_df
-
-def compute_technical_indicators(df):
-    """Computes technical indicators for the given DataFrame."""
-    
-    # Basic candle features
-    df['body'] = df['close'] - df['open']
-    df['range'] = df['high'] - df['low']
-    df['upper_wick'] = df['high'] - df[['close', 'open']].max(axis=1)
-    df['lower_wick'] = df[['close', 'open']].min(axis=1) - df['low']
-    df['return'] = df['close'].pct_change()
-
-    # Moving Averages
-    df['sma_10'] = df['close'].rolling(10).mean()
-    df['sma_50'] = df['close'].rolling(50).mean()
-    df['sma_ratio'] = df['sma_10'] / (df['sma_50'] + 1e-9) - 1
-    df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
-
-    # Momentum and Volatility
-    df['macd'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
-    delta = df['close'].diff(1)
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / (loss + 1e-9)
-    df['rsi_14'] = 100 - (100 / (1 + rs))
-    
-    df['vol_change'] = df['volume'].pct_change()
-    
-    tr = pd.DataFrame(index=df.index)
-    tr['h-l'] = df['high'] - df['low']
-    tr['h-pc'] = abs(df['high'] - df['close'].shift(1))
-    tr['l-pc'] = abs(df['low'] - df['close'].shift(1))
-    df['atr'] = tr.max(axis=1).rolling(14).mean()
-
-    # Trend Analysis
-    hourly_index = df.index.floor('h')
-    df_hourly = df['close'].groupby(hourly_index).mean()
-    hourly_ema = df_hourly.ewm(span=20, adjust=False).mean()
-    df['hourly_ema_20'] = hourly_ema.reindex(hourly_index, method='ffill').values
-    df['price_vs_hourly_trend'] = (df['close'] - df['hourly_ema_20']) / (df['hourly_ema_20'] + 1e-9)
-    
-    # Bollinger Bands
-    df['bb_mid'] = df['close'].rolling(20).mean()
-    bb_std = df['close'].rolling(20).std()
-    df['bb_width'] = ((df['bb_mid'] + 2 * bb_std) - (df['bb_mid'] - 2 * bb_std)) / (df['bb_mid'] + 1e-9)
-    
-    return df
-
-def create_labels(df, lookahead_period, risk_reward_ratio, profit_threshold_pct):
-    """Creates binary labels based on a forward-looking profit/loss strategy."""
-    future_highs = df['high'].rolling(window=lookahead_period).max().shift(-lookahead_period)
-    future_lows = df['low'].rolling(window=lookahead_period).min().shift(-lookahead_period)
-    
-    potential_profit = future_highs - df['close']
-    potential_loss = df['close'] - future_lows
-    
-    # Dynamic profit threshold based on the current price
-    profit_target = df['close'] * (profit_threshold_pct / 100.0)
-
-    # Label is 1 (buy) if the potential profit meets the threshold and R/R ratio
-    df['label'] = (
-        (potential_profit >= profit_target) &
-        (potential_loss > 0) & # Avoid division by zero
-        (potential_profit / (potential_loss + 1e-9) >= risk_reward_ratio)
-    ).astype(int)
-    
-    return df
-
-# ==============================================================================
-# 2. MODEL AND DATASET DEFINITION
-# ==============================================================================
-
-class TimeSeriesDataset(Dataset):
-    """Custom PyTorch Dataset for time-series windowing."""
-    def __init__(self, features, labels, window_size):
-        self.features = features
-        self.labels = labels
-        self.window_size = window_size
-
-    def __len__(self):
-        return len(self.features) - self.window_size
-
-    def __getitem__(self, idx):
-        # A window of features and the label corresponding to the end of that window
-        feature_window = self.features[idx : idx + self.window_size]
-        label = self.labels[idx + self.window_size]
-        return torch.tensor(feature_window, dtype=torch.float32), torch.tensor(label, dtype=torch.float32).view(1)
-
+# ------------------------- Model -------------------------
 class LSTMModel(nn.Module):
-    """Bidirectional LSTM model for classification."""
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout_rate):
-        super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=True, dropout=dropout_rate)
-        self.dropout = nn.Dropout(dropout_rate)
-        # The output feature size is hidden_size * 2 because it's bidirectional
-        self.fc = nn.Linear(hidden_size * 2, output_size)
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 64,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        bidirectional: bool = False,
+    ) -> None:
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
+        )
+        out_size = hidden_size * (2 if bidirectional else 1)
+        self.head = nn.Sequential(
+            nn.Linear(out_size, out_size),
+            nn.ReLU(),
+            nn.Linear(out_size, 1),
+        )
 
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        # We only care about the output of the last time step
-        out = self.dropout(out[:, -1, :])
-        out = self.fc(out)
-        return out
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, F)
+        _, (hn, _) = self.lstm(x)
+        last = hn[-1]  # (B, H) from last layer
+        return self.head(last).squeeze(-1)  # logits
 
-# ==============================================================================
-# 3. TRAINING SCRIPT
-# ==============================================================================
 
-def main(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"--- Using device: {device} ---")
-    
-    # 1. Load and prepare data
-    full_df = load_ohlc_data(folder=args.train)
-    
-    feature_cols = [
-        'open', 'high', 'low', 'close', 'body', 'range', 'upper_wick', 'lower_wick', 'return',
-        'sma_ratio', 'ema_20', 'macd', 'rsi_14', 'vol_change', 'atr', 'price_vs_hourly_trend', 'bb_width'
-    ]
-    
-    # 2. Feature engineering and labeling on the whole dataset
-    df_with_features = compute_technical_indicators(full_df)
-    df_labeled = create_labels(
-        df_with_features, 
-        args.lookahead_period,
-        args.risk_reward_ratio,
-        args.profit_threshold_pct
-    )
-    
-    # Drop NaNs created by rolling indicators and labeling lookahead
-    df_final = df_labeled.dropna().copy()
-    df_final.replace([np.inf, -np.inf], 0, inplace=True)
+# ------------------------- Utilities -------------------------
+def set_seeds(seed: int = 42) -> None:
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed); torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-    # 3. **CRITICAL FIX**: Split data chronologically BEFORE scaling
-    train_size = int(len(df_final) * 0.8)
-    val_size = int(len(df_final) * 0.1)
-    
-    train_df = df_final.iloc[:train_size]
-    val_df = df_final.iloc[train_size:train_size + val_size]
-    # test_df is the remainder, can be used for final evaluation if needed
-    
-    print(f"--- Data Split (Chronological) ---")
-    print(f"Training set size: {len(train_df)}")
-    print(f"Validation set size: {len(val_df)}")
-    
-    # 4. **CRITICAL FIX**: Fit scaler ONLY on training data
+
+def build_sequences(
+    feat_df: pd.DataFrame, feature_cols, window_size: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build (X, y) where y is next-bar up (close[t+1] > close[t]).
+    """
+    Xs, ys = [], []
+    close = feat_df["close"].values
+    mat = feat_df[feature_cols].to_numpy(dtype=np.float32)
+
+    for i in range(window_size, len(mat) - 1):
+        Xs.append(mat[i - window_size : i, :])
+        ys.append(1.0 if close[i + 1] > close[i] else 0.0)
+
+    X = np.stack(Xs, axis=0) if Xs else np.zeros((0, window_size, len(feature_cols)), dtype=np.float32)
+    y = np.array(ys, dtype=np.float32)
+    return X, y
+
+
+# ------------------------- Training entrypoint -------------------------
+def train(
+    data_path: str,
+    model_out: str = "model.pt",
+    scaler_out: str = "scaler.joblib",
+    meta_out: str = "model_meta.json",
+) -> None:
+    set_seeds(42)
+
+    # 1) Load raw OHLCV (expects columns: timestamp/index, open, high, low, close, volume)
+    raw = pd.read_csv(data_path)
+    if "timestamp" in raw.columns:
+        raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True)
+        raw.set_index("timestamp", inplace=True)
+
+    # 2) Build features (single source of truth)
+    feat = build_features(raw)
+
+    # 3) Meta (feature schema & window)
+    prev_meta = load_meta(meta_out) if os.path.exists(meta_out) else load_meta()
+    feature_cols = prev_meta.get("feature_cols", DEFAULT_FEATURE_COLS)
+    window_size = int(prev_meta.get("window_size", 150))
+
+    # 4) Split, scale (fit ONLY on train!)
+    X, y = build_sequences(feat, feature_cols, window_size)
+    assert len(X) == len(y), "X and y must align"
+
+    if len(X) < 100:
+        raise RuntimeError("Not enough sequences to train. Provide more data.")
+
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, shuffle=False)
+
     scaler = StandardScaler()
-    train_df.loc[:, feature_cols] = scaler.fit_transform(train_df[feature_cols])
-    # Transform validation data with the scaler fitted on training data
-    val_df.loc[:, feature_cols] = scaler.transform(val_df[feature_cols])
-    
-    scaler_path = os.path.join(args.model_dir, "scaler.pkl")
-    joblib.dump(scaler, scaler_path)
-    print(f"--- Scaler fitted on training data and saved to {scaler_path} ---")
+    B, T, F = X_train.shape
+    X_train_2d = X_train.reshape(B * T, F)
+    scaler.fit(X_train_2d)
+    X_train = scaler.transform(X_train_2d).reshape(B, T, F)
 
-    # 5. Create Datasets and DataLoaders
-    train_features = train_df[feature_cols].values
-    train_labels = train_df['label'].values
-    val_features = val_df[feature_cols].values
-    val_labels = val_df['label'].values
-    
-    train_dataset = TimeSeriesDataset(train_features, train_labels, args.window_size)
-    val_dataset = TimeSeriesDataset(val_features, val_labels, args.window_size)
-    
-    # 6. Handle Class Imbalance
-    pos_count = np.sum(train_labels)
-    neg_count = len(train_labels) - pos_count
-    pos_weight_value = neg_count / pos_count if pos_count > 0 else 1.0
-    pos_weight_tensor = torch.tensor([pos_weight_value], device=device)
-    print(f"--- Class Imbalance Handling ---")
-    print(f"Positive (1): {pos_count}, Negative (0): {neg_count}. BCE Loss Weight: {pos_weight_value:.2f}")
+    Bv, Tv, Fv = X_val.shape
+    X_val = scaler.transform(X_val.reshape(Bv * Tv, Fv)).reshape(Bv, Tv, Fv)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    
-    # 7. Initialize Model, Criterion, and Optimizer
+    # 5) Model
+    hidden_size = int(prev_meta.get("hidden_size", 64))
+    num_layers  = int(prev_meta.get("num_layers", 2))
+    dropout     = float(prev_meta.get("dropout", 0.1))
+    bidir       = bool(prev_meta.get("bidirectional", False))
+
     model = LSTMModel(
         input_size=len(feature_cols),
-        hidden_size=args.hidden_size,
-        num_layers=args.num_layers,
-        output_size=1,
-        dropout_rate=args.dropout_rate
-    ).to(device)
-    
-    # Save model configuration for robust inference
-    model_config = {
-        "input_size": len(feature_cols), "hidden_size": args.hidden_size, 
-        "num_layers": args.num_layers, "output_size": 1, "dropout_rate": args.dropout_rate
-    }
-    config_path = os.path.join(args.model_dir, "model_config.json")
-    with open(config_path, 'w') as f:
-        json.dump(model_config, f)
-    print(f"--- Model config saved to {config_path} ---")
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        bidirectional=bidir,
+    )
 
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    # 8. Training Loop with Early Stopping
-    best_val_loss = float('inf')
-    epochs_no_improve = 0
-    
-    print("\n--- Starting Model Training ---")
-    for epoch in range(args.epochs):
+    def to_torch(x, y):
+        return torch.tensor(x, dtype=torch.float32, device=device), torch.tensor(y, dtype=torch.float32, device=device)
+
+    best_val = float("inf")
+    for epoch in range(20):
         model.train()
-        total_train_loss = 0
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            total_train_loss += loss.item()
+        xb, yb = to_torch(X_train, y_train)
+        optimizer.zero_grad()
+        logits = model(xb)
+        loss = criterion(logits, yb)
+        loss.backward(); optimizer.step()
 
         model.eval()
-        total_val_loss = 0
-        all_labels, all_preds = [], []
         with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                total_val_loss += loss.item()
-                preds = torch.sigmoid(outputs) > 0.5
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
+            xv, yv = to_torch(X_val, y_val)
+            v_logits = model(xv)
+            v_loss = criterion(v_logits, yv).item()
 
-        avg_train_loss = total_train_loss / len(train_loader)
-        avg_val_loss = total_val_loss / len(val_loader)
-        val_accuracy = np.mean(np.array(all_preds) == np.array(all_labels)) * 100
-        
-        print(f"Epoch {epoch+1:02d}/{args.epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}%")
+        if v_loss < best_val:
+            best_val = v_loss
+            torch.save(model.state_dict(), model_out)
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            epochs_no_improve = 0
-            best_model_path = os.path.join(args.model_dir, "best_model.pth")
-            torch.save(model.state_dict(), best_model_path)
-            print(f"  -> Validation loss improved. Saving best model to {best_model_path}")
-        else:
-            epochs_no_improve += 1
-            print(f"  -> No improvement. Early stopping patience: {epochs_no_improve}/{args.patience}")
-            
-        if epochs_no_improve >= args.patience:
-            print(f"--- Early stopping triggered after {args.patience} epochs with no improvement. ---")
-            break
-            
-    print("--- Training complete. ---")
+        print(f"epoch {epoch+1:02d} | train {loss.item():.4f} | val {v_loss:.4f}")
 
-# ==============================================================================
-# 4. SCRIPT ENTRYPOINT
-# ==============================================================================
+    # 6) Persist artifacts
+    dump(scaler, scaler_out)
+
+    # 7) Write/merge meta
+    meta: Dict[str, Any] = {
+        **prev_meta,
+        "feature_cols": feature_cols,
+        "window_size": window_size,
+        "input_size": len(feature_cols),
+        "hidden_size": hidden_size,
+        "num_layers": num_layers,
+        "dropout": dropout,
+        "bidirectional": bidir,
+        "scaler_type": "standard",
+        # Set/keep thresholds (tune later)
+        "buy_threshold": float(prev_meta.get("buy_threshold", 0.5)),
+        "sell_threshold": float(prev_meta.get("sell_threshold", 0.5)),
+        "label_def": "next_bar_up",
+    }
+    with open(meta_out, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    print(f"Saved: {model_out}, {scaler_out}, {meta_out}")
+    
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    
-    # SageMaker environment variables
-    parser.add_argument('--train', type=str, default=os.environ.get('SM_CHANNEL_TRAIN'))
-    parser.add_argument('--model-dir', type=str, default=os.environ.get('SM_MODEL_DIR'))
-    
-    # Model Hyperparameters
-    parser.add_argument('--hidden-size', type=int, default=128)
-    parser.add_argument('--num-layers', type=int, default=3)
-    parser.add_argument('--dropout-rate', type=float, default=0.5)
-    parser.add_argument('--window-size', type=int, default=150)
-    
-    # Training Hyperparameters
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=1024)
-    parser.add_argument('--learning-rate', type=float, default=0.001)
-    parser.add_argument('--patience', type=int, default=5)
-    
-    # Strategy Hyperparameters
-    parser.add_argument('--lookahead-period', type=int, default=10)    
-    parser.add_argument('--risk-reward-ratio', type=float, default=2.0)
-    parser.add_argument('--profit-threshold-pct', type=float, default=0.5)
-
-    args = parser.parse_args()
-    main(args)
+    # Example:
+    # python aws_train_model.py -- just wire your own CLI as needed
+    # or call train("your_data.csv")
+    pass

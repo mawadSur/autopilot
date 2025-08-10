@@ -1,186 +1,139 @@
-import os
-import pandas as pd
-from tqdm.auto import tqdm
-import joblib
-import torch
-import torch.nn as nn
+# backtest_fast.py
+from __future__ import annotations
+import argparse, os, sys
+from typing import Dict, Any, Optional
 import numpy as np
-import json
-from utils import load_ohlc_chunks # Assuming utils.py has this function
+import pandas as pd
+import torch
+from joblib import load
 
-# --- 1. Load Model and Feature Logic Locally ---
+from utils import (
+    load_meta, FeatureSpec, load_ohlc_chunks, build_features,
+    make_model_window, proba_to_signal,
+)
 
-# The LSTMModel class must be defined here, identical to the one in your training script.
+# Reuse the same model arch you trained with (bidirectional configurable via meta)
+import torch.nn as nn
 class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout_rate):
-        super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=True)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.fc = nn.Linear(hidden_size * 2, output_size)
+    def __init__(self, input_size:int, hidden_size:int=64, num_layers:int=2, dropout:float=0.1, bidirectional:bool=False):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size, hidden_size=hidden_size, num_layers=num_layers,
+            batch_first=True, dropout=dropout if num_layers>1 else 0.0, bidirectional=bidirectional
+        )
+        out = hidden_size * (2 if bidirectional else 1)
+        self.head = nn.Sequential(nn.Linear(out, out), nn.ReLU(), nn.Linear(out, 1))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, (hn, _) = self.lstm(x)
+        last = hn[-1]
+        return self.head(last).squeeze(-1)  # logits
 
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = self.dropout(out[:, -1, :])
-        out = self.fc(out)
-        return out
 
-def compute_technical_indicators(df):
-    """
-    This function is copied from your training script to ensure the logic is identical.
-    It calculates all features for the entire DataFrame at once (vectorized).
-    """
-    df['body'] = df['close'] - df['open']
-    df['range'] = df['high'] - df['low']
-    df['upper_wick'] = df['high'] - df[['close', 'open']].max(axis=1)
-    df['lower_wick'] = df[['close', 'open']].min(axis=1) - df['low']
-    df['return'] = df['close'].pct_change()
-    df['sma_10'] = df['close'].rolling(10).mean()
-    df['sma_50'] = df['close'].rolling(50).mean()
-    df['sma_ratio'] = df['sma_10'] / (df['sma_50'] + 1e-9) - 1
-    df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['macd'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
-    
-    delta = df['close'].diff(1)
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / (loss + 1e-9)
-    df['rsi_14'] = 100 - (100 / (1 + rs))
-    
-    df['vol_change'] = df['volume'].pct_change()
-    tr = pd.DataFrame(index=df.index); tr['h-l'] = df['high'] - df['low']; tr['h-pc'] = abs(df['high'] - df['close'].shift(1)); tr['l-pc'] = abs(df['low'] - df['close'].shift(1))
-    df['atr'] = tr.max(axis=1).rolling(14).mean()
+def load_artifacts(model_path="model.pt", scaler_path="scaler.joblib", meta_path="model_meta.json"):
+    meta = load_meta(meta_path)
+    spec = FeatureSpec(meta["feature_cols"], int(meta["window_size"]))
+    model = LSTMModel(
+        input_size=len(spec.feature_cols),
+        hidden_size=int(meta.get("hidden_size",64)),
+        num_layers=int(meta.get("num_layers",2)),
+        dropout=float(meta.get("dropout",0.1)),
+        bidirectional=bool(meta.get("bidirectional",False)),
+    )
+    model.load_state_dict(torch.load(model_path, map_location="cpu"))
+    model.eval()
+    scaler = None
+    if os.path.exists(scaler_path):
+        try: scaler = load(scaler_path)
+        except Exception: scaler = None
+    return model, scaler, meta, spec
 
-    hourly_index = df.index.floor('h')
-    df_hourly = df['close'].groupby(hourly_index).mean()
-    hourly_ema = df_hourly.ewm(span=20, adjust=False).mean()
-    df['hourly_ema_20'] = hourly_ema.reindex(hourly_index, method='ffill').values
-    df['price_vs_hourly_trend'] = (df['close'] - df['hourly_ema_20']) / (df['hourly_ema_20'] + 1e-9)
-    
-    bb_mid = df['close'].rolling(20).mean()
-    bb_std = df['close'].rolling(20).std()
-    df['bb_width'] = ((bb_mid + 2 * bb_std) - (bb_mid - 2 * bb_std)) / (bb_mid + 1e-9)
-    
-    df.replace([np.inf, -np.inf], 0, inplace=True)
-    df.dropna(inplace=True)
-    return df
 
-def run_chunk_backtest(df, signals):
-    """
-    Runs the backtest on a single chunk of data and returns the results.
-    """
-    # --- CORRECTED: Realistic trading parameters ---
-    TRADING_FEE_PCT = 0.01
-    TAKE_PROFIT_PCT = 20.00
-    STOP_LOSS_PCT = 0.5
+def backtest_stream(
+    data_dir: str,
+    fee_bps: float = 3.0,
+    warmup_bars: int = 5000,   # keep this many bars of history for indicators across chunk boundaries
+) -> Dict[str, Any]:
 
-    in_position = False
-    entry_price = 0.0
-    take_profit_price = 0.0
-    stop_loss_price = 0.0
-    
-    trades = []
-    winning_trades = 0
+    model, scaler, meta, spec = load_artifacts()
+    buy_th = float(meta.get("buy_threshold", 0.5))
+    sell_th = float(meta.get("sell_threshold", 0.5))
 
-    for i in range(len(df)):
-        current_row = df.iloc[i]
-        
-        if in_position:
-            if current_row['low'] <= stop_loss_price:
-                # Use the constant SL percentage for PnL
-                pnl = -STOP_LOSS_PCT - (2 * TRADING_FEE_PCT)
-                trades.append(pnl)
-                in_position = False 
-            elif current_row['high'] >= take_profit_price:
-                # Use the constant TP percentage for PnL
-                pnl = TAKE_PROFIT_PCT - (2 * TRADING_FEE_PCT)
-                trades.append(pnl)
-                winning_trades += 1
-                in_position = False
+    position = 0  # 0=flat, 1=long
+    last_price: Optional[float] = None
+    equity = 1.0
+    trades = 0
+    bars = 0
 
-        if not in_position and signals[i] == 1:
-            in_position = True
-            entry_price = current_row['close']
-            take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT / 100)
-            stop_loss_price = entry_price * (1 - STOP_LOSS_PCT / 100)
+    # rolling raw buffer
+    raw_buffer = pd.DataFrame(columns=["open","high","low","close","volume"])
 
-    return trades, winning_trades
+    print(f"📦 Reading chunks from: {data_dir}")
+    for chunk in load_ohlc_chunks(data_dir):
+        # append + keep only tail(warmup_bars + len(chunk)) to avoid unbounded memory
+        raw_buffer = pd.concat([raw_buffer, chunk])
+        raw_buffer = raw_buffer[~raw_buffer.index.duplicated(keep="last")].sort_index()
+        if len(raw_buffer) > warmup_bars + len(chunk):
+            raw_buffer = raw_buffer.tail(warmup_bars + len(chunk))
+
+        # Build features for the buffer, then process only the NEW time range
+        feat = build_features(raw_buffer, compat_inf_to_zero=True)
+        new_mask = feat.index >= chunk.index[0]
+        feat_new = feat.loc[new_mask]
+        if feat_new.empty:
+            continue
+
+        for t in feat_new.index:
+            # up-to-time window
+            sub = feat.loc[:t]
+            X, px = make_model_window(sub, spec=spec, scaler=scaler)
+            if X is None:
+                continue
+            with torch.no_grad():
+                prob = torch.sigmoid(model(torch.from_numpy(X))).item()
+            signal, _ = proba_to_signal(prob, buy_th, sell_th)
+
+            if signal == "BUY" and position == 0:
+                position = 1
+                last_price = px
+                equity *= (1.0 - fee_bps/10000.0)
+                trades += 1
+            elif signal == "SELL" and position == 1:
+                ret = (px - (last_price or px)) / (last_price or px)
+                equity *= (1.0 + ret)
+                equity *= (1.0 - fee_bps/10000.0)
+                position = 0
+                last_price = None
+                trades += 1
+            bars += 1
+
+    # close open pos at the very end
+    if position == 1 and last_price is not None and len(raw_buffer):
+        final_px = float(raw_buffer["close"].iloc[-1])
+        ret = (final_px - last_price) / last_price
+        equity *= (1.0 + ret)
+
+    return {
+        "equity": float(equity),
+        "total_return_pct": float((equity - 1.0) * 100.0),
+        "trades": int(trades),
+        "bars": int(bars),
+    }
+
 
 def main():
-    """Main function to load data, run batch predictions, and start the backtest."""
-    MODEL_DIR = "./output" # Assumes artifacts are in an 'output' folder
-    
-    print("Loading model and scaler once...")
-    scaler = joblib.load(os.path.join(MODEL_DIR, "scaler.pkl"))
-    with open(os.path.join(MODEL_DIR, "model_config.json"), 'r') as f:
-        model_config = json.load(f)
+    ap = argparse.ArgumentParser(description="Fast long/flat backtest (chunked)")
+    ap.add_argument("-d","--data-dir", default=os.getenv("DATA_DIR","eth_1m_data"))
+    ap.add_argument("--fee-bps", type=float, default=float(os.getenv("FEE_BPS","3.0")))
+    ap.add_argument("--warmup-bars", type=int, default=int(os.getenv("WARMUP_BARS","5000")))
+    args = ap.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = LSTMModel(**model_config).to(device)
-    model.load_state_dict(torch.load(os.path.join(MODEL_DIR, "best_model.pth"), map_location=device))
-    model.eval()
-
-    feature_cols = [
-        'open', 'high', 'low', 'close', 'body', 'range', 'upper_wick', 'lower_wick', 'return',
-        'sma_ratio', 'ema_20', 'macd', 'rsi_14', 'vol_change', 'atr', 'price_vs_hourly_trend', 'bb_width'
-    ]
-    window_size = model_config['input_size']
-    
-    # --- MODIFIED: Process data in chunks to save memory ---
-    all_trades = []
-    total_winning_trades = 0
-    
-    data_chunks = load_ohlc_chunks(folder='eth_1m_data', chunk_mode=True)
-    
-    for df_chunk in tqdm(data_chunks, desc="Processing monthly chunks"):
-        df_chunk['date'] = pd.to_datetime(df_chunk['date'], unit='ms')
-        df_chunk.set_index('date', inplace=True)
-        if df_chunk.empty:
-            continue
-
-        # 1. Compute features for the current chunk
-        df_features = compute_technical_indicators(df_chunk.copy())
-        if len(df_features) <= window_size:
-            continue
-
-        # 2. Scale features and create windows
-        scaled_features = scaler.transform(df_features[feature_cols])
-        
-        # A more memory-efficient way to create windows might be needed for very low-RAM systems
-        # but this is generally fine for chunk-based processing.
-        windows = [scaled_features[i:i + window_size] for i in range(len(scaled_features) - window_size + 1)]
-        input_tensor = torch.tensor(np.array(windows), dtype=torch.float32).to(device)
-        
-        # 3. Get predictions for the chunk
-        with torch.no_grad():
-            predictions = model(input_tensor)
-        
-        probabilities = torch.sigmoid(predictions).cpu().numpy().flatten()
-        signals_raw = (probabilities > 0.65).astype(int) # Using a more realistic threshold
-        
-        # 4. Align signals and run backtest for the chunk
-        signals = np.zeros(len(df_features))
-        signals[window_size-1:] = signals_raw
-        
-        chunk_trades, chunk_wins = run_chunk_backtest(df_features, signals)
-        
-        # 5. Aggregate results
-        all_trades.extend(chunk_trades)
-        total_winning_trades += chunk_wins
-
-    # --- FINAL SUMMARY ---
-    total_trades = len(all_trades)
-    print("\n--- Overall Backtest Summary ---")
-    if total_trades > 0:
-        win_rate = (total_winning_trades / total_trades) * 100
-        total_pnl = sum(all_trades)
-        print(f"Total Trades Executed: {total_trades}")
-        print(f"Winning Trades: {total_winning_trades}")
-        print(f"Win Rate: {win_rate:.2f}%")
-        print(f"Total Net PnL: {total_pnl:.2f}%")
-        print(f"Average PnL per Trade: {total_pnl / total_trades:.3f}%")
-    else:
-        print("No trades were executed during the entire backtest.")
-    print("---------------------------------")
+    res = backtest_stream(args.data_dir, fee_bps=args.fee_bps, warmup_bars=args.warmup_bars)
+    print("\n================ Backtest (fast) ================")
+    print(f"Bars processed  : {res['bars']}")
+    print(f"Trades          : {res['trades']}")
+    print(f"Final equity    : {res['equity']:.6f}")
+    print(f"Total return    : {res['total_return_pct']:.3f}%")
+    print("=================================================\n")
 
 
 if __name__ == "__main__":

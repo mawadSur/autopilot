@@ -1,112 +1,139 @@
-import os
+# backtest.py
+from __future__ import annotations
+import argparse, os
+from typing import Dict, Any
 import pandas as pd
-from tqdm.auto import tqdm
-from dotenv import load_dotenv
-from utils import SignalGenerator, load_ohlc_chunks
+import torch
+from joblib import load
 
-def run_backtest(df, signal_gen):
-    """
-    Runs a backtest using a Take-Profit/Stop-Loss strategy.
-    """
-    print("\n📈 Starting backtest with Take-Profit/Stop-Loss strategy...")
+from utils import (
+    load_meta, FeatureSpec, load_ohlc_chunks, build_features,
+    make_model_window, proba_to_signal,
+)
 
-    # --- Realistic Trading Parameters ---
-    TRADING_FEE_PCT = 0.075  # Standard fee for Binance (0.075%)
-    TAKE_PROFIT_PCT = 1.5    # Target a 1.5% profit on each trade
-    STOP_LOSS_PCT = 0.75     # A 0.75% stop-loss for risk management
+import torch.nn as nn
+class LSTMModel(nn.Module):
+    def __init__(self, input_size:int, hidden_size:int=64, num_layers:int=2, dropout:float=0.1, bidirectional:bool=False):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size, hidden_size=hidden_size, num_layers=num_layers,
+            batch_first=True, dropout=dropout if num_layers>1 else 0.0, bidirectional=bidirectional
+        )
+        out = hidden_size * (2 if bidirectional else 1)
+        self.head = nn.Sequential(nn.Linear(out, out), nn.ReLU(), nn.Linear(out, 1))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, (hn, _) = self.lstm(x)
+        return self.head(hn[-1]).squeeze(-1)
 
-    # --- Backtest State & Logging ---
-    in_position = False
-    entry_price = 0.0
-    take_profit_price = 0.0
-    stop_loss_price = 0.0
-    
-    trades = []
-    total_trades = 0
-    winning_trades = 0
 
-    # Pre-fill the history buffer to ensure the model has enough data from the start
-    initial_history_size = signal_gen.history_size
-    initial_history_df = df.head(initial_history_size)
-    for _, row in initial_history_df.iterrows():
-        signal_gen.history.append(row.to_dict())
-    print(f"Pre-filled history buffer with {len(signal_gen.history)} records.")
+def load_artifacts(model_path="model.pt", scaler_path="scaler.joblib", meta_path="model_meta.json"):
+    meta = load_meta(meta_path)
+    spec = FeatureSpec(meta["feature_cols"], int(meta["window_size"]))
+    model = LSTMModel(
+        input_size=len(spec.feature_cols),
+        hidden_size=int(meta.get("hidden_size",64)),
+        num_layers=int(meta.get("num_layers",2)),
+        dropout=float(meta.get("dropout",0.1)),
+        bidirectional=bool(meta.get("bidirectional",False)),
+    )
+    model.load_state_dict(torch.load(model_path, map_location="cpu"))
+    model.eval()
+    scaler = None
+    if os.path.exists(scaler_path):
+        try: scaler = load(scaler_path)
+        except Exception: scaler = None
+    return model, scaler, meta, spec
 
-    # Iterate through the rest of the data, one minute at a time
-    for i in tqdm(range(initial_history_size, len(df)), desc="Backtesting"):
-        current_row = df.iloc[i]
-        current_price = current_row['close']
-        current_high = current_row['high']
-        current_low = current_row['low']
-        
-        # ✅ CORRECTED EXIT LOGIC
-        if in_position:
-            # 1. Check for Stop-Loss first (conservative, "worst-first" approach)
-            if current_low <= stop_loss_price:
-                exit_price = stop_loss_price
-                pnl = ((exit_price - entry_price) / entry_price) * 100 - (2 * TRADING_FEE_PCT)
-                trades.append(pnl)
-                print(f"\n❌ STOP LOSS at {exit_price:.2f}. PnL: {pnl:.3f}%")
-                in_position = False 
 
-            # 2. Only if not stopped out, check for Take-Profit
-            elif current_high >= take_profit_price:
-                exit_price = take_profit_price
-                pnl = ((exit_price - entry_price) / entry_price) * 100 - (2 * TRADING_FEE_PCT)
-                trades.append(pnl)
-                winning_trades += 1
-                print(f"\n✅ TAKE PROFIT at {exit_price:.2f}. PnL: {pnl:.3f}%")
-                in_position = False
+def run_backtest_chunked(
+    data_dir: str,
+    lookahead_steps: int = 10,
+    stop_loss_pct: float = 0.5,  # %
+    fee_pct: float = 0.075,      # %
+    warmup_bars: int = 5000,
+) -> Dict[str, Any]:
 
-        # --- ENTRY LOGIC ---
-        if not in_position:
-            result = signal_gen.get_signal(current_row.to_dict())
-            signal = result.get('signal')
-            
-            if signal == 1:
-                total_trades += 1
-                in_position = True
-                entry_price = current_price
-                take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT / 100)
-                stop_loss_price = entry_price * (1 - STOP_LOSS_PCT / 100)
-                print(f"\n📈 BUY SIGNAL #{total_trades} at {entry_price:.2f} (Time: {current_row['date']})")
-                print(f"   -> TP: {take_profit_price:.2f}, SL: {stop_loss_price:.2f}")
+    model, scaler, meta, spec = load_artifacts()
+    buy_th = float(meta.get("buy_threshold", 0.5))
+    sell_th = float(meta.get("sell_threshold", 0.5))
 
-    # --- SUMMARY ---
-    print("\n--- Backtest Summary ---")
-    if total_trades > 0:
-        win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
-        total_pnl = sum(trades)
-        avg_pnl = total_pnl / total_trades if total_trades > 0 else 0
-        
-        print(f"Total Trades Executed: {total_trades}")
-        print(f"Winning Trades: {winning_trades}")
-        print(f"Win Rate: {win_rate:.2f}%")
-        print(f"Total Net PnL: {total_pnl:.2f}%")
-        print(f"Average PnL per Trade: {avg_pnl:.3f}%")
-    else:
-        print("No trades were executed during the backtest.")
-    print("------------------------")
+    wins = losses = trades = 0
+    net_pnl_pct = 0.0
+
+    raw_buffer = pd.DataFrame(columns=["open","high","low","close","volume"])
+
+    print(f"📦 Reading chunks from: {data_dir}")
+    for chunk in load_ohlc_chunks(data_dir):
+        raw_buffer = pd.concat([raw_buffer, chunk])
+        raw_buffer = raw_buffer[~raw_buffer.index.duplicated(keep="last")].sort_index()
+        if len(raw_buffer) > warmup_bars + len(chunk):
+            raw_buffer = raw_buffer.tail(warmup_bars + len(chunk))
+
+        feat = build_features(raw_buffer, compat_inf_to_zero=True)
+        if feat.empty:
+            continue
+        # we need a simple row-wise loop to align with "lookahead" logic
+        for i in range(len(feat) - lookahead_steps):
+            sub = feat.iloc[: i+1]
+            X, px = make_model_window(sub, spec=spec, scaler=scaler)
+            if X is None:
+                continue
+
+            with torch.no_grad():
+                prob = torch.sigmoid(model(torch.from_numpy(X))).item()
+            signal, _ = proba_to_signal(prob, buy_th, sell_th)
+            if signal != "BUY":
+                continue
+
+            # evaluate outcome over next N bars
+            entry_price = float(sub["close"].iloc[-1])
+            stop_price = entry_price * (1 - stop_loss_pct/100.0)
+            future = feat.iloc[i+1 : i+1+lookahead_steps]
+            if future.empty:
+                continue
+
+            low_in_period = float(future["low"].min())
+            exit_price = float(future["close"].iloc[-1])  # exit at end if no stop
+            if low_in_period <= stop_price:
+                pnl = -stop_loss_pct - fee_pct  # entry fee assumed included
+                losses += 1
+            else:
+                pnl = ((exit_price - entry_price) / entry_price) * 100.0
+                pnl -= (2 * fee_pct)  # entry + exit fees
+                if pnl >= 0: wins += 1
+                else: losses += 1
+            net_pnl_pct += pnl
+            trades += 1
+
+    return {
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": (wins / trades * 100.0) if trades else 0.0,
+        "net_pnl_pct": net_pnl_pct,
+    }
+
 
 def main():
-    """Main function to run the backtest."""
-    load_dotenv()
-    
-    endpoint_name = os.getenv("ENDPOINT_NAME")
-    if not endpoint_name:
-        raise ValueError("ENDPOINT_NAME environment variable not set. Please create a .env file.")
+    ap = argparse.ArgumentParser(description="Lookahead/stop-loss backtest (chunked)")
+    ap.add_argument("-d","--data-dir", default=os.getenv("DATA_DIR","eth_1m_data"))
+    ap.add_argument("--lookahead", type=int, default=int(os.getenv("LOOKAHEAD_STEPS","10")))
+    ap.add_argument("--stop-loss-pct", type=float, default=float(os.getenv("STOP_LOSS_PCT","0.5")))
+    ap.add_argument("--fee-pct", type=float, default=float(os.getenv("TRADING_FEE_PCT","0.075")))
+    ap.add_argument("--warmup-bars", type=int, default=int(os.getenv("WARMUP_BARS","5000")))
+    args = ap.parse_args()
 
-    signal_gen = SignalGenerator(endpoint_name=endpoint_name)
+    res = run_backtest_chunked(
+        args.data_dir, lookahead_steps=args.lookahead, stop_loss_pct=args.stop_loss_pct,
+        fee_pct=args.fee_pct, warmup_bars=args.warmup_bars,
+    )
+    print("\n================= Backtest (lookahead) =================")
+    print(f"Trades          : {res['trades']}")
+    print(f"Wins/Losses     : {res['wins']} / {res['losses']}")
+    print(f"Win rate        : {res['win_rate_pct']:.2f}%")
+    print(f"Net PnL         : {res['net_pnl_pct']:.3f}%")
+    print("========================================================\n")
 
-    print("Loading all historical data for backtest...")
-    all_data = pd.concat(load_ohlc_chunks(folder='eth_1m_data', chunk_mode=True), ignore_index=True)
-    all_data['date'] = pd.to_datetime(all_data['date'], unit='ms')
-    
-    if all_data.empty:
-        print("No data found. Exiting backtest.")
-        return
-        
-    run_backtest(all_data, signal_gen)
 
 if __name__ == "__main__":
     main()

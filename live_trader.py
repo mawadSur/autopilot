@@ -3,116 +3,78 @@ import time
 import pandas as pd
 import logging
 from dotenv import load_dotenv
-from utils import SignalGenerator, get_client_binance
+from binance.client import Client
+from utils import SignalGenerator
 
 def run_live_trader():
-    """
-    Runs a LIVE trading bot that can execute real orders.
-    """
+    """Runs a LIVE trading bot that can execute real orders (scaffold)."""
     print("🚀 Starting LIVE Trading Bot...")
     load_dotenv()
 
-    # --- Setup Logging ---
     logging.basicConfig(
-        filename='live_trade.log', 
-        level=logging.INFO, 
-        format='%(asctime)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        filename=os.getenv("LIVE_TRADER_LOG", "live_trader.log"),
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
     )
-    
-    # --- Get Environment Variables & Initialize Clients ---
+
+    api_key = os.getenv("BINANCE_KEY")
+    api_secret = os.getenv("BINANCE_SECRET")
+    if not api_key or not api_secret:
+        raise ValueError("Missing BINANCE_KEY/BINANCE_SECRET in env.")
+    client = Client(api_key, api_secret)
+
     endpoint_name = os.getenv("ENDPOINT_NAME")
     if not endpoint_name:
-        raise ValueError("ENDPOINT_NAME not set in .env file.")
-    
-    # Ensure TESTNET is NOT set or is false in your .env file
-    try:
-        client = get_client_binance()
-        print("✅ Successfully connected to LIVE Binance API.")
-    except Exception as e:
-        print(f"❌ Error connecting to Binance: {e}")
-        logging.error(f"Error connecting to Binance: {e}")
-        return
-
+        raise ValueError("ENDPOINT_NAME not set in env.")
     signal_gen = SignalGenerator(endpoint_name=endpoint_name)
 
-    # --- Trading Parameters ---
-    SYMBOL = 'ETHUSDT'
-    TRADE_QUANTITY_USDT = 20 # Amount in USDT to trade each time
-    TAKE_PROFIT_PCT = 1.5
-    STOP_LOSS_PCT = 0.75
-    
-    # --- Trading State ---
+    SYMBOL = os.getenv("SYMBOL", "ETHUSDT")
+    QUOTE_USD = float(os.getenv("TRADE_QUANTITY_USDT", "20"))
+    TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "1.5"))
+    STOP_LOSS_PCT   = float(os.getenv("STOP_LOSS_PCT", "0.75"))
+
     in_position = False
     entry_price = 0.0
     take_profit_price = 0.0
     stop_loss_price = 0.0
-    
-    print(f"Trading Parameters: Quantity=${TRADE_QUANTITY_USDT}, TP={TAKE_PROFIT_PCT}%, SL={STOP_LOSS_PCT}%")
-    logging.info(f"--- Starting New LIVE Trading Session ---")
-    logging.info(f"Parameters: Quantity=${TRADE_QUANTITY_USDT}, TP={TAKE_PROFIT_PCT}%, SL={STOP_LOSS_PCT}%")
 
-    # --- Main Trading Loop ---
+    print(f"Trading {SYMBOL} | Qty=${QUOTE_USD} | TP={TAKE_PROFIT_PCT}% | SL={STOP_LOSS_PCT}%")
+    logging.info("Session started")
+
     while True:
         try:
-            latest_kline = client.get_klines(symbol=SYMBOL, interval=client.KLINE_INTERVAL_1MINUTE, limit=1)[0]
-            kline_data = {
-                'date': pd.to_datetime(latest_kline[0], unit='ms'),
-                'open': float(latest_kline[1]), 'high': float(latest_kline[2]),
-                'low': float(latest_kline[3]), 'close': float(latest_kline[4]),
-                'volume': float(latest_kline[5])
+            k = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_1MINUTE, limit=1)[0]
+            kline = {
+                'date': pd.to_datetime(k[0], unit='ms'),
+                'open': float(k[1]), 'high': float(k[2]),
+                'low': float(k[3]), 'close': float(k[4]),
+                'volume': float(k[5]),
             }
-            current_price = kline_data['close']
-            current_high = kline_data['high']
-            current_low = kline_data['low']
+            current_price = kline['close']
 
-            print(f"\rChecking {kline_data['date']} | Price: ${current_price:.2f} | In Position: {in_position}", end="")
-
-            # --- EXIT LOGIC ---
             if in_position:
-                exit_reason = ""
-                if current_high >= take_profit_price:
-                    exit_reason = f"✅ EXECUTING SELL (TAKE PROFIT) at ~${take_profit_price:.2f}"
-                elif current_low <= stop_loss_price:
-                    exit_reason = f"❌ EXECUTING SELL (STOP LOSS) at ~${stop_loss_price:.2f}"
-
-                if exit_reason:
-                    print(f"\n{exit_reason}")
-                    logging.info(exit_reason)
-                    # =================================================================
-                    # !!! IMPORTANT: REAL SELL ORDER EXECUTION LOGIC GOES HERE !!!
-                    # Example: 
-                    # quantity_to_sell = TRADE_QUANTITY_USDT / entry_price 
-                    # client.create_order(symbol=SYMBOL, side='SELL', type='MARKET', quantity=round(quantity_to_sell, 5))
-                    # =================================================================
+                if current_price >= take_profit_price:
+                    logging.info(f"TP hit at {current_price:.2f}")
+                    # TODO: place real SELL order
                     in_position = False
-
-            # --- ENTRY LOGIC ---
-            if not in_position:
-                result = signal_gen.get_signal(kline_data)
-                signal = result.get('signal')
-
-                if signal == 1:
-                    log_msg = f"📈 BUY SIGNAL at ~${current_price:.2f}"
-                    print(f"\n{log_msg}")
-                    logging.info(log_msg)
-                    # =================================================================
-                    # !!! IMPORTANT: REAL BUY ORDER EXECUTION LOGIC GOES HERE !!!
-                    # Example: 
-                    # client.create_order(symbol=SYMBOL, side='BUY', type='MARKET', quoteOrderQty=TRADE_QUANTITY_USDT)
-                    # =================================================================
+                elif current_price <= stop_loss_price:
+                    logging.info(f"SL hit at {current_price:.2f}")
+                    # TODO: place real SELL order
+                    in_position = False
+            else:
+                res = signal_gen.get_signal(kline)
+                sig = res.get('signal', 0)
+                if sig == 1:
+                    logging.info(f"BUY signal at {current_price:.2f}")
+                    # TODO: place real BUY order for QUOTE_USD
                     in_position = True
                     entry_price = current_price
-                    take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT / 100)
-                    stop_loss_price = entry_price * (1 - STOP_LOSS_PCT / 100)
-                    logging.info(f"   -> New Position: TP={take_profit_price:.2f}, SL={stop_loss_price:.2f}")
+                    take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT/100.0)
+                    stop_loss_price   = entry_price * (1 - STOP_LOSS_PCT/100.0)
 
             time.sleep(60)
-
         except Exception as e:
-            error_msg = f"An error occurred in the main loop: {e}"
-            print(f"\n{error_msg}")
-            logging.error(error_msg)
+            logging.error(f"Loop error: {e}")
             time.sleep(60)
 
 if __name__ == "__main__":
