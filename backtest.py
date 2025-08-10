@@ -1,162 +1,112 @@
 import os
 import pandas as pd
-import backtrader as bt
-import json
-from tqdm import tqdm
+from tqdm.auto import tqdm
+from dotenv import load_dotenv
+from utils import SignalGenerator, load_ohlc_chunks
 
+def run_backtest(df, signal_gen):
+    """
+    Runs a backtest using a Take-Profit/Stop-Loss strategy.
+    """
+    print("\n📈 Starting backtest with Take-Profit/Stop-Loss strategy...")
 
-class SignalData(bt.feeds.PandasData):
-    lines = ('signal', 'confidence',)
-    params = (
-        ('datetime', None),
-        ('open', 'open'),
-        ('high', 'high'),
-        ('low', 'low'),
-        ('close', 'close'),
-        ('volume', 'volume'),
-        ('openinterest', -1),
-        ('signal', -1),
-        ('confidence', -1),
-    )
+    # --- Realistic Trading Parameters ---
+    TRADING_FEE_PCT = 0.075  # Standard fee for Binance (0.075%)
+    TAKE_PROFIT_PCT = 1.5    # Target a 1.5% profit on each trade
+    STOP_LOSS_PCT = 0.75     # A 0.75% stop-loss for risk management
 
+    # --- Backtest State & Logging ---
+    in_position = False
+    entry_price = 0.0
+    take_profit_price = 0.0
+    stop_loss_price = 0.0
+    
+    trades = []
+    total_trades = 0
+    winning_trades = 0
 
-class SignalStrategy(bt.Strategy):
-    params = (
-        ('atr_period', 14),
-        ('atr_tp_mult', 1.5),
-        ('atr_sl_mult', 1.0),
-        ('min_volume_ratio', 0.5),
-        ('cooldown_bars', 5),
-        ('max_hold', 24),
-    )
+    # Pre-fill the history buffer to ensure the model has enough data from the start
+    initial_history_size = signal_gen.history_size
+    initial_history_df = df.head(initial_history_size)
+    for _, row in initial_history_df.iterrows():
+        signal_gen.history.append(row.to_dict())
+    print(f"Pre-filled history buffer with {len(signal_gen.history)} records.")
 
-    def __init__(self):
-        self.order = None
-        self.entry_price = None
-        self.entry_bar = None
-        self.last_exit_bar = -999
+    # Iterate through the rest of the data, one minute at a time
+    for i in tqdm(range(initial_history_size, len(df)), desc="Backtesting"):
+        current_row = df.iloc[i]
+        current_price = current_row['close']
+        current_high = current_row['high']
+        current_low = current_row['low']
+        
+        # ✅ CORRECTED EXIT LOGIC
+        if in_position:
+            # 1. Check for Stop-Loss first (conservative, "worst-first" approach)
+            if current_low <= stop_loss_price:
+                exit_price = stop_loss_price
+                pnl = ((exit_price - entry_price) / entry_price) * 100 - (2 * TRADING_FEE_PCT)
+                trades.append(pnl)
+                print(f"\n❌ STOP LOSS at {exit_price:.2f}. PnL: {pnl:.3f}%")
+                in_position = False 
 
-        self.atr = bt.indicators.ATR(self.data, period=self.p.atr_period)
-        self.total_trades = 0
-        self.total_wins = 0
-        self.total_losses = 0
-        self.log_list = []
+            # 2. Only if not stopped out, check for Take-Profit
+            elif current_high >= take_profit_price:
+                exit_price = take_profit_price
+                pnl = ((exit_price - entry_price) / entry_price) * 100 - (2 * TRADING_FEE_PCT)
+                trades.append(pnl)
+                winning_trades += 1
+                print(f"\n✅ TAKE PROFIT at {exit_price:.2f}. PnL: {pnl:.3f}%")
+                in_position = False
 
-        with open("model_meta.json", "r") as f:
-            self.conf_threshold = json.load(f).get("best_threshold", 0.6)
+        # --- ENTRY LOGIC ---
+        if not in_position:
+            result = signal_gen.get_signal(current_row.to_dict())
+            signal = result.get('signal')
+            
+            if signal == 1:
+                total_trades += 1
+                in_position = True
+                entry_price = current_price
+                take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT / 100)
+                stop_loss_price = entry_price * (1 - STOP_LOSS_PCT / 100)
+                print(f"\n📈 BUY SIGNAL #{total_trades} at {entry_price:.2f} (Time: {current_row['date']})")
+                print(f"   -> TP: {take_profit_price:.2f}, SL: {stop_loss_price:.2f}")
 
-    def log(self, txt):
-        dt = self.datas[0].datetime.datetime(0)
-        print(f'{dt.isoformat()} - {txt}')
+    # --- SUMMARY ---
+    print("\n--- Backtest Summary ---")
+    if total_trades > 0:
+        win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
+        total_pnl = sum(trades)
+        avg_pnl = total_pnl / total_trades if total_trades > 0 else 0
+        
+        print(f"Total Trades Executed: {total_trades}")
+        print(f"Winning Trades: {winning_trades}")
+        print(f"Win Rate: {win_rate:.2f}%")
+        print(f"Total Net PnL: {total_pnl:.2f}%")
+        print(f"Average PnL per Trade: {avg_pnl:.3f}%")
+    else:
+        print("No trades were executed during the backtest.")
+    print("------------------------")
 
-    def notify_order(self, order):
-        if order.status in [order.Completed, order.Canceled, order.Rejected]:
-            self.order = None
+def main():
+    """Main function to run the backtest."""
+    load_dotenv()
+    
+    endpoint_name = os.getenv("ENDPOINT_NAME")
+    if not endpoint_name:
+        raise ValueError("ENDPOINT_NAME environment variable not set. Please create a .env file.")
 
-    def next(self):
-        if self.order:
-            return
+    signal_gen = SignalGenerator(endpoint_name=endpoint_name)
 
-        if not self.position:
-            if self.data.signal[0] == 1 and self.data.confidence[0] >= self.conf_threshold:
-                if self.data.volume[0] < self.data.volume[-1] * self.p.min_volume_ratio:
-                    return
-                if len(self) - self.last_exit_bar < self.p.cooldown_bars:
-                    return
-
-                self.order = self.buy()
-                self.entry_price = self.data.close[0]
-                self.entry_bar = len(self)
-                self.tp_price = self.entry_price + self.atr[0] * self.p.atr_tp_mult
-                self.sl_price = self.entry_price - self.atr[0] * self.p.atr_sl_mult
-                self.log(f'BUY at {self.entry_price:.2f} | TP: {self.tp_price:.2f}, SL: {self.sl_price:.2f}')
-        else:
-            current_price = self.data.close[0]
-            held_bars = len(self) - self.entry_bar
-
-            should_exit = (
-                current_price >= self.tp_price or
-                current_price <= self.sl_price or
-                held_bars >= self.p.max_hold
-            )
-
-            if should_exit:
-                self.order = self.sell()
-                pnl = current_price - self.entry_price
-                result = "WIN" if pnl > 0 else "LOSS"
-                self.total_trades += 1
-                if pnl > 0:
-                    self.total_wins += 1
-                else:
-                    self.total_losses += 1
-                self.last_exit_bar = len(self)
-                self.log(f'SELL at {current_price:.2f} | PnL: {pnl:.2f} → {result}')
-                self.log_list.append({
-                    "entry_bar": self.entry_bar,
-                    "exit_bar": len(self),
-                    "entry_price": self.entry_price,
-                    "exit_price": current_price,
-                    "held_hours": held_bars,
-                    "pnl": pnl,
-                    "result": result
-                })
-
-
-def run_backtest_in_chunks(csv_path='eth_signals.csv', chunk_size=1_000_000, progress_file='chunk_progress.txt'):
-    chunk_iter = pd.read_csv(csv_path, chunksize=chunk_size)
-
-    start_chunk = 0
-    if os.path.exists(progress_file):
-        with open(progress_file, 'r') as f:
-            start_chunk = int(f.read().strip())
-        print(f"⏩ Resuming from chunk {start_chunk}")
-
-    for i, chunk in enumerate(tqdm(chunk_iter, desc="Backtesting Chunks", ncols=100)):
-        if i < start_chunk:
-            continue
-
-        if 'signal' not in chunk.columns or 'confidence' not in chunk.columns:
-            print(f"❌ Skipping chunk {i} due to missing signal/confidence")
-            continue
-
-        chunk.dropna(inplace=True)
-
-        cerebro = bt.Cerebro()
-        cerebro.adddata(SignalData(dataname=chunk))
-        cerebro.addstrategy(SignalStrategy)
-        cerebro.broker.setcash(10000)
-        cerebro.broker.setcommission(commission=0.001)
-        cerebro.addsizer(bt.sizers.PercentSizer, percents=95)
-
-        cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
-        cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-
-        print(f"\n=== Starting Chunk {i} ===")
-        start_val = cerebro.broker.getvalue()
-
-        strat = cerebro.run()[0]
-        end_val = cerebro.broker.getvalue()
-
-        print(f"Final Portfolio Value: {end_val}")
-        print("\n=== Trade Log ===")
-        for trade in strat.log_list:
-            print(trade)
-
-        print("\n=== Metrics ===")
-        print(f"Total Trades: {strat.total_trades}")
-        print(f"Wins: {strat.total_wins}")
-        print(f"Losses: {strat.total_losses}")
-        if strat.total_trades > 0:
-            print(f"Win Rate: {strat.total_wins / strat.total_trades * 100:.2f}%")
-        print(f"Total Return: {end_val - start_val:.2f} USD")
-
-        print("\n=== Analyzers ===")
-        print("Sharpe Ratio:", strat.analyzers.sharpe.get_analysis())
-        print("Max Drawdown:", strat.analyzers.drawdown.get_analysis().get('max', {}).get('drawdown', 'N/A'), "%")
-
-        with open(progress_file, 'w') as f:
-            f.write(str(i + 1))
-
+    print("Loading all historical data for backtest...")
+    all_data = pd.concat(load_ohlc_chunks(folder='eth_1m_data', chunk_mode=True), ignore_index=True)
+    all_data['date'] = pd.to_datetime(all_data['date'], unit='ms')
+    
+    if all_data.empty:
+        print("No data found. Exiting backtest.")
+        return
+        
+    run_backtest(all_data, signal_gen)
 
 if __name__ == "__main__":
-    run_backtest_in_chunks()
+    main()
