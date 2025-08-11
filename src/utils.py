@@ -1,185 +1,274 @@
 # utils.py
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, Any, Iterator
-import glob, os
-import numpy as np
-import pandas as pd
+
 import json
+import os
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
-# ---------- Feature spec ----------
-@dataclass(frozen=True)
-class FeatureSpec:
-    feature_cols: List[str]
+# ---------------------------------------------------------------------
+# Small env helpers
+# ---------------------------------------------------------------------
+def _get_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+def _get_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+def _get_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+# ---------------------------------------------------------------------
+# Model meta loader (optional)
+# ---------------------------------------------------------------------
+@dataclass
+class ModelMeta:
     window_size: int = 150
+    threshold: float = 0.60
+    features: List[str] = None  # e.g., ["open","high","low","close","volume"]
 
-DEFAULT_FEATURE_COLS: List[str] = [
-    "open","high","low","close",
-    "body","range","upper_wick","lower_wick","return",
-    "sma_ratio","ema_20","macd","rsi_14","vol_change",
-    "atr","price_vs_hourly_trend","bb_width",
-]
-DEFAULT_FEATURE_SPEC = FeatureSpec(DEFAULT_FEATURE_COLS, 150)
+def _load_model_meta(meta_path: Path = Path("model_meta.json")) -> ModelMeta:
+    meta = ModelMeta(
+        window_size=_get_int("WINDOW_SIZE", _get_int("HISTORY_SIZE", 150)),
+        threshold=_get_float("CONF_THRESHOLD", 0.60),
+        features=None,
+    )
+    if meta_path.exists():
+        try:
+            with meta_path.open("r") as f:
+                j = json.load(f)
+            if isinstance(j, dict):
+                meta.window_size = int(j.get("window_size", meta.window_size))
+                meta.threshold = float(j.get("threshold", meta.threshold))
+                feats = j.get("features")
+                if isinstance(feats, list) and feats:
+                    meta.features = [str(x) for x in feats]
+        except Exception:
+            # ignore malformed meta; keep defaults
+            pass
 
+    # env override for features (comma-separated)
+    env_feats = os.getenv("FEATURES")
+    if env_feats:
+        meta.features = [s.strip() for s in env_feats.split(",") if s.strip()]
 
-# ---------- Meta ----------
-def load_meta(path: str = "model_meta.json") -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return {
-            "feature_cols": DEFAULT_FEATURE_COLS,
-            "window_size": 150,
-            "buy_threshold": 0.5,
-            "sell_threshold": 0.5,
-            "hidden_size": 64,
-            "num_layers": 2,
-            "dropout": 0.1,
-            "bidirectional": False,
-        }
-    with open(path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-    meta.setdefault("feature_cols", DEFAULT_FEATURE_COLS)
-    meta.setdefault("window_size", 150)
-    meta.setdefault("buy_threshold", 0.5)
-    meta.setdefault("sell_threshold", 0.5)
+    # final default
+    if not meta.features:
+        meta.features = ["open", "high", "low", "close", "volume"]
+
     return meta
 
+# ---------------------------------------------------------------------
+# Binance helpers (used by paper_trade.py, run_live_check.py, trade.py)
+# ---------------------------------------------------------------------
+def get_binance_client(testnet: Optional[bool] = None):
+    """
+    Lazy-imports binance and returns a configured Client.
+    Picks keys based on TESTNET flag (env or param).
+    """
+    from binance.client import Client  # lazy import
 
-# ---------- IO: stream OHLCV files ----------
-def load_ohlc_chunks(
-    folder: str,
-    pattern: str = "*.csv",
-    required_cols: Tuple[str, ...] = ("open","high","low","close","volume"),
-) -> Iterator[pd.DataFrame]:
+    if testnet is None:
+        testnet = _get_bool("TESTNET", False)
+
+    if testnet:
+        key = os.getenv("BINANCE_TESTNET_KEY")
+        sec = os.getenv("BINANCE_TESTNET_SECRET")
+    else:
+        key = os.getenv("BINANCE_KEY") or os.getenv("BINANCE_TESTNET_KEY")
+        sec = os.getenv("BINANCE_SECRET") or os.getenv("BINANCE_TESTNET_SECRET")
+
+    if not key or not sec:
+        raise RuntimeError("Missing Binance API credentials in env")
+
+    # Add a small timeout to avoid hanging calls
+    return Client(api_key=key, api_secret=sec, testnet=testnet, requests_params={"timeout": 30})
+
+def kline_to_row(k: Iterable[Any]) -> Dict[str, Any]:
     """
-    Yields OHLCV dataframes (monthly or otherwise) with a tz-aware DatetimeIndex.
-    Accepts files that either have a 'timestamp'/'date' column, or already have an index.
+    Convert a kline array to the row format expected by SignalGenerator.
+    k: [openTime, open, high, low, close, volume, ...]
     """
-    paths = sorted(glob.glob(os.path.join(folder, pattern)))
-    for p in paths:
-        df = pd.read_csv(p)
-        # normalize time index
-        if "timestamp" in df.columns:
-            ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        elif "date" in df.columns:
-            ts = pd.to_datetime(df["date"], utc=True, errors="coerce")
+    k = list(k)
+    return {
+        "date": int(k[0]),
+        "open": float(k[1]),
+        "high": float(k[2]),
+        "low": float(k[3]),
+        "close": float(k[4]),
+        "volume": float(k[5]),
+    }
+
+def prefill_history(signal_gen: "SignalGenerator", client, symbol: str, interval: str) -> None:
+    """
+    Warm up the history buffer with the last N bars (N = window_size).
+    """
+    limit = min(signal_gen.history_size, 1000)
+    kl = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    for k in kl:
+        signal_gen.history.append(kline_to_row(k))
+
+def fetch_latest_bar(client, symbol: str, interval: str) -> Tuple[Dict[str, Any], int]:
+    """
+    Fetch only the most recent bar and its open time.
+    """
+    kl = client.get_klines(symbol=symbol, interval=interval, limit=2)
+    last = kline_to_row(kl[-1])
+    return last, last["date"]
+
+# ---------------------------------------------------------------------
+# SageMaker Predictor (lazy)
+# ---------------------------------------------------------------------
+class _SMEndpoint:
+    def __init__(self, endpoint_name: str):
+        self.endpoint_name = endpoint_name
+        self._predictor = None  # built on first use
+
+    def _get_predictor(self):
+        if self._predictor is not None:
+            return self._predictor
+
+        try:
+            import boto3  # lazy
+            from botocore.config import Config
+            import sagemaker
+            from sagemaker.predictor import Predictor
+            from sagemaker.serializers import JSONSerializer
+            from sagemaker.deserializers import JSONDeserializer
+        except Exception as e:
+            raise RuntimeError(f"Import error for boto3/sagemaker: {e}")
+
+        cfg = Config(read_timeout=180, connect_timeout=180, retries={"max_attempts": 0})
+        smrt = boto3.client("sagemaker-runtime", config=cfg)
+        sess = sagemaker.Session(sagemaker_runtime_client=smrt)
+
+        self._predictor = Predictor(
+            endpoint_name=self.endpoint_name,
+            sagemaker_session=sess,
+            serializer=JSONSerializer(),
+            deserializer=JSONDeserializer(),
+        )
+        return self._predictor
+
+    def predict(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        pred = self._get_predictor()
+        out = pred.predict(payload)
+        # Normalize common shapes
+        if isinstance(out, dict):
+            return out
+        # Some containers return {"body": "...json..."}
+        try:
+            text = out.get("body") if isinstance(out, dict) else out
+            if isinstance(text, (bytes, bytearray)):
+                text = text.decode("utf-8")
+            return json.loads(text)
+        except Exception:
+            return {"raw": out}
+
+# ---------------------------------------------------------------------
+# Signal Generator
+# ---------------------------------------------------------------------
+class SignalGenerator:
+    """
+    Buffers OHLCV rows and queries a SageMaker endpoint for a signal.
+    - Reads window_size/threshold/features from model_meta.json or env.
+    - Exposes .history (deque of rows) for warm-up.
+    - get_signal(row) -> {'signal':0/1, 'confidence':float|None, 'probability':float|None, 'meta':{...}}
+    """
+
+    def __init__(
+        self,
+        endpoint_name: Optional[str] = None,
+        window_size: Optional[int] = None,
+        threshold: Optional[float] = None,
+        features: Optional[List[str]] = None,
+    ):
+        meta = _load_model_meta()
+        self.history_size: int = int(window_size or meta.window_size)
+        self.threshold: float = float(threshold if threshold is not None else meta.threshold)
+        self.features: List[str] = features or meta.features
+
+        self.history: Deque[Dict[str, Any]] = deque(maxlen=self.history_size)
+        self._endpoint_name = endpoint_name or os.getenv("ENDPOINT_NAME")
+        self._sagemaker: Optional[_SMEndpoint] = None
+        self._last_open_time: Optional[int] = None  # for de-duping if you want to feed live ticks
+
+        if not self._endpoint_name:
+            raise RuntimeError("ENDPOINT_NAME is not set (and no endpoint_name provided)")
+
+    # ----------------- public API -----------------
+    def get_signal(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Append a new OHLCV row and, when we have enough history, call the endpoint.
+        Row must contain keys in ['date','open','high','low','close','volume'].
+        """
+        self._append(row)
+
+        if len(self.history) < self.history_size:
+            return {"signal": 0, "confidence": None, "probability": None, "meta": {"reason": "warming_up"}}
+
+        inputs = self._build_inputs()
+        result = self._infer({"inputs": inputs})
+
+        # normalize result shapes
+        prob = None
+        conf = None
+        signal = 0
+
+        if isinstance(result, dict):
+            # common variants
+            prob = result.get("probability") or result.get("prob") or result.get("proba")
+            conf = result.get("confidence", prob)
+            sig = result.get("signal")
+            if sig is not None:
+                try:
+                    signal = int(sig)
+                except Exception:
+                    signal = 1 if float(sig) >= self.threshold else 0
+            elif conf is not None:
+                signal = 1 if float(conf) >= self.threshold else 0
+
+        return {"signal": signal, "confidence": conf, "probability": prob, "meta": {"features": self.features}}
+
+    # ----------------- internals ------------------
+    def _append(self, row: Dict[str, Any]) -> None:
+        # keep strictly increasing by open time
+        ts = int(row["date"])
+        if self._last_open_time is None or ts > self._last_open_time:
+            self.history.append(row)
+            self._last_open_time = ts
         else:
-            # assume index is a timestamp-like column name saved by to_csv(index=True)
-            idx_name = df.columns[0]
-            ts = pd.to_datetime(df[idx_name], utc=True, errors="coerce")
-        df["__ts__"] = ts
-        df = df.dropna(subset=["__ts__"]).set_index("__ts__").sort_index()
+            # same candle update: replace tail (latest) to keep close/volume fresh
+            if self.history:
+                self.history.pop()
+            self.history.append(row)
+            self._last_open_time = ts
 
-        # column subset + dtype
-        missing = set(required_cols) - set(df.columns)
-        if missing:
-            # try lower/upper case accidental variants
-            for m in list(missing):
-                if m.title() in df.columns:  # e.g. Open
-                    df[m] = pd.to_numeric(df[m.title()], errors="coerce")
-                    missing.remove(m)
-            if missing:
-                raise ValueError(f"{p} is missing columns: {missing}")
+    def _build_inputs(self) -> List[List[float]]:
+        """
+        Turn history -> 2D feature matrix [window_size x feature_count].
+        Defaults to raw OHLCV (order taken from self.features).
+        If you later store a richer feature list in model_meta.json, this will honor it automatically.
+        """
+        # Quick map to speed up repeated lookups
+        feat_keys = self.features
+        out: List[List[float]] = []
+        for r in list(self.history)[-self.history_size:]:
+            out.append([float(r[k]) for k in feat_keys])
+        return out
 
-        for c in required_cols:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        # keep only what's needed (plus 'close' is used later)
-        yield df[["open","high","low","close","volume"]].dropna().sort_index()
-
-
-# ---------- TA helpers ----------
-def _ensure_dt_index_utc(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if not isinstance(out.index, pd.DatetimeIndex):
-        out.index = pd.to_datetime(out.index, utc=True)
-    else:
-        if out.index.tz is None:
-            out.index = out.index.tz_localize("UTC")
-    return out.sort_index()
-
-def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    up = delta.clip(lower=0.0)
-    down = (-delta).clip(lower=0.0)
-    roll_up = up.ewm(alpha=1/period, adjust=False).mean()
-    roll_down = down.ewm(alpha=1/period, adjust=False).mean()
-    rs = roll_up / (roll_down + 1e-12)
-    return 100.0 - (100.0 / (1.0 + rs))
-
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([(high-low),(high-prev_close).abs(),(low-prev_close).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, adjust=False).mean()
-
-
-# ---------- Feature pipeline (single source of truth) ----------
-def build_features(raw_df: pd.DataFrame, *, add_hourly_trend: bool = True,
-                   compat_inf_to_zero: bool = False, keep_helper_cols: bool = False) -> pd.DataFrame:
-    df = _ensure_dt_index_utc(raw_df).copy()
-
-    df["body"] = df["close"] - df["open"]
-    df["range"] = df["high"] - df["low"]
-    df["upper_wick"] = df["high"] - df[["close","open"]].max(axis=1)
-    df["lower_wick"] = df[["close","open"]].min(axis=1) - df["low"]
-
-    df["return"] = df["close"].pct_change()
-    df["vol_change"] = df["volume"].pct_change()
-
-    df["sma_10"] = df["close"].rolling(10, min_periods=10).mean()
-    df["sma_50"] = df["close"].rolling(50, min_periods=50).mean()
-    df["sma_ratio"] = (df["sma_10"]/df["sma_50"]) - 1.0
-
-    df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["macd"] = df["close"].ewm(span=12, adjust=False).mean() - df["close"].ewm(span=26, adjust=False).mean()
-
-    df["rsi_14"] = compute_rsi(df["close"], 14)
-    df["atr"] = compute_atr(df, 14)
-
-    if add_hourly_trend:
-        hourly = df["close"].resample("1h").mean()
-        hourly_ema20 = hourly.ewm(span=20, adjust=False).mean()
-        df["hourly_ema_20"] = hourly_ema20.reindex(df.index, method="ffill")
-        denom = df["hourly_ema_20"].replace(0, np.nan)
-        df["price_vs_hourly_trend"] = (df["close"] - df["hourly_ema_20"]) / denom
-    else:
-        df["price_vs_hourly_trend"] = np.nan
-
-    bb_std = df["close"].rolling(20, min_periods=20).std()
-    bb_mid = df["close"].rolling(20, min_periods=20).mean()
-    df["bb_width"] = (4.0 * bb_std) / (bb_mid.replace(0, np.nan))
-
-    df.replace([np.inf, -np.inf], 0 if compat_inf_to_zero else np.nan, inplace=True)
-    df.dropna(inplace=True)
-
-    if not keep_helper_cols:
-        for c in ("sma_10","sma_50","hourly_ema_20"):
-            if c in df.columns: df.drop(columns=c, inplace=True)
-    return df
-
-
-def make_model_window(
-    feat_df: pd.DataFrame,
-    spec: FeatureSpec,
-    scaler=None,
-) -> Tuple[Optional[np.ndarray], Optional[float]]:
-    missing = [c for c in spec.feature_cols if c not in feat_df.columns]
-    if missing:
-        raise ValueError(f"Missing features: {missing}")
-    if len(feat_df) < spec.window_size:
-        price = float(feat_df["close"].iloc[-1]) if len(feat_df) else None
-        return None, price
-    mat = feat_df[spec.feature_cols].tail(spec.window_size).to_numpy(dtype=np.float32)
-    if scaler is not None:
-        mat = scaler.transform(mat)
-    X = np.expand_dims(mat, axis=0)
-    return X, float(feat_df["close"].iloc[-1])
-
-
-def proba_to_signal(p: float, buy_threshold: float, sell_threshold: float) -> tuple[str, float]:
-    if p >= buy_threshold: return "BUY", float(p)
-    if p <= sell_threshold: return "SELL", float(1.0 - p)
-    mid = 0.5 * (buy_threshold + sell_threshold)
-    span = max(buy_threshold - mid, 1e-9)
-    conf = 1.0 - (abs(p - mid) / span)
-    return "HOLD", float(max(0.0, min(1.0, conf)))
+    def _infer(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if self._sagemaker is None:
+            self._sagemaker = _SMEndpoint(self._endpoint_name)
+        return self._sagemaker.predict(payload)
