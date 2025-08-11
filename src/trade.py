@@ -1,73 +1,99 @@
 import os
 import time
-import logging
-import pandas as pd
-from binance.client import Client
-from binance.enums import *
+from typing import Dict, Any, Tuple
+
 from dotenv import load_dotenv
+from binance.client import Client
+from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
+from binance.exceptions import BinanceAPIException
+
 from utils import SignalGenerator
 
-TRADE_SYMBOL = os.getenv("TRADE_SYMBOL", "ETHUSDT")
-TRADE_QUANTITY_USDT = float(os.getenv("TRADE_QUANTITY_USDT", "15"))
-
+# ---------------------------------------
 load_dotenv()
-API_KEY = os.getenv("BINANCE_KEY")
-API_SECRET = os.getenv("BINANCE_SECRET")
+
+SYMBOL = os.getenv("TRADE_SYMBOL", "ETHUSDT")
+INTERVAL = os.getenv("INTERVAL", "1m")
 ENDPOINT_NAME = os.getenv("ENDPOINT_NAME")
+QUOTE_USDT = float(os.getenv("TRADE_QUANTITY_USDT", "15"))
 
-if not API_KEY or not API_SECRET:
-    raise ValueError("Missing BINANCE_KEY/BINANCE_SECRET in env/.env")
-if not ENDPOINT_NAME:
-    raise ValueError("Missing ENDPOINT_NAME in env/.env")
+API_KEY = os.getenv("BINANCE_KEY") or os.getenv("BINANCE_TESTNET_KEY")
+API_SECRET = os.getenv("BINANCE_SECRET") or os.getenv("BINANCE_TESTNET_SECRET")
+TESTNET = bool(int(os.getenv("TESTNET", "0")))
+DRY_RUN = bool(int(os.getenv("DRY_RUN", "1")))  # default safe
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+def get_client() -> Client:
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError("Missing BINANCE credentials in env")
+    return Client(API_KEY, API_SECRET, testnet=TESTNET)
 
-def trade_live():
-    client = Client(API_KEY, API_SECRET)
-    signal_gen = SignalGenerator(endpoint_name=ENDPOINT_NAME)
+def to_row(k) -> Dict[str, Any]:
+    return {"date": k[0], "open": float(k[1]), "high": float(k[2]),
+            "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])}
 
-    # Prefill history
-    print(f"Pre-filling history with last {signal_gen.history_size} minutes...")
-    klines = client.get_klines(symbol=TRADE_SYMBOL, interval=Client.KLINE_INTERVAL_1MINUTE, limit=signal_gen.history_size)
-    for k in klines:
-        kline_data = {
-            'date': pd.to_datetime(k[0], unit='ms'),
-            'open': float(k[1]), 'high': float(k[2]),
-            'low': float(k[3]), 'close': float(k[4]),
-            'volume': float(k[5])
-        }
-        signal_gen.history.append(kline_data)
+def prefill(sig: SignalGenerator, client: Client) -> None:
+    kl = client.get_klines(symbol=SYMBOL, interval=INTERVAL, limit=min(sig.history_size, 1000))
+    for k in kl: sig.history.append(to_row(k))
 
-    print("✅ History buffer filled. Starting live trading loop...")
+def latest(client: Client) -> Tuple[Dict[str, Any], int]:
+    kl = client.get_klines(symbol=SYMBOL, interval=INTERVAL, limit=2)
+    last = to_row(kl[-1])
+    return last, last["date"]
+
+def place_market_quote_order(client: Client, side: str, symbol: str, quote_qty: float) -> Dict[str, Any]:
+    if DRY_RUN:
+        print(f"[DRY RUN] {side} {symbol} for {quote_qty} USDT")
+        return {"status": "dry", "side": side, "symbol": symbol, "quoteOrderQty": quote_qty}
+    try:
+        return client.create_order(
+            symbol=symbol,
+            side=side,
+            type=ORDER_TYPE_MARKET,
+            quoteOrderQty=str(quote_qty),
+        )
+    except BinanceAPIException as e:
+        raise RuntimeError(f"Binance order failed: {e.status_code} {e.message}")
+
+def trade_live(poll_seconds: int = 1) -> None:
+    if not ENDPOINT_NAME:
+        raise RuntimeError("ENDPOINT_NAME is not set")
+
+    client = get_client()
+    sig = SignalGenerator(endpoint_name=ENDPOINT_NAME)
+    prefill(sig, client)
+
     position_open = False
-    interval = int(os.getenv("LOOP_INTERVAL_SEC", "60"))
+    last_open_time = -1
+
+    print(f"Live trading started on {SYMBOL} | DRY_RUN={DRY_RUN} TESTNET={TESTNET}")
 
     while True:
         try:
-            k = client.get_klines(symbol=TRADE_SYMBOL, interval=Client.KLINE_INTERVAL_1MINUTE, limit=1)[0]
-            new_kline_data = {
-                'date': pd.to_datetime(k[0], unit='ms'),
-                'open': float(k[1]), 'high': float(k[2]),
-                'low': float(k[3]), 'close': float(k[4]),
-                'volume': float(k[5])
-            }
+            bar, open_time = latest(client)
+            if open_time == last_open_time:
+                time.sleep(poll_seconds); 
+                continue
+            last_open_time = open_time
 
-            if not position_open:
-                res = signal_gen.get_signal(new_kline_data)
-                current_price = new_kline_data['close']
-                print(f"Price: {current_price:.2f} | Confidence: {res.get('confidence')} | Signal: {res.get('signal')}")
-                if res.get("signal") == 1:
-                    print(f"🚀 BUY {TRADE_SYMBOL} for ${TRADE_QUANTITY_USDT} (market)")
-                    # TODO: place real order via client.create_order(...)
-                    position_open = True
-            else:
-                print("Position is open. Waiting for exit condition...")
-                # TODO: Implement TP/SL logic and sell
+            res = sig.get_signal(bar)
+            conf = res.get("confidence")
+            signal = res.get("signal", 0)
+            price = bar["close"]
+
+            if not position_open and signal == 1 and conf is not None and conf >= sig.threshold:
+                order = place_market_quote_order(client, SIDE_BUY, SYMBOL, QUOTE_USDT)
+                print(f"🚀 BUY @ {price:.2f} | conf={conf:.3f} -> {order.get('status', 'ok')}")
+                position_open = True
+            elif position_open and signal == 0:
+                order = place_market_quote_order(client, SIDE_SELL, SYMBOL, QUOTE_USDT)
+                print(f"🏁 SELL @ {price:.2f} -> {order.get('status', 'ok')}")
+                position_open = False
 
         except Exception as e:
-            logging.error(f"Error in trade loop: {e}")
+            print(f"Error in trade loop: {e}")
+            time.sleep(2)
 
-        time.sleep(interval)
+        time.sleep(poll_seconds)
 
 if __name__ == "__main__":
     trade_live()
