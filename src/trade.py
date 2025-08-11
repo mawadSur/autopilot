@@ -19,9 +19,14 @@ QUOTE_USDT = float(os.getenv("TRADE_QUANTITY_USDT", "15"))
 
 API_KEY = os.getenv("BINANCE_KEY") or os.getenv("BINANCE_TESTNET_KEY")
 API_SECRET = os.getenv("BINANCE_SECRET") or os.getenv("BINANCE_TESTNET_SECRET")
-TESTNET = bool(int(os.getenv("TESTNET", "0")))
-DRY_RUN = bool(int(os.getenv("DRY_RUN", "1")))  # default safe
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
+TESTNET = env_bool("TESTNET", False)
+DRY_RUN = env_bool("DRY_RUN", True) 
 def get_client() -> Client:
     if not API_KEY or not API_SECRET:
         raise RuntimeError("Missing BINANCE credentials in env")
