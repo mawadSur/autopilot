@@ -55,7 +55,7 @@ def ensure_dir(path: str) -> None:
 
 def build_month_path(out_dir: str, symbol: str, interval: str, month_dt: datetime) -> str:
     y_m = month_dt.strftime("%Y-%m")
-    fname = f"{symbol.lower()}_{interval.lower()}_{y_m}.csv"
+    fname = f"eth_{interval.lower()}_{y_m}.csv"
     return os.path.join(out_dir, fname)
 
 
