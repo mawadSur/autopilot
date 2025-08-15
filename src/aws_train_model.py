@@ -1,3 +1,4 @@
+# aws_train_model.py
 from __future__ import annotations
 
 import os
@@ -5,8 +6,7 @@ import argparse
 import json
 import random
 import glob
-from collections import deque
-from typing import Dict, Any, Iterable, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -15,15 +15,208 @@ import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 from joblib import dump
 
-# Single-source feature pipeline
-from utils import build_features, load_meta, DEFAULT_FEATURE_COLS
-
 SM_TRAIN_DIR = os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train")
 SM_MODEL_DIR = os.environ.get("SM_MODEL_DIR", "/opt/ml/model")
 
 
-# ---------------- Model ----------------
-class LSTMModel(nn.Module):
+# ------------------------------
+# Meta loader (honors env MODEL_META_PATH)
+# ------------------------------
+DEFAULT_FEATURE_COLS = [
+    "open", "high", "low", "close", "body", "range", "upper_wick", "lower_wick",
+    "return", "sma_ratio", "ema_20", "macd", "rsi_14", "vol_change", "atr",
+    "price_vs_hourly_trend", "bb_width",
+]
+
+def load_model_meta() -> Dict[str, Any]:
+    candidates = [
+        os.getenv("MODEL_META_PATH"),
+        os.path.join(os.getcwd(), "model_meta.json"),
+        os.path.join(SM_MODEL_DIR, "model_meta.json"),
+    ]
+    for p in [c for c in candidates if c]:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    j = json.load(f)
+                if isinstance(j, dict):
+                    if "features" in j and "feature_cols" not in j:
+                        j["feature_cols"] = j["features"]
+                    if "feature_cols" not in j:
+                        j["feature_cols"] = DEFAULT_FEATURE_COLS
+                    if "window_size" not in j:
+                        j["window_size"] = 150
+                    return j
+            except Exception:
+                pass
+    return {"feature_cols": DEFAULT_FEATURE_COLS, "window_size": 150}
+
+
+# ------------------------------
+# Reproducibility
+# ------------------------------
+def set_seeds(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ------------------------------
+# CSV schema normalization
+# ------------------------------
+def _norm(s: str) -> str:
+    return str(s).strip().lower()
+
+BINANCE_12 = {0: "ts", 1: "open", 2: "high", 3: "low", 4: "close", 5: "volume"}
+
+def _map_ohlcv_columns(df: pd.DataFrame, path: str) -> pd.DataFrame:
+    cols = list(df.columns)
+    norm = [_norm(c) for c in cols]
+    out = df.copy()
+
+    # Typical headered CSV
+    if {"open", "high", "low", "close", "volume"}.issubset(set(norm)):
+        rename = {}
+        for c in cols:
+            n = _norm(c)
+            if n in {"open", "high", "low", "close", "volume"}:
+                rename[c] = n
+            elif n in {"date", "time", "timestamp"}:
+                rename[c] = "ts"
+        out = out.rename(columns=rename)
+    else:
+        # Try Binance klines layout
+        if len(cols) >= 6:
+            rename = {c: BINANCE_12.get(i, f"c{i}") for i, c in enumerate(cols)}
+            out = out.rename(columns=rename)
+        else:
+            raise ValueError(f"Unrecognized CSV schema: {path}")
+
+    if "ts" in out.columns:
+        out["ts"] = pd.to_datetime(out["ts"], unit="ms", errors="coerce").fillna(method="ffill")
+    else:
+        out["ts"] = pd.date_range(start=pd.Timestamp.utcnow(), periods=len(out), freq="min")
+    out = out.dropna(subset=["ts", "open", "high", "low", "close", "volume"]).set_index("ts").sort_index()
+    return out[["open", "high", "low", "close", "volume"]]
+
+def _read_csv_robust(path: str) -> pd.DataFrame:
+    # Try headered
+    try:
+        df = pd.read_csv(path)
+        if all(str(c).replace(".", "", 1).isdigit() for c in df.columns):
+            raise ValueError("numeric headers -> headerless")
+        return _map_ohlcv_columns(df, path)
+    except Exception:
+        pass
+    # Headerless
+    probe = pd.read_csv(path, header=None, nrows=1)
+    n = probe.shape[1]
+    if n >= 6:
+        df = pd.read_csv(path, header=None)
+        df.columns = list(range(n))
+        return _map_ohlcv_columns(df, path)
+    raise ValueError(f"Could not parse CSV: {path}")
+
+
+# ------------------------------
+# Feature engineering
+# ------------------------------
+def _ema(a: pd.Series, span: int) -> pd.Series:
+    return a.ewm(span=span, adjust=False).mean()
+
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    gain = up.rolling(window=period, min_periods=period).mean()
+    loss = down.rolling(window=period, min_periods=period).mean()
+    rs = gain / (loss + 1e-12)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50.0)
+
+def build_features(df: pd.DataFrame, compat_inf_to_zero: bool = False) -> pd.DataFrame:
+    out = df.copy().sort_index()
+
+    out["body"] = out["close"] - out["open"]
+    out["range"] = out["high"] - out["low"]
+    out["upper_wick"] = out["high"] - out[["open", "close"]].max(axis=1)
+    out["lower_wick"] = out[["open", "close"]].min(axis=1) - out["low"]
+    out["return"] = out["close"].pct_change().fillna(0.0)
+
+    sma20 = out["close"].rolling(20, min_periods=1).mean()
+    out["sma_ratio"] = (out["close"] / (sma20 + 1e-12)).astype(np.float32)
+    out["ema_20"] = _ema(out["close"], 20)
+
+    ema12 = _ema(out["close"], 12)
+    ema26 = _ema(out["close"], 26)
+    out["macd"] = (ema12 - ema26)
+
+    out["rsi_14"] = _rsi(out["close"], 14)
+
+    out["vol_change"] = out["volume"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    prev_close = out["close"].shift(1)
+    tr = pd.concat([
+        (out["high"] - out["low"]),
+        (out["high"] - prev_close).abs(),
+        (out["low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    out["atr"] = tr.rolling(14, min_periods=1).mean()
+
+    hourly = out["close"].rolling(60, min_periods=1).mean()
+    out["price_vs_hourly_trend"] = out["close"] / (hourly + 1e-12)
+
+    std20 = out["close"].rolling(20, min_periods=1).std()
+    upper = sma20 + 2 * std20
+    lower = sma20 - 2 * std20
+    out["bb_width"] = (upper - lower) / (sma20 + 1e-12)
+
+    if compat_inf_to_zero:
+        out = out.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    return out
+
+
+# ------------------------------
+# Sequences (emit targets only from current month)
+# ------------------------------
+def build_sequences_from_features(
+    feat_df: pd.DataFrame,
+    feature_cols: List[str],
+    window_size: int,
+    carryover_feat: Optional[np.ndarray],
+    carryover_closes: Optional[np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    feat_mat = feat_df[feature_cols].to_numpy(dtype=np.float32)
+    closes = feat_df["close"].to_numpy(dtype=np.float32)
+
+    carry_len = 0
+    if carryover_feat is not None:
+        carry_len = len(carryover_feat)
+        feat_mat = np.concatenate([carryover_feat, feat_mat], axis=0)
+        closes = np.concatenate([carryover_closes, closes], axis=0)
+
+    start = max(window_size, carry_len)  # ensure targets land in "new" part
+    X, y = [], []
+    for i in range(start, len(feat_mat)):
+        X.append(feat_mat[i - window_size : i])
+        y.append(float(closes[i] > closes[i - 1]))
+
+    X = np.asarray(X, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float32)
+
+    tail_len = min(window_size, len(feat_mat))
+    next_carry_feat = feat_mat[-tail_len:].copy()
+    next_carry_close = closes[-tail_len:].copy()
+    return X, y, next_carry_feat, next_carry_close
+
+
+# ------------------------------
+# Model
+# ------------------------------
+class LSTMClassifier(nn.Module):
     def __init__(
         self,
         input_size: int,
@@ -49,141 +242,14 @@ class LSTMModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, F)
         _, (hn, _) = self.lstm(x)
-        last = hn[-1]  # (B, H)
-        return self.head(last).squeeze(-1)  # logits
+        last = hn[-1]
+        return self.head(last).squeeze(-1)
 
 
-# -------------- Misc utils --------------
-def set_seeds(seed: int = 42) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-# ---------- Robust CSV normalization (works with headerless & Binance 12-col klines) ----------
-def _norm(s: str) -> str:
-    return str(s).strip().lower().replace(" ", "").replace("-", "").replace("_", "")
-
-def _parse_ts(series: pd.Series) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
-    if s.notna().sum() >= max(1, int(0.5 * len(series))):
-        m = s.dropna().median()
-        unit = "us" if m > 1e14 else ("ms" if m > 1e12 else "s")
-        return pd.to_datetime(s.astype("int64"), unit=unit, utc=True, errors="coerce")
-    return pd.to_datetime(series, utc=True, errors="coerce")
-
-def _map_ohlcv_columns(df: pd.DataFrame, path: str) -> pd.DataFrame:
-    norm_to_orig = {_norm(c): c for c in df.columns}
-    def find(aliases):  # original name for first alias that exists
-        for a in aliases:
-            if a in norm_to_orig:
-                return norm_to_orig[a]
-        return None
-
-    ts_col   = find(["timestamp","time","date","datetime","opentime","open_time","t","starttime"])
-    open_col = find(["open","o","openprice"])
-    high_col = find(["high","h","highprice"])
-    low_col  = find(["low","l","lowprice"])
-    close_col= find(["close","c","closeprice","adjclose"])
-    vol_col  = find(["volume","vol","baseassetvolume","basevolume","takerbasevol","takerbasevolume","quoteassetvolume"])
-
-    if not all([ts_col, open_col, high_col, low_col, close_col, vol_col]):
-        raise KeyError(f"Missing OHLCV columns in {path}. Headers={list(df.columns)[:10]}")
-
-    out = pd.DataFrame({
-        "ts": _parse_ts(df[ts_col]),
-        "open":   pd.to_numeric(df[open_col], errors="coerce"),
-        "high":   pd.to_numeric(df[high_col], errors="coerce"),
-        "low":    pd.to_numeric(df[low_col], errors="coerce"),
-        "close":  pd.to_numeric(df[close_col], errors="coerce"),
-        "volume": pd.to_numeric(df[vol_col], errors="coerce"),
-    })
-    out = out.dropna(subset=["ts","open","high","low","close","volume"]).set_index("ts").sort_index()
-    return out[["open","high","low","close","volume"]]
-
-def _read_csv_robust(path: str) -> pd.DataFrame:
-    # Try normal headered CSV
-    try:
-        df = pd.read_csv(path)
-        if all(str(c).replace(".", "", 1).isdigit() for c in df.columns):
-            raise ValueError("numeric headers -> headerless")
-        return _map_ohlcv_columns(df, path)
-    except Exception:
-        pass
-    # Headerless fallbacks
-    probe = pd.read_csv(path, header=None, nrows=1)
-    n = probe.shape[1]
-    if n == 6:
-        names = ["timestamp","open","high","low","close","volume"]
-    elif n >= 12:
-        names = [
-            "timestamp","open","high","low","close","volume",
-            "close_time","qav","num_trades","taker_base_vol","taker_quote_vol","ignore",
-        ] + [f"extra_{i}" for i in range(n - 12)]
-    else:
-        names = [f"col{i}" for i in range(n)]
-    df2 = pd.read_csv(path, header=None, names=names)
-    return _map_ohlcv_columns(df2, path)
-
-
-# ---------- File iterator (bounded memory) ----------
-def iter_month_frames(train_dir: str) -> Iterable[pd.DataFrame]:
-    """Yield normalized OHLCV frames, one file (month) at a time."""
-    paths = sorted(glob.glob(os.path.join(train_dir, "**/*.csv"), recursive=True))
-    if not paths:
-        raise RuntimeError(f"No CSV files found under {train_dir}")
-    for p in paths:
-        try:
-            df = _read_csv_robust(p)
-            yield df
-        except Exception as e:
-            print(f"[warn] Skipping {p}: {e}")
-
-
-# ---------- Sequence builder (streaming, with window carryover) ----------
-def build_sequences_from_features(
-    feat_df: pd.DataFrame,
-    feature_cols: List[str],
-    window_size: int,
-    carryover_feat: np.ndarray | None,
-    carryover_closes: np.ndarray | None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Build supervised sequences for ONE month of features, using carryovers from previous month
-    so windows remain continuous across month boundaries.
-
-    Returns: (X, y, next_carry_feat_tail, next_carry_close_tail)
-    """
-    feat_mat = feat_df[feature_cols].to_numpy(dtype=np.float32)
-    closes = feat_df["close"].to_numpy(dtype=np.float32)
-
-    if carryover_feat is not None:
-        feat_mat = np.concatenate([carryover_feat, feat_mat], axis=0)
-        closes = np.concatenate([carryover_closes, closes], axis=0)
-
-    Xs, ys = [], []
-    # Label definition: y_t = 1 if close_{t+1} > close_{t}, else 0
-    # We emit (window ending at t) paired with label for t, so need t+1 to exist
-    for end in range(window_size - 1, len(feat_mat) - 1):
-        start = end - (window_size - 1)
-        Xs.append(feat_mat[start : end + 1, :])
-        ys.append(1.0 if closes[end + 1] > closes[end] else 0.0)
-
-    X = np.stack(Xs, axis=0) if Xs else np.zeros((0, window_size, len(feature_cols)), np.float32)
-    y = np.array(ys, dtype=np.float32)
-
-    # Prepare tails for next month
-    tail_feat = feat_mat[-(window_size - 1):] if len(feat_mat) >= window_size - 1 else feat_mat.copy()
-    tail_close = closes[-(window_size - 1):] if len(closes) >= window_size - 1 else closes.copy()
-    return X, y, tail_feat, tail_close
-
-
-# -------------- Train (two-pass, streaming by month) --------------
+# ------------------------------
+# Training
+# ------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--hidden_size", type=int, default=64)
@@ -193,60 +259,79 @@ def main() -> None:
     ap.add_argument("--window_size", type=int, default=150)
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--val_months", type=int, default=1, help="Use the last N months for validation.")
+    ap.add_argument("--val_months", type=int, default=1)
     ap.add_argument("--batch_size", type=int, default=256)
-    ap.add_argument("--accumulate", type=int, default=1, help="Gradient accumulation steps.")
+    ap.add_argument("--accumulate", type=int, default=1)
     args, _ = ap.parse_known_args()
 
     set_seeds(42)
 
-    # ---- Metadata / feature schema ----
-    meta_path = os.path.join(SM_MODEL_DIR, "model_meta.json")
-    prev_meta = load_meta(meta_path) if os.path.exists(meta_path) else load_meta()
-    feature_cols = prev_meta.get("feature_cols", DEFAULT_FEATURE_COLS)
-    window_size = int(args.window_size)
+    meta_in = load_model_meta()
+    feature_cols = list(meta_in.get("feature_cols", DEFAULT_FEATURE_COLS))
+    window_size = int(meta_in.get("window_size", args.window_size or 150))
 
-    # ---- Enumerate files once to split train/val by month ----
+    # Files & split
     all_paths = sorted(glob.glob(os.path.join(SM_TRAIN_DIR, "**/*.csv"), recursive=True))
     if not all_paths:
         raise RuntimeError(f"No CSV files found under {SM_TRAIN_DIR}")
-    split = max(1, int(args.val_months))
-    train_paths = all_paths[:-split] if len(all_paths) > split else all_paths[:-1]
-    val_paths = all_paths[-split:] if len(all_paths) > split else all_paths[-1:]
 
-    print(f"[files] train months={len(train_paths)}  val months={len(val_paths)}")
+    val_months = max(0, int(args.val_months))
+    if val_months >= len(all_paths):
+        val_months = max(0, len(all_paths) - 1)
 
-    # ---- PASS 1: Fit scaler incrementally on TRAIN months only (row-wise features, not sequences) ----
+    train_paths = all_paths[:-val_months] if val_months > 0 else all_paths
+    val_paths = all_paths[-val_months:] if val_months > 0 else []
+
+    if len(train_paths) == 0:
+        raise RuntimeError(
+            "No training files after splitting. Reduce --val_months or add more CSVs."
+        )
+
+    print(f"[files] train={len(train_paths)} val={len(val_paths)}")
+
+    # -------- PASS 1: fit scaler on TRAIN months, skip empties --------
     scaler = StandardScaler()
-    rows_count = 0
+    fitted_rows = 0
     carry_raw = None
+
     for p in train_paths:
         df = _read_csv_robust(p)
-        # Keep indicator continuity with a modest warmup tail of raw bars
         if carry_raw is not None:
             df = pd.concat([carry_raw, df]).sort_index()
-        feat = build_features(df, compat_inf_to_zero=True)
-        # Keep only the rows that belong to this file (avoid refitting on previous month)
-        if carry_raw is not None:
-            feat = feat.loc[df.index[len(carry_raw):]]
-        arr = feat[feature_cols].to_numpy(dtype=np.float32)
-        if len(arr):
-            scaler.partial_fit(arr)
-            rows_count += len(arr)
-        # prepare small raw tail for next month (enough for indicators)
-        carry_raw = df.tail(2000)
-    print(f"[scaler] fitted on ~{rows_count:,} feature rows")
 
-    # ---- Build model ----
-    model = LSTMModel(
+        feat_all = build_features(df, compat_inf_to_zero=True)
+        offset = len(carry_raw) if carry_raw is not None else 0
+        feat_new = feat_all.iloc[offset:]  # positional slice (key fix)
+
+        if feat_new.empty:
+            print(f"[warn] no new rows in {p} after stitching; skipping")
+        else:
+            # column presence check
+            missing = [c for c in feature_cols if c not in feat_new.columns]
+            if missing:
+                raise RuntimeError(f"Missing features {missing} in file {p}")
+            scaler.partial_fit(feat_new[feature_cols].to_numpy(np.float32))
+            fitted_rows += len(feat_new)
+
+        carry_raw = df.tail(2000)
+
+    if not hasattr(scaler, "n_features_in_") or fitted_rows == 0:
+        raise RuntimeError(
+            "Scaler did not fit: no usable training rows. "
+            "Ensure at least one non-empty TRAIN month and a valid --val_months."
+        )
+    print(f"[scaler] fitted on ~{fitted_rows:,} rows")
+
+    # -------- Train / Validate --------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = LSTMClassifier(
         input_size=len(feature_cols),
         hidden_size=int(args.hidden_size),
         num_layers=int(args.num_layers),
         dropout=float(args.dropout),
         bidirectional=bool(args.bidirectional),
-    )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    ).to(device)
+
     opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
     loss_fn = nn.BCEWithLogitsLoss()
 
@@ -254,23 +339,23 @@ def main() -> None:
         if len(X) == 0:
             return 0.0
         model.train()
-        total_loss, steps = 0.0, 0
-        # shuffle per month chunk
         idx = np.arange(len(X))
         np.random.shuffle(idx)
-        X = X[idx]; y = y[idx]
+        X, y = X[idx], y[idx]
+
+        total_loss, steps = 0.0, 0
+        opt.zero_grad(set_to_none=True)
         for i in range(0, len(X), batch_size):
             xb = torch.tensor(X[i:i+batch_size], dtype=torch.float32, device=device)
             yb = torch.tensor(y[i:i+batch_size], dtype=torch.float32, device=device)
             logits = model(xb)
-            loss = loss_fn(logits, yb) / accumulate
+            loss = loss_fn(logits, yb) / max(1, accumulate)
             loss.backward()
-            if (steps + 1) % accumulate == 0:
-                opt.step(); opt.zero_grad(set_to_none=True)
-            total_loss += loss.item() * accumulate
             steps += 1
-        # flush leftover grads
-        if steps % accumulate != 0:
+            if steps % accumulate == 0:
+                opt.step(); opt.zero_grad(set_to_none=True)
+            total_loss += loss.item() * max(1, accumulate)
+        if steps % max(1, accumulate) != 0:
             opt.step(); opt.zero_grad(set_to_none=True)
         return total_loss / max(1, steps)
 
@@ -278,85 +363,94 @@ def main() -> None:
         if len(X) == 0:
             return 0.0
         model.eval()
-        tot, steps = 0.0, 0
+        total, steps = 0.0, 0
         with torch.no_grad():
             for i in range(0, len(X), batch_size):
                 xb = torch.tensor(X[i:i+batch_size], dtype=torch.float32, device=device)
                 yb = torch.tensor(y[i:i+batch_size], dtype=torch.float32, device=device)
                 logits = model(xb)
-                loss = loss_fn(logits, yb).item()
-                tot += loss; steps += 1
-        return tot / max(1, steps)
+                total += loss_fn(logits, yb).item()
+                steps += 1
+        return total / max(1, steps)
 
-    # ---- PASS 2: Train epoch-by-epoch, month-by-month (bounded memory) ----
-    best = float("inf")
     os.makedirs(SM_MODEL_DIR, exist_ok=True)
+    best = float("inf")
 
     for epoch in range(int(args.epochs)):
-        # --- Train over train months ---
+        print(f"\n=== epoch {epoch+1}/{int(args.epochs)} ===")
+
+        # ---- Train over months
         carry_feat = None
         carry_close = None
-        epoch_train_loss, month_ct = 0.0, 0
+        month_losses: List[float] = []
+
         for p in train_paths:
             df = _read_csv_robust(p)
-            # maintain indicator continuity with small raw tail
-            if month_ct > 0:
-                df = pd.concat([carry_raw, df]).sort_index()
-            feat = build_features(df, compat_inf_to_zero=True)
-            # only new rows for this month
-            if month_ct > 0:
-                feat = feat.loc[df.index[len(carry_raw):]]
+            feat_all = build_features(df, compat_inf_to_zero=True)
 
-            # scale row-wise features then form sequences (with carryover windows)
-            feat_scaled = feat.copy()
-            feat_scaled[feature_cols] = scaler.transform(feat_scaled[feature_cols].to_numpy(np.float32))
+            # scale full month (continuity handled in sequence builder)
+            miss = [c for c in feature_cols if c not in feat_all.columns]
+            if miss:
+                raise RuntimeError(f"Missing features {miss} in file {p}")
+
+            feat_scaled = feat_all.copy()
+            feat_scaled[feature_cols] = scaler.transform(
+                feat_scaled[feature_cols].to_numpy(np.float32)
+            )
 
             X, y, carry_feat, carry_close = build_sequences_from_features(
                 feat_scaled, feature_cols, window_size, carry_feat, carry_close
             )
+            if len(X) == 0:
+                print(f"[warn] month {p} produced 0 training sequences; skipping")
+                continue
 
-            # prepare next raw carry for indicators continuity
-            carry_raw = df.tail(2000)
-
-            if len(X):
-                loss = train_batches(X, y, batch_size=int(args.batch_size), accumulate=int(args.accumulate))
-                epoch_train_loss += loss
-                month_ct += 1
-
-        epoch_train_loss = epoch_train_loss / max(1, month_ct)
-
-        # --- Evaluate on validation months without storing everything at once ---
-        val_losses: List[float] = []
-        carry_feat_v = None; carry_close_v = None; carry_raw_v = None
-        for p in val_paths:
-            df = _read_csv_robust(p)
-            if carry_raw_v is not None:
-                df = pd.concat([carry_raw_v, df]).sort_index()
-            feat = build_features(df, compat_inf_to_zero=True)
-            if carry_raw_v is not None:
-                feat = feat.loc[df.index[len(carry_raw_v):]]
-            feat_scaled = feat.copy()
-            feat_scaled[feature_cols] = scaler.transform(feat_scaled[feature_cols].to_numpy(np.float32))
-            Xv, yv, carry_feat_v, carry_close_v = build_sequences_from_features(
-                feat_scaled, feature_cols, window_size, carry_feat_v, carry_close_v
+            loss = train_batches(
+                X, y, batch_size=int(args.batch_size), accumulate=int(args.accumulate)
             )
-            carry_raw_v = df.tail(2000)
-            if len(Xv):
+            month_losses.append(loss)
+
+        if month_losses:
+            print(f"[train] mean_loss={float(np.mean(month_losses)):.6f}")
+
+        # ---- Validate
+        val_losses: List[float] = []
+        if val_paths:
+            carry_feat_v = None
+            carry_close_v = None
+            for p in val_paths:
+                df = _read_csv_robust(p)
+                feat_all = build_features(df, compat_inf_to_zero=True)
+
+                miss = [c for c in feature_cols if c not in feat_all.columns]
+                if miss:
+                    raise RuntimeError(f"Missing features {miss} in VAL file {p}")
+
+                feat_scaled = feat_all.copy()
+                feat_scaled[feature_cols] = scaler.transform(
+                    feat_scaled[feature_cols].to_numpy(np.float32)
+                )
+
+                Xv, yv, carry_feat_v, carry_close_v = build_sequences_from_features(
+                    feat_scaled, feature_cols, window_size, carry_feat_v, carry_close_v
+                )
+                if len(Xv) == 0:
+                    print(f"[warn] month {p} produced 0 validation sequences; skipping")
+                    continue
+
                 val_losses.append(eval_batches(Xv, yv, batch_size=int(args.batch_size)))
 
         v_loss = float(np.mean(val_losses)) if val_losses else 0.0
+        print(f"val_loss={v_loss:.6f}", flush=True)  # metric for SageMaker/Hyperparam Tuning
 
-        # Emit the metric the tuner looks for
-        print(f"val_loss={v_loss:.6f}", flush=True)
-
-        if v_loss < best:
+        if val_losses and v_loss < best:
             best = v_loss
             torch.save(model.state_dict(), os.path.join(SM_MODEL_DIR, "model.pt"))
 
-    # ---- Save scaler + meta ----
+    # ---- Save artifacts ----
     dump(scaler, os.path.join(SM_MODEL_DIR, "scaler.joblib"))
-    meta: Dict[str, Any] = {
-        **prev_meta,
+    meta_out: Dict[str, Any] = {
+        **meta_in,
         "feature_cols": feature_cols,
         "window_size": window_size,
         "input_size": len(feature_cols),
@@ -365,12 +459,10 @@ def main() -> None:
         "dropout": float(args.dropout),
         "bidirectional": bool(args.bidirectional),
         "scaler_type": "standard",
-        "buy_threshold": float(prev_meta.get("buy_threshold", 0.5)),
-        "sell_threshold": float(prev_meta.get("sell_threshold", 0.5)),
         "label_def": "next_bar_up",
     }
     with open(os.path.join(SM_MODEL_DIR, "model_meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+        json.dump(meta_out, f, indent=2)
 
 
 if __name__ == "__main__":
