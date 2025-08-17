@@ -1,469 +1,632 @@
-# aws_train_model.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+aws_train_model.py
+
+Chunked training for LSTM classifier on many CSVs under a directory (e.g., eth_1m_data/).
+- Streams data in chunks with a (T-1) overlap buffer so sequences don't break at boundaries
+- Two-pass StandardScaler fit for best accuracy (fit on train portion only)
+- Validation split:
+    * default: last --val-frac of sequences
+    * legacy flag: --val_months N  -> last N CSV files (by filename) comprise the validation set
+- Saves: model.pt, scaler.joblib (if enabled), model_meta.json
+- Works locally and on SageMaker (uses SM_MODEL_DIR if available)
+- Reads CHUNK_SIZE from .env (default 200000)
+
+Backward-compat flags accepted (mapped internally):
+  --batch_size   -> --batch-size
+  --hidden_size  -> --hidden-size
+  --window_size  -> --seq-len
+  --val_months   -> activates month-based validation split
+  --accumulate   -> gradient accumulation steps
+
+Usage (defaults assume ./eth_1m_data exists and label column is 'label'):
+  python aws_train_model.py --data eth_1m_data --seq-len 60 --epochs 10
+"""
+
 from __future__ import annotations
 
-import os
 import argparse
-import json
-import random
 import glob
-from typing import Dict, Any, List, Tuple, Optional
+import json
+import os
+import random
+from dataclasses import asdict
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.preprocessing import StandardScaler
-from joblib import dump
+from torch.utils.data import IterableDataset, DataLoader
 
-SM_TRAIN_DIR = os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train")
-SM_MODEL_DIR = os.environ.get("SM_MODEL_DIR", "/opt/ml/model")
+# env (.env) support
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
 
+# Prefer joblib for sklearn persistence
+try:
+    import joblib
+except Exception:
+    joblib = None
 
-# ------------------------------
-# Meta loader (honors env MODEL_META_PATH)
-# ------------------------------
-DEFAULT_FEATURE_COLS = [
-    "open", "high", "low", "close", "body", "range", "upper_wick", "lower_wick",
-    "return", "sma_ratio", "ema_20", "macd", "rsi_14", "vol_change", "atr",
-    "price_vs_hourly_trend", "bb_width",
-]
+# Optional scaler (enabled via --scale-features)
+try:
+    from sklearn.preprocessing import StandardScaler
+except Exception:
+    StandardScaler = None  # guard if sklearn isn't installed
 
-def load_model_meta() -> Dict[str, Any]:
-    candidates = [
-        os.getenv("MODEL_META_PATH"),
-        os.path.join(os.getcwd(), "model_meta.json"),
-        os.path.join(SM_MODEL_DIR, "model_meta.json"),
-    ]
-    for p in [c for c in candidates if c]:
-        if os.path.exists(p):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    j = json.load(f)
-                if isinstance(j, dict):
-                    if "features" in j and "feature_cols" not in j:
-                        j["feature_cols"] = j["features"]
-                    if "feature_cols" not in j:
-                        j["feature_cols"] = DEFAULT_FEATURE_COLS
-                    if "window_size" not in j:
-                        j["window_size"] = 150
-                    return j
-            except Exception:
-                pass
-    return {"feature_cols": DEFAULT_FEATURE_COLS, "window_size": 150}
+# ---- Unified model and metadata helpers (models.py in project root) ----
+from models import (
+    LSTMClassifier,
+    ModelMeta,
+)
 
+# -----------------------------
+# Utils & Repro
+# -----------------------------
 
-# ------------------------------
-# Reproducibility
-# ------------------------------
-def set_seeds(seed: int = 42) -> None:
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
+def list_csvs_sorted(path: str) -> List[str]:
+    if os.path.isdir(path):
+        files = sorted(glob.glob(os.path.join(path, "*.csv")))
+        if not files:
+            raise FileNotFoundError(f"No CSV files found in directory: {path}")
+        return files
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    if os.path.splitext(path)[1].lower() != ".csv":
+        raise ValueError(f"Only .csv supported in chunked mode; got {path}")
+    return [path]
 
-# ------------------------------
-# CSV schema normalization
-# ------------------------------
-def _norm(s: str) -> str:
-    return str(s).strip().lower()
+def infer_feature_cols_from_sample(
+    sample_df: pd.DataFrame,
+    label_col: Optional[str],
+    time_col: Optional[str],
+    price_col: Optional[str],
+    explicit_feature_cols: Optional[List[str]],
+) -> List[str]:
+    if explicit_feature_cols:
+        return explicit_feature_cols
+    drop = {c for c in [label_col, time_col, price_col] if c is not None}
+    numeric = sample_df.select_dtypes(include=[np.number]).columns.tolist()
+    feats = [c for c in numeric if c not in drop]
+    if not feats:
+        raise ValueError("Could not infer numeric feature columns from the sample.")
+    return feats
 
-BINANCE_12 = {0: "ts", 1: "open", 2: "high", 3: "low", 4: "close", 5: "volume"}
+def build_windows_from_flat(features: np.ndarray, seq_len: int) -> np.ndarray:
+    """
+    features: [N, F] -> windows: [N - seq_len + 1, seq_len, F]
+    """
+    N, F = features.shape
+    if N < seq_len:
+        return np.empty((0, seq_len, F), dtype=np.float32)
+    stride0, stride1 = features.strides
+    shape = (N - seq_len + 1, seq_len, F)
+    strides = (stride0, stride0, stride1)
+    win = np.lib.stride_tricks.as_strided(features, shape=shape, strides=strides).copy()
+    return win
 
-def _map_ohlcv_columns(df: pd.DataFrame, path: str) -> pd.DataFrame:
-    cols = list(df.columns)
-    norm = [_norm(c) for c in cols]
-    out = df.copy()
+# -----------------------------
+# Chunked iterators with overlap buffer (T-1)
+# -----------------------------
 
-    # Typical headered CSV
-    if {"open", "high", "low", "close", "volume"}.issubset(set(norm)):
-        rename = {}
-        for c in cols:
-            n = _norm(c)
-            if n in {"open", "high", "low", "close", "volume"}:
-                rename[c] = n
-            elif n in {"date", "time", "timestamp"}:
-                rename[c] = "ts"
-        out = out.rename(columns=rename)
-    else:
-        # Try Binance klines layout
-        if len(cols) >= 6:
-            rename = {c: BINANCE_12.get(i, f"c{i}") for i, c in enumerate(cols)}
-            out = out.rename(columns=rename)
-        else:
-            raise ValueError(f"Unrecognized CSV schema: {path}")
-
-    if "ts" in out.columns:
-        out["ts"] = pd.to_datetime(out["ts"], unit="ms", errors="coerce").fillna(method="ffill")
-    else:
-        out["ts"] = pd.date_range(start=pd.Timestamp.utcnow(), periods=len(out), freq="min")
-    out = out.dropna(subset=["ts", "open", "high", "low", "close", "volume"]).set_index("ts").sort_index()
-    return out[["open", "high", "low", "close", "volume"]]
-
-def _read_csv_robust(path: str) -> pd.DataFrame:
-    # Try headered
-    try:
-        df = pd.read_csv(path)
-        if all(str(c).replace(".", "", 1).isdigit() for c in df.columns):
-            raise ValueError("numeric headers -> headerless")
-        return _map_ohlcv_columns(df, path)
-    except Exception:
-        pass
-    # Headerless
-    probe = pd.read_csv(path, header=None, nrows=1)
-    n = probe.shape[1]
-    if n >= 6:
-        df = pd.read_csv(path, header=None)
-        df.columns = list(range(n))
-        return _map_ohlcv_columns(df, path)
-    raise ValueError(f"Could not parse CSV: {path}")
-
-
-# ------------------------------
-# Feature engineering
-# ------------------------------
-def _ema(a: pd.Series, span: int) -> pd.Series:
-    return a.ewm(span=span, adjust=False).mean()
-
-def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    gain = up.rolling(window=period, min_periods=period).mean()
-    loss = down.rolling(window=period, min_periods=period).mean()
-    rs = gain / (loss + 1e-12)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50.0)
-
-def build_features(df: pd.DataFrame, compat_inf_to_zero: bool = False) -> pd.DataFrame:
-    out = df.copy().sort_index()
-
-    out["body"] = out["close"] - out["open"]
-    out["range"] = out["high"] - out["low"]
-    out["upper_wick"] = out["high"] - out[["open", "close"]].max(axis=1)
-    out["lower_wick"] = out[["open", "close"]].min(axis=1) - out["low"]
-    out["return"] = out["close"].pct_change().fillna(0.0)
-
-    sma20 = out["close"].rolling(20, min_periods=1).mean()
-    out["sma_ratio"] = (out["close"] / (sma20 + 1e-12)).astype(np.float32)
-    out["ema_20"] = _ema(out["close"], 20)
-
-    ema12 = _ema(out["close"], 12)
-    ema26 = _ema(out["close"], 26)
-    out["macd"] = (ema12 - ema26)
-
-    out["rsi_14"] = _rsi(out["close"], 14)
-
-    out["vol_change"] = out["volume"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
-
-    prev_close = out["close"].shift(1)
-    tr = pd.concat([
-        (out["high"] - out["low"]),
-        (out["high"] - prev_close).abs(),
-        (out["low"] - prev_close).abs()
-    ], axis=1).max(axis=1)
-    out["atr"] = tr.rolling(14, min_periods=1).mean()
-
-    hourly = out["close"].rolling(60, min_periods=1).mean()
-    out["price_vs_hourly_trend"] = out["close"] / (hourly + 1e-12)
-
-    std20 = out["close"].rolling(20, min_periods=1).std()
-    upper = sma20 + 2 * std20
-    lower = sma20 - 2 * std20
-    out["bb_width"] = (upper - lower) / (sma20 + 1e-12)
-
-    if compat_inf_to_zero:
-        out = out.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-    return out
-
-
-# ------------------------------
-# Sequences (emit targets only from current month)
-# ------------------------------
-def build_sequences_from_features(
-    feat_df: pd.DataFrame,
+def iter_chunked_windows_and_labels(
+    files: List[str],
     feature_cols: List[str],
-    window_size: int,
-    carryover_feat: Optional[np.ndarray],
-    carryover_closes: Optional[np.ndarray],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    feat_mat = feat_df[feature_cols].to_numpy(dtype=np.float32)
-    closes = feat_df["close"].to_numpy(dtype=np.float32)
+    label_col: str,
+    seq_len: int,
+    chunksize: int,
+) -> Generator[Tuple[np.ndarray, np.ndarray], None, None]:
+    """
+    Yields (X_chunk, y_chunk) where:
+      X_chunk: [B, T, F], y_chunk: [B]
+    Maintains a (T-1)-row buffer across chunks & files so windows are continuous.
+    """
+    buffer_df = None
+    for fpath in files:
+        for chunk in pd.read_csv(fpath, chunksize=chunksize):
+            dfc = chunk if buffer_df is None else pd.concat([buffer_df, chunk], ignore_index=True)
+            L = len(dfc)
+            if L < seq_len:
+                buffer_df = dfc
+                continue
 
-    carry_len = 0
-    if carryover_feat is not None:
-        carry_len = len(carryover_feat)
-        feat_mat = np.concatenate([carryover_feat, feat_mat], axis=0)
-        closes = np.concatenate([carryover_closes, closes], axis=0)
+            feats = dfc[feature_cols].to_numpy(dtype=np.float32)
+            X_all = build_windows_from_flat(feats, seq_len)            # [W, T, F], W = L - seq_len + 1
+            y_all = dfc[label_col].to_numpy()                          # [L]
+            y_all = y_all[seq_len - 1:]                                # [W], aligned to window end
 
-    start = max(window_size, carry_len)  # ensure targets land in "new" part
-    X, y = [], []
-    for i in range(start, len(feat_mat)):
-        X.append(feat_mat[i - window_size : i])
-        y.append(float(closes[i] > closes[i - 1]))
+            # Defer last (seq_len - 1) windows to next loop to preserve continuity
+            emit = max(0, X_all.shape[0] - (seq_len - 1))
+            if emit > 0:
+                yield X_all[:emit], y_all[:emit]
 
-    X = np.asarray(X, dtype=np.float32)
-    y = np.asarray(y, dtype=np.float32)
+            buffer_df = dfc.iloc[-(seq_len - 1):].copy()
 
-    tail_len = min(window_size, len(feat_mat))
-    next_carry_feat = feat_mat[-tail_len:].copy()
-    next_carry_close = closes[-tail_len:].copy()
-    return X, y, next_carry_feat, next_carry_close
+def count_total_sequences(
+    files: List[str],
+    feature_cols: List[str],
+    label_col: str,
+    seq_len: int,
+    chunksize: int,
+) -> int:
+    total = 0
+    buffer_df = None
+    for fpath in files:
+        for chunk in pd.read_csv(fpath, chunksize=chunksize):
+            dfc = chunk if buffer_df is None else pd.concat([buffer_df, chunk], ignore_index=True)
+            L = len(dfc)
+            if L < seq_len:
+                buffer_df = dfc
+                continue
+            W = L - seq_len + 1
+            emit = max(0, W - (seq_len - 1))
+            total += emit
+            buffer_df = dfc.iloc[-(seq_len - 1):].copy()
+    return total
 
+# -----------------------------
+# IterableDatasets for streaming train / val (index-based split)
+# -----------------------------
 
-# ------------------------------
-# Model
-# ------------------------------
-class LSTMClassifier(nn.Module):
+class SeqIterableDataset(IterableDataset):
+    """
+    Streams sequences directly from disk, yielding mini-batches.
+    Subsets:
+      - 'train': indices [0, n_train)
+      - 'val'  : indices [n_train, n_total)
+    """
     def __init__(
         self,
-        input_size: int,
-        hidden_size: int = 64,
-        num_layers: int = 2,
-        dropout: float = 0.1,
-        bidirectional: bool = False,
-    ) -> None:
+        files: List[str],
+        feature_cols: List[str],
+        label_col: str,
+        seq_len: int,
+        chunksize: int,
+        subset: str,
+        n_train: int,
+        n_total: int,
+        scaler: Optional[StandardScaler] = None,
+        batch_size: int = 128,
+    ):
         super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=bidirectional,
+        assert subset in ("train", "val")
+        self.files = files
+        self.feature_cols = feature_cols
+        self.label_col = label_col
+        self.seq_len = seq_len
+        self.chunksize = chunksize
+        self.subset = subset
+        self.n_train = n_train
+        self.n_total = n_total
+        self.scaler = scaler
+        self.batch_size = int(batch_size)
+
+    def __iter__(self):
+        start_idx = 0
+        target_lo = 0 if self.subset == "train" else self.n_train
+        target_hi = self.n_train if self.subset == "train" else self.n_total
+
+        buf_X, buf_y = [], []
+
+        for X_chunk, y_chunk in iter_chunked_windows_and_labels(
+            self.files, self.feature_cols, self.label_col, self.seq_len, self.chunksize
+        ):
+            B = len(X_chunk)
+            if B == 0:
+                continue
+
+            end_idx = start_idx + B
+            take_lo = max(target_lo, start_idx)
+            take_hi = min(target_hi, end_idx)
+            if take_hi <= take_lo:
+                start_idx = end_idx
+                continue
+
+            s = take_lo - start_idx
+            e = take_hi - start_idx
+            Xb = X_chunk[s:e]
+            yb = y_chunk[s:e]
+
+            if self.scaler is not None:
+                k, t, f = Xb.shape
+                Xb = self.scaler.transform(Xb.reshape(k * t, f)).reshape(k, t, f)
+
+            buf_X.append(Xb)
+            buf_y.append(yb)
+
+            # Flush in mini-batches
+            while True:
+                total_k = sum(x.shape[0] for x in buf_X)
+                if total_k < self.batch_size:
+                    break
+                need = self.batch_size
+                out_X, out_y = [], []
+                while need > 0 and buf_X:
+                    x0, y0 = buf_X[0], buf_y[0]
+                    if x0.shape[0] <= need:
+                        out_X.append(x0); out_y.append(y0)
+                        buf_X.pop(0); buf_y.pop(0)
+                        need -= x0.shape[0]
+                    else:
+                        out_X.append(x0[:need]); out_y.append(y0[:need])
+                        buf_X[0] = x0[need:]; buf_y[0] = y0[need:]
+                        need = 0
+                X_out = np.concatenate(out_X, axis=0)
+                y_out = np.concatenate(out_y, axis=0)
+                yield torch.from_numpy(X_out.astype(np.float32)), torch.from_numpy(y_out.astype(np.int64))
+
+            start_idx = end_idx
+
+        if buf_X:
+            X_out = np.concatenate(buf_X, axis=0)
+            y_out = np.concatenate(buf_y, axis=0)
+            yield torch.from_numpy(X_out.astype(np.float32)), torch.from_numpy(y_out.astype(np.int64))
+
+# -----------------------------
+# Train / Eval Epochs (Iterable) with accumulation
+# -----------------------------
+
+def train_epoch_iter(model: nn.Module,
+                     loader: DataLoader,
+                     device: str,
+                     criterion: nn.Module,
+                     optimizer: torch.optim.Optimizer,
+                     accumulate: int = 1) -> Tuple[float, float, int]:
+    model.train()
+    total_loss = 0.0
+    total_correct = 0
+    n = 0
+    step = 0
+    optimizer.zero_grad(set_to_none=True)
+    for xb, yb in loader:
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+
+        logits = model(xb)
+        loss = criterion(logits, yb) / max(1, accumulate)
+        loss.backward()
+
+        step += 1
+        if step % max(1, accumulate) == 0:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        bs = xb.shape[0]
+        total_loss += float(loss.item()) * bs * max(1, accumulate)  # undo the /accumulate for reporting
+        total_correct += int((logits.argmax(dim=-1) == yb).sum().item())
+        n += bs
+
+    # Flush leftover grads
+    if step % max(1, accumulate) != 0:
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    avg_loss = total_loss / max(1, n)
+    acc = total_correct / max(1, n)
+    return avg_loss, acc, n
+
+def eval_epoch_iter(model: nn.Module,
+                    loader: DataLoader,
+                    device: str,
+                    criterion: nn.Module) -> Tuple[float, float, int]:
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    n = 0
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            bs = xb.shape[0]
+            total_loss += float(loss.item()) * bs
+            total_correct += int((logits.argmax(dim=-1) == yb).sum().item())
+            n += bs
+    return total_loss / max(1, n), total_correct / max(1, n), n
+
+# -----------------------------
+# Argparse (new + legacy aliases)
+# -----------------------------
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Chunked LSTM training (directory or single CSV).")
+    # IO
+    p.add_argument("--data", type=str, default="eth_1m_data",
+                   help="Path to a CSV file or a directory of CSVs (default: eth_1m_data)")
+    p.add_argument("--output-dir", type=str, default=None,
+                   help="Where to save artifacts. Defaults to SM_MODEL_DIR if set, else ./model")
+    # Columns & sequences
+    p.add_argument("--label-col", type=str, default="label",
+                   help="Ground-truth label column (int classes). Default: 'label'")
+    p.add_argument("--price-col", type=str, default="close", help="Optional price column (unused for loss).")
+    p.add_argument("--time-col", type=str, default=None, help="Optional timestamp column (not required).")
+    p.add_argument("--feature-cols", type=str, nargs="*", default=None,
+                   help="Explicit list of feature columns; if omitted, auto-detect numeric minus label/price/time from a sample.")
+    p.add_argument("--seq-len", type=int, default=60, help="Sequence length for windowing.")
+    # Legacy alias for --seq-len
+    p.add_argument("--window_size", dest="seq_len", type=int, help=argparse.SUPPRESS)
+
+    # Scaling
+    p.add_argument("--scale-features", type=int, default=1, help="1 to fit/apply StandardScaler; 0 to disable.")
+    # Model hyperparams (+ legacy aliases)
+    p.add_argument("--hidden-size", type=int, default=128)
+    p.add_argument("--hidden_size", dest="hidden-size", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--num-layers", type=int, default=2)
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--bidirectional", type=int, default=0)
+    p.add_argument("--num-classes", type=int, default=3)
+    # Training hyperparams (+ legacy aliases)
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--batch_size", dest="batch-size", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--learning-rate", type=float, default=1e-3)
+    p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--val-frac", type=float, default=0.2, help="Fraction of sequences at the END used for validation.")
+    p.add_argument("--val_months", type=int, default=None,
+                   help="Legacy: use last N CSV files as validation (overrides --val-frac when set).")
+    p.add_argument("--shuffle-train", type=int, default=0, help="(unused for streaming; kept for API parity)")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--use-class-weights", type=int, default=1)
+    p.add_argument("--accumulate", type=int, default=1, help="Gradient accumulation steps (legacy flag supported).")
+    return p
+
+# -----------------------------
+# Main
+# -----------------------------
+
+def main():
+    load_dotenv()
+    args = build_arg_parser().parse_args()
+    set_seed(args.seed)
+
+    # Normalize hyphenated dest names that argparse stores as attributes with dashes replaced by underscores
+    # e.g. --hidden-size becomes args.hidden_size
+    if hasattr(args, "hidden-size"):
+        args.hidden_size = getattr(args, "hidden-size")
+    if hasattr(args, "batch-size"):
+        args.batch_size = getattr(args, "batch-size")
+
+    # Resolve output dir (SageMaker-compatible)
+    output_dir = args.output_dir or os.environ.get("SM_MODEL_DIR", "./model")
+    os.makedirs(output_dir, exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[INFO] Using device: {device}")
+
+    # Files to read
+    files = list_csvs_sorted(args.data)
+
+    # Infer feature columns from a small sample (first file head)
+    sample = pd.read_csv(files[0], nrows=2000)
+    feature_cols = infer_feature_cols_from_sample(
+        sample_df=sample,
+        label_col=args.label_col,
+        time_col=args.time_col,
+        price_col=args.price_col,
+        explicit_feature_cols=args.feature_cols,
+    )
+    print(f"[INFO] Using {len(feature_cols)} feature columns")
+
+    if args.label_col not in sample.columns:
+        raise ValueError(f"Label column '{args.label_col}' not found in sample. "
+                         f"Pass --label-col or create a '{args.label_col}' column.")
+
+    # Chunk size from .env
+    chunk_size_env = os.getenv("CHUNK_SIZE", "200000")
+    try:
+        chunksize = max(10_000, int(chunk_size_env))
+    except Exception:
+        chunksize = 200_000
+    print(f"[INFO] CHUNK_SIZE = {chunksize}")
+
+    # -----------------------------
+    # PASS 0: Count sequences & decide split
+    # -----------------------------
+    # Default: index-based split by --val-frac.
+    total_sequences = count_total_sequences(
+        files=files,
+        feature_cols=feature_cols,
+        label_col=args.label_col,
+        seq_len=args.seq_len,
+        chunksize=chunksize,
+    )
+    if total_sequences == 0:
+        raise RuntimeError("No sequences produced. Check seq-len and your data.")
+
+    if args.val_months and len(files) > 1 and args.val_months > 0:
+        # Last N files' sequences are validation; rest are training
+        n_val = count_total_sequences(
+            files=files[-int(args.val_months):],
+            feature_cols=feature_cols,
+            label_col=args.label_col,
+            seq_len=args.seq_len,
+            chunksize=chunksize,
         )
-        out_size = hidden_size * (2 if bidirectional else 1)
-        self.head = nn.Sequential(
-            nn.Linear(out_size, out_size),
-            nn.ReLU(),
-            nn.Linear(out_size, 1),
-        )
+        n_train = max(1, total_sequences - n_val)
+        print(f"[INFO] Validation by last {args.val_months} file(s): train={n_train} | val={n_val}")
+    else:
+        n_val = max(1, int(total_sequences * float(args.val_frac)))
+        n_train = max(1, total_sequences - n_val)
+        print(f"[INFO] Validation by fraction {args.val_frac:.3f}: train={n_train} | val={n_val}")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _, (hn, _) = self.lstm(x)
-        last = hn[-1]
-        return self.head(last).squeeze(-1)
+    # -----------------------------
+    # PASS 1: Fit scaler on TRAIN portion only
+    # -----------------------------
+    scaler = None
+    if int(args.scale_features) == 1:
+        if StandardScaler is None:
+            raise RuntimeError("scikit-learn not available but --scale-features=1 was set")
+        scaler = StandardScaler()
+        seen = 0
+        for X_chunk, _ in iter_chunked_windows_and_labels(
+            files, feature_cols, args.label_col, args.seq_len, chunksize
+        ):
+            if seen >= n_train:
+                break
+            B = len(X_chunk)
+            if B == 0:
+                continue
+            take = min(B, n_train - seen)
+            Xb = X_chunk[:take]
+            b, t, f = Xb.shape
+            scaler.partial_fit(Xb.reshape(b * t, f))
+            seen += take
+        print("[INFO] Scaler fitted on training portion.")
+    else:
+        print("[INFO] Feature scaling disabled.")
 
-
-# ------------------------------
-# Training
-# ------------------------------
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--hidden_size", type=int, default=64)
-    ap.add_argument("--num_layers", type=int, default=2)
-    ap.add_argument("--dropout", type=float, default=0.1)
-    ap.add_argument("--bidirectional", type=bool, default=False)
-    ap.add_argument("--window_size", type=int, default=150)
-    ap.add_argument("--epochs", type=int, default=10)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--val_months", type=int, default=1)
-    ap.add_argument("--batch_size", type=int, default=256)
-    ap.add_argument("--accumulate", type=int, default=1)
-    args, _ = ap.parse_known_args()
-
-    set_seeds(42)
-
-    meta_in = load_model_meta()
-    feature_cols = list(meta_in.get("feature_cols", DEFAULT_FEATURE_COLS))
-    window_size = int(meta_in.get("window_size", args.window_size or 150))
-
-    # Files & split
-    all_paths = sorted(glob.glob(os.path.join(SM_TRAIN_DIR, "**/*.csv"), recursive=True))
-    if not all_paths:
-        raise RuntimeError(f"No CSV files found under {SM_TRAIN_DIR}")
-
-    val_months = max(0, int(args.val_months))
-    if val_months >= len(all_paths):
-        val_months = max(0, len(all_paths) - 1)
-
-    train_paths = all_paths[:-val_months] if val_months > 0 else all_paths
-    val_paths = all_paths[-val_months:] if val_months > 0 else []
-
-    if len(train_paths) == 0:
-        raise RuntimeError(
-            "No training files after splitting. Reduce --val_months or add more CSVs."
-        )
-
-    print(f"[files] train={len(train_paths)} val={len(val_paths)}")
-
-    # -------- PASS 1: fit scaler on TRAIN months, skip empties --------
-    scaler = StandardScaler()
-    fitted_rows = 0
-    carry_raw = None
-
-    for p in train_paths:
-        df = _read_csv_robust(p)
-        if carry_raw is not None:
-            df = pd.concat([carry_raw, df]).sort_index()
-
-        feat_all = build_features(df, compat_inf_to_zero=True)
-        offset = len(carry_raw) if carry_raw is not None else 0
-        feat_new = feat_all.iloc[offset:]  # positional slice (key fix)
-
-        if feat_new.empty:
-            print(f"[warn] no new rows in {p} after stitching; skipping")
-        else:
-            # column presence check
-            missing = [c for c in feature_cols if c not in feat_new.columns]
-            if missing:
-                raise RuntimeError(f"Missing features {missing} in file {p}")
-            scaler.partial_fit(feat_new[feature_cols].to_numpy(np.float32))
-            fitted_rows += len(feat_new)
-
-        carry_raw = df.tail(2000)
-
-    if not hasattr(scaler, "n_features_in_") or fitted_rows == 0:
-        raise RuntimeError(
-            "Scaler did not fit: no usable training rows. "
-            "Ensure at least one non-empty TRAIN month and a valid --val_months."
-        )
-    print(f"[scaler] fitted on ~{fitted_rows:,} rows")
-
-    # -------- Train / Validate --------
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # -----------------------------
+    # Build model, loss, optimizer
+    # -----------------------------
+    input_size = len(feature_cols)
     model = LSTMClassifier(
-        input_size=len(feature_cols),
+        input_size=input_size,
         hidden_size=int(args.hidden_size),
         num_layers=int(args.num_layers),
         dropout=float(args.dropout),
         bidirectional=bool(args.bidirectional),
+        num_classes=int(args.num_classes),
     ).to(device)
 
-    opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
-    loss_fn = nn.BCEWithLogitsLoss()
-
-    def train_batches(X: np.ndarray, y: np.ndarray, batch_size: int, accumulate: int) -> float:
-        if len(X) == 0:
-            return 0.0
-        model.train()
-        idx = np.arange(len(X))
-        np.random.shuffle(idx)
-        X, y = X[idx], y[idx]
-
-        total_loss, steps = 0.0, 0
-        opt.zero_grad(set_to_none=True)
-        for i in range(0, len(X), batch_size):
-            xb = torch.tensor(X[i:i+batch_size], dtype=torch.float32, device=device)
-            yb = torch.tensor(y[i:i+batch_size], dtype=torch.float32, device=device)
-            logits = model(xb)
-            loss = loss_fn(logits, yb) / max(1, accumulate)
-            loss.backward()
-            steps += 1
-            if steps % accumulate == 0:
-                opt.step(); opt.zero_grad(set_to_none=True)
-            total_loss += loss.item() * max(1, accumulate)
-        if steps % max(1, accumulate) != 0:
-            opt.step(); opt.zero_grad(set_to_none=True)
-        return total_loss / max(1, steps)
-
-    def eval_batches(X: np.ndarray, y: np.ndarray, batch_size: int) -> float:
-        if len(X) == 0:
-            return 0.0
-        model.eval()
-        total, steps = 0.0, 0
-        with torch.no_grad():
-            for i in range(0, len(X), batch_size):
-                xb = torch.tensor(X[i:i+batch_size], dtype=torch.float32, device=device)
-                yb = torch.tensor(y[i:i+batch_size], dtype=torch.float32, device=device)
-                logits = model(xb)
-                total += loss_fn(logits, yb).item()
-                steps += 1
-        return total / max(1, steps)
-
-    os.makedirs(SM_MODEL_DIR, exist_ok=True)
-    best = float("inf")
-
-    for epoch in range(int(args.epochs)):
-        print(f"\n=== epoch {epoch+1}/{int(args.epochs)} ===")
-
-        # ---- Train over months
-        carry_feat = None
-        carry_close = None
-        month_losses: List[float] = []
-
-        for p in train_paths:
-            df = _read_csv_robust(p)
-            feat_all = build_features(df, compat_inf_to_zero=True)
-
-            # scale full month (continuity handled in sequence builder)
-            miss = [c for c in feature_cols if c not in feat_all.columns]
-            if miss:
-                raise RuntimeError(f"Missing features {miss} in file {p}")
-
-            feat_scaled = feat_all.copy()
-            feat_scaled[feature_cols] = scaler.transform(
-                feat_scaled[feature_cols].to_numpy(np.float32)
-            )
-
-            X, y, carry_feat, carry_close = build_sequences_from_features(
-                feat_scaled, feature_cols, window_size, carry_feat, carry_close
-            )
-            if len(X) == 0:
-                print(f"[warn] month {p} produced 0 training sequences; skipping")
+    # Class weights (stream over train portion)
+    if int(args.use_class_weights) == 1:
+        counts = np.zeros(args.num_classes, dtype=np.int64)
+        seen = 0
+        for _, y_chunk in iter_chunked_windows_and_labels(
+            files, feature_cols, args.label_col, args.seq_len, chunksize
+        ):
+            if seen >= n_train:
+                break
+            B = len(y_chunk)
+            if B == 0:
                 continue
+            take = min(B, n_train - seen)
+            yb = y_chunk[:take]
+            classes, cnt = np.unique(yb, return_counts=True)
+            for c, k in zip(classes, cnt):
+                if 0 <= int(c) < args.num_classes:
+                    counts[int(c)] += int(k)
+            seen += take
+        weights = np.zeros(args.num_classes, dtype=np.float32)
+        for c in range(args.num_classes):
+            weights[c] = 0.0 if counts[c] == 0 else 1.0 / counts[c]
+        if weights.sum() > 0:
+            weights = weights * (len(weights) / (weights.sum()))
+        cw = torch.tensor(weights, dtype=torch.float32, device=device)
+        print(f"[INFO] Class weights: {np.round(weights,4).tolist()}")
+        criterion = nn.CrossEntropyLoss(weight=cw)
+    else:
+        criterion = nn.CrossEntropyLoss()
 
-            loss = train_batches(
-                X, y, batch_size=int(args.batch_size), accumulate=int(args.accumulate)
-            )
-            month_losses.append(loss)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(args.learning_rate),
+        weight_decay=float(args.weight_decay),
+    )
 
-        if month_losses:
-            print(f"[train] mean_loss={float(np.mean(month_losses)):.6f}")
+    # -----------------------------
+    # Dataloaders (streaming)
+    # -----------------------------
+    train_ds = SeqIterableDataset(
+        files=files,
+        feature_cols=feature_cols,
+        label_col=args.label_col,
+        seq_len=args.seq_len,
+        chunksize=chunksize,
+        subset="train",
+        n_train=n_train,
+        n_total=total_sequences,
+        scaler=scaler,
+        batch_size=int(args.batch_size),
+    )
+    val_ds = SeqIterableDataset(
+        files=files,
+        feature_cols=feature_cols,
+        label_col=args.label_col,
+        seq_len=args.seq_len,
+        chunksize=chunksize,
+        subset="val",
+        n_train=n_train,
+        n_total=total_sequences,
+        scaler=scaler,
+        batch_size=int(args.batch_size),
+    )
 
-        # ---- Validate
-        val_losses: List[float] = []
-        if val_paths:
-            carry_feat_v = None
-            carry_close_v = None
-            for p in val_paths:
-                df = _read_csv_robust(p)
-                feat_all = build_features(df, compat_inf_to_zero=True)
+    train_loader = DataLoader(train_ds, batch_size=None, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=None, num_workers=0, pin_memory=True)
 
-                miss = [c for c in feature_cols if c not in feat_all.columns]
-                if miss:
-                    raise RuntimeError(f"Missing features {miss} in VAL file {p}")
+    # -----------------------------
+    # Training loop (best val loss)
+    # -----------------------------
+    best_val_loss = float("inf")
+    best_state = None
+    for epoch in range(1, int(args.epochs) + 1):
+        tr_loss, tr_acc, tr_n = train_epoch_iter(
+            model, train_loader, device, criterion, optimizer, accumulate=int(args.accumulate)
+        )
+        va_loss, va_acc, va_n = eval_epoch_iter(model, val_loader, device, criterion)
 
-                feat_scaled = feat_all.copy()
-                feat_scaled[feature_cols] = scaler.transform(
-                    feat_scaled[feature_cols].to_numpy(np.float32)
-                )
+        print(f"[EPOCH {epoch:03d}] "
+              f"train_n={tr_n} train_loss={tr_loss:.5f} train_acc={tr_acc:.4f} | "
+              f"val_n={va_n} val_loss={va_loss:.5f} val_acc={va_acc:.4f}")
 
-                Xv, yv, carry_feat_v, carry_close_v = build_sequences_from_features(
-                    feat_scaled, feature_cols, window_size, carry_feat_v, carry_close_v
-                )
-                if len(Xv) == 0:
-                    print(f"[warn] month {p} produced 0 validation sequences; skipping")
-                    continue
+        if va_loss < best_val_loss:
+            best_val_loss = va_loss
+            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
 
-                val_losses.append(eval_batches(Xv, yv, batch_size=int(args.batch_size)))
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
-        v_loss = float(np.mean(val_losses)) if val_losses else 0.0
-        print(f"val_loss={v_loss:.6f}", flush=True)  # metric for SageMaker/Hyperparam Tuning
+    # -----------------------------
+    # Save artifacts
+    # -----------------------------
+    weights_path = os.path.join(output_dir, "model.pt")
+    torch.save(model.state_dict(), weights_path)
+    print(f"[SAVE] Weights -> {weights_path}")
 
-        if val_losses and v_loss < best:
-            best = v_loss
-            torch.save(model.state_dict(), os.path.join(SM_MODEL_DIR, "model.pt"))
+    scaler_path = None
+    if scaler is not None:
+        scaler_path = os.path.join(output_dir, "scaler.joblib")
+        if joblib is not None:
+            joblib.dump(scaler, scaler_path)
+        else:
+            import pickle
+            with open(scaler_path, "wb") as f:
+                pickle.dump(scaler, f)
+        print(f"[SAVE] Scaler -> {scaler_path}")
 
-    # ---- Save artifacts ----
-    dump(scaler, os.path.join(SM_MODEL_DIR, "scaler.joblib"))
-    meta_out: Dict[str, Any] = {
-        **meta_in,
-        "feature_cols": feature_cols,
-        "window_size": window_size,
-        "input_size": len(feature_cols),
-        "hidden_size": int(args.hidden_size),
-        "num_layers": int(args.num_layers),
-        "dropout": float(args.dropout),
-        "bidirectional": bool(args.bidirectional),
-        "scaler_type": "standard",
-        "label_def": "next_bar_up",
-    }
-    with open(os.path.join(SM_MODEL_DIR, "model_meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta_out, f, indent=2)
+    meta = ModelMeta(
+        input_size=input_size,
+        hidden_size=int(args.hidden_size),
+        num_layers=int(args.num_layers),
+        dropout=float(args.dropout),
+        bidirectional=bool(args.bidirectional),
+        num_classes=int(args.num_classes),
+        model_state_path="model.pt",
+        scaler_path="scaler.joblib" if scaler_path is not None else None,
+        feature_scaling=bool(scaler_path is not None),
+        framework="pytorch",
+        model_type="lstm_classifier",
+    )
+    meta_path = os.path.join(output_dir, "model_meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(asdict(meta), f, indent=2)
+    print(f"[SAVE] Meta -> {meta_path}")
 
+    print("[DONE] Training complete.")
 
 if __name__ == "__main__":
     main()
