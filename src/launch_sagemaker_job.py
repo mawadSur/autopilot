@@ -123,7 +123,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--price-col", type=str, default=_env("PRICE_COL", "close"))
 
     p.add_argument("--epochs", type=int, default=_env_int("EPOCHS", 50))
-    p.add_argument("--batch-size", type=int, default=_env_int("BATCH_SIZE", 512))
+    p.add_argument("--batch-size", type=int, default=_env_int("BATCH_SIZE", 1024))
     p.add_argument("--hidden-size", type=int, default=_env_int("HIDDEN_SIZE", 512))
     p.add_argument("--num-layers", type=int, default=_env_int("NUM_LAYERS", 3))
     p.add_argument("--dropout", type=float, default=_env_float("DROPOUT", 0.3))
