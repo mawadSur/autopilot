@@ -1,27 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-aws_train_model.py
+Chunked LSTM training with optional auto-labels and robust price-column autodetect.
 
-Chunked training for LSTM classifier on many CSVs under a directory (e.g., eth_1m_data/).
-- Streams data in chunks with a (T-1) overlap buffer so sequences don't break at boundaries
-- Two-pass StandardScaler fit for best accuracy (fit on train portion only)
-- Validation split:
-    * default: last --val-frac of sequences
-    * legacy flag: --val_months N  -> last N CSV files (by filename) comprise the validation set
-- Saves: model.pt, scaler.joblib (if enabled), model_meta.json
-- Works locally and on SageMaker (uses SM_MODEL_DIR if available)
-- Reads CHUNK_SIZE from .env (default 200000)
-
-Backward-compat flags accepted (mapped internally):
-  --batch_size   -> --batch-size
-  --hidden_size  -> --hidden-size
-  --window_size  -> --seq-len
-  --val_months   -> activates month-based validation split
-  --accumulate   -> gradient accumulation steps
-
-Usage (defaults assume ./eth_1m_data exists and label column is 'label'):
-  python aws_train_model.py --data eth_1m_data --seq-len 60 --epochs 10
+- Reads a single CSV or a directory of CSVs (sorted) such as ./eth_1m_data/
+- Builds rolling windows with proper overlap across chunk/file boundaries
+- Optional auto-labels from future returns if a label column is not present
+- Uses .env CHUNK_SIZE and runs locally or on SageMaker (SM_MODEL_DIR)
 """
 
 from __future__ import annotations
@@ -32,7 +17,7 @@ import json
 import os
 import random
 from dataclasses import asdict
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -40,11 +25,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import IterableDataset, DataLoader
 
-# env (.env) support
+# Optional .env support
 try:
     from dotenv import load_dotenv
 except Exception:
-    def load_dotenv(*args, **kwargs):
+    def load_dotenv(*_args, **_kwargs):
         return False
 
 # Prefer joblib for sklearn persistence
@@ -59,11 +44,9 @@ try:
 except Exception:
     StandardScaler = None  # guard if sklearn isn't installed
 
-# ---- Unified model and metadata helpers (models.py in project root) ----
-from models import (
-    LSTMClassifier,
-    ModelMeta,
-)
+# Unified model and metadata helpers (models.py in project root)
+from models import LSTMClassifier, ModelMeta
+
 
 # -----------------------------
 # Utils & Repro
@@ -76,6 +59,7 @@ def set_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
 def list_csvs_sorted(path: str) -> List[str]:
     if os.path.isdir(path):
         files = sorted(glob.glob(os.path.join(path, "*.csv")))
@@ -87,6 +71,7 @@ def list_csvs_sorted(path: str) -> List[str]:
     if os.path.splitext(path)[1].lower() != ".csv":
         raise ValueError(f"Only .csv supported in chunked mode; got {path}")
     return [path]
+
 
 def infer_feature_cols_from_sample(
     sample_df: pd.DataFrame,
@@ -104,6 +89,7 @@ def infer_feature_cols_from_sample(
         raise ValueError("Could not infer numeric feature columns from the sample.")
     return feats
 
+
 def build_windows_from_flat(features: np.ndarray, seq_len: int) -> np.ndarray:
     """
     features: [N, F] -> windows: [N - seq_len + 1, seq_len, F]
@@ -117,8 +103,66 @@ def build_windows_from_flat(features: np.ndarray, seq_len: int) -> np.ndarray:
     win = np.lib.stride_tricks.as_strided(features, shape=shape, strides=strides).copy()
     return win
 
+
 # -----------------------------
-# Chunked iterators with overlap buffer (T-1)
+# Auto-labels
+# -----------------------------
+
+def labels_from_price_array(px: np.ndarray, horizon: int, up_bps: float, down_bps: float) -> np.ndarray:
+    """
+    3-class labels by future return over `horizon` bars.
+      class 2 (UP)   : return >=  up_bps / 1e4
+      class 0 (DOWN) : return <= -down_bps / 1e4
+      class 1 (FLAT) : otherwise
+    The last `horizon` rows are NaN (no lookahead available).
+    """
+    fut = np.empty_like(px)
+    fut[:-horizon] = px[horizon:]
+    fut[-horizon:] = np.nan
+    ret = fut / px - 1.0
+    up = up_bps / 1e4
+    dn = down_bps / 1e4
+
+    lbl = np.full(px.shape, np.nan, dtype=float)
+    lbl[ret >= up] = 2
+    lbl[ret <= -dn] = 0
+    mid = (ret < up) & (ret > -dn)
+    lbl[mid] = 1
+    return lbl
+
+
+# -----------------------------
+# Price-column autodetect
+# -----------------------------
+
+PRICE_CANDIDATES = [
+    "close", "adj_close", "adj close", "close_price", "price", "last", "mid", "c"
+]
+
+def _resolve_price_col_from_columns(columns: List[str], preferred: Optional[str]) -> Optional[str]:
+    """
+    Try to resolve a price column name in a case-insensitive way.
+    - First try the preferred name.
+    - Then try common aliases.
+    Return the actual column name if found, else None.
+    """
+    lower_map = {c.lower(): c for c in columns}
+
+    if preferred:
+        if preferred in columns:
+            return preferred
+        if preferred.lower() in lower_map:
+            return lower_map[preferred.lower()]
+
+    for cand in PRICE_CANDIDATES:
+        if cand in lower_map:
+            return lower_map[cand]
+
+    return None
+
+
+# -----------------------------
+# Chunked iterators with overlap
 # -----------------------------
 
 def iter_chunked_windows_and_labels(
@@ -127,32 +171,62 @@ def iter_chunked_windows_and_labels(
     label_col: str,
     seq_len: int,
     chunksize: int,
+    *,
+    auto_label: int,
+    price_col: str,
+    horizon: int,
+    up_bps: float,
+    down_bps: float,
 ) -> Generator[Tuple[np.ndarray, np.ndarray], None, None]:
     """
     Yields (X_chunk, y_chunk) where:
       X_chunk: [B, T, F], y_chunk: [B]
-    Maintains a (T-1)-row buffer across chunks & files so windows are continuous.
+    Maintains a buffer of size (seq_len-1 + horizon_if_auto_label) across chunks/files to preserve both
+    sequence continuity and the lookahead for auto labels.
     """
+    keep = seq_len - 1 + (horizon if auto_label else 0)
     buffer_df = None
+
     for fpath in files:
         for chunk in pd.read_csv(fpath, chunksize=chunksize):
-            dfc = chunk if buffer_df is None else pd.concat([buffer_df, chunk], ignore_index=True)
-            L = len(dfc)
-            if L < seq_len:
-                buffer_df = dfc
-                continue
+            df = chunk if buffer_df is None else pd.concat([buffer_df, chunk], ignore_index=True)
+            L = len(df)
 
-            feats = dfc[feature_cols].to_numpy(dtype=np.float32)
-            X_all = build_windows_from_flat(feats, seq_len)            # [W, T, F], W = L - seq_len + 1
-            y_all = dfc[label_col].to_numpy()                          # [L]
-            y_all = y_all[seq_len - 1:]                                # [W], aligned to window end
+            if auto_label:
+                # Resolve (or re-resolve) price column for this chunk/file
+                resolved_price = _resolve_price_col_from_columns(df.columns.tolist(), price_col)
+                if resolved_price is None:
+                    cols = ", ".join(map(str, df.columns.tolist()))
+                    raise ValueError(
+                        f"--auto-label set but no suitable price column found. "
+                        f"Tried '{price_col}' and aliases {PRICE_CANDIDATES}. "
+                        f"Available columns: [{cols}]. "
+                        f"Pass --price-col <name> to specify explicitly."
+                    )
 
-            # Defer last (seq_len - 1) windows to next loop to preserve continuity
+                valid_L = L - horizon
+                if valid_L < seq_len:
+                    buffer_df = df
+                    continue
+                feats = df.iloc[:valid_L][feature_cols].to_numpy(dtype=np.float32)
+                X_all = build_windows_from_flat(feats, seq_len)                      # [W, T, F], W = valid_L - seq_len + 1
+                y_all = labels_from_price_array(df[resolved_price].to_numpy(dtype=float), horizon, up_bps, down_bps)
+                y_all = y_all[:valid_L][seq_len - 1:]                                # align to window end
+            else:
+                if L < seq_len:
+                    buffer_df = df
+                    continue
+                feats = df[feature_cols].to_numpy(dtype=np.float32)
+                X_all = build_windows_from_flat(feats, seq_len)
+                y_all = df[label_col].to_numpy()[seq_len - 1:]
+
+            # Emit all but the last (seq_len - 1) windows; keep them to preserve continuity
             emit = max(0, X_all.shape[0] - (seq_len - 1))
             if emit > 0:
                 yield X_all[:emit], y_all[:emit]
 
-            buffer_df = dfc.iloc[-(seq_len - 1):].copy()
+            buffer_df = df.iloc[-keep:].copy()
+
 
 def count_total_sequences(
     files: List[str],
@@ -160,24 +234,47 @@ def count_total_sequences(
     label_col: str,
     seq_len: int,
     chunksize: int,
+    *,
+    auto_label: int,
+    price_col: str,
+    horizon: int,
+    up_bps: float,
+    down_bps: float,
 ) -> int:
     total = 0
+    keep = seq_len - 1 + (horizon if auto_label else 0)
     buffer_df = None
+
     for fpath in files:
         for chunk in pd.read_csv(fpath, chunksize=chunksize):
-            dfc = chunk if buffer_df is None else pd.concat([buffer_df, chunk], ignore_index=True)
-            L = len(dfc)
-            if L < seq_len:
-                buffer_df = dfc
-                continue
-            W = L - seq_len + 1
+            df = chunk if buffer_df is None else pd.concat([buffer_df, chunk], ignore_index=True)
+            L = len(df)
+
+            if auto_label:
+                resolved_price = _resolve_price_col_from_columns(df.columns.tolist(), price_col)
+                if resolved_price is None:
+                    buffer_df = df.iloc[-keep:].copy()
+                    continue  # skip counting this chunk; iter function will raise with full context
+                valid_L = L - horizon
+                if valid_L < seq_len:
+                    buffer_df = df
+                    continue
+                W = valid_L - seq_len + 1
+            else:
+                if L < seq_len:
+                    buffer_df = df
+                    continue
+                W = L - seq_len + 1
+
             emit = max(0, W - (seq_len - 1))
             total += emit
-            buffer_df = dfc.iloc[-(seq_len - 1):].copy()
+            buffer_df = df.iloc[-keep:].copy()
+
     return total
 
+
 # -----------------------------
-# IterableDatasets for streaming train / val (index-based split)
+# IterableDatasets (streaming)
 # -----------------------------
 
 class SeqIterableDataset(IterableDataset):
@@ -187,6 +284,7 @@ class SeqIterableDataset(IterableDataset):
       - 'train': indices [0, n_train)
       - 'val'  : indices [n_train, n_total)
     """
+
     def __init__(
         self,
         files: List[str],
@@ -197,8 +295,14 @@ class SeqIterableDataset(IterableDataset):
         subset: str,
         n_train: int,
         n_total: int,
-        scaler: Optional[StandardScaler] = None,
-        batch_size: int = 128,
+        scaler: Optional[StandardScaler],
+        *,
+        auto_label: int,
+        price_col: str,
+        horizon: int,
+        up_bps: float,
+        down_bps: float,
+        batch_size: int,
     ):
         super().__init__()
         assert subset in ("train", "val")
@@ -211,6 +315,11 @@ class SeqIterableDataset(IterableDataset):
         self.n_train = n_train
         self.n_total = n_total
         self.scaler = scaler
+        self.auto_label = auto_label
+        self.price_col = price_col
+        self.horizon = horizon
+        self.up_bps = up_bps
+        self.down_bps = down_bps
         self.batch_size = int(batch_size)
 
     def __iter__(self):
@@ -221,7 +330,16 @@ class SeqIterableDataset(IterableDataset):
         buf_X, buf_y = [], []
 
         for X_chunk, y_chunk in iter_chunked_windows_and_labels(
-            self.files, self.feature_cols, self.label_col, self.seq_len, self.chunksize
+            self.files,
+            self.feature_cols,
+            self.label_col,
+            self.seq_len,
+            self.chunksize,
+            auto_label=self.auto_label,
+            price_col=self.price_col,
+            horizon=self.horizon,
+            up_bps=self.up_bps,
+            down_bps=self.down_bps,
         ):
             B = len(X_chunk)
             if B == 0:
@@ -256,12 +374,16 @@ class SeqIterableDataset(IterableDataset):
                 while need > 0 and buf_X:
                     x0, y0 = buf_X[0], buf_y[0]
                     if x0.shape[0] <= need:
-                        out_X.append(x0); out_y.append(y0)
-                        buf_X.pop(0); buf_y.pop(0)
+                        out_X.append(x0)
+                        out_y.append(y0)
+                        buf_X.pop(0)
+                        buf_y.pop(0)
                         need -= x0.shape[0]
                     else:
-                        out_X.append(x0[:need]); out_y.append(y0[:need])
-                        buf_X[0] = x0[need:]; buf_y[0] = y0[need:]
+                        out_X.append(x0[:need])
+                        out_y.append(y0[:need])
+                        buf_X[0] = x0[need:]
+                        buf_y[0] = y0[need:]
                         need = 0
                 X_out = np.concatenate(out_X, axis=0)
                 y_out = np.concatenate(out_y, axis=0)
@@ -269,27 +391,32 @@ class SeqIterableDataset(IterableDataset):
 
             start_idx = end_idx
 
+        # Flush remainder
         if buf_X:
             X_out = np.concatenate(buf_X, axis=0)
             y_out = np.concatenate(buf_y, axis=0)
             yield torch.from_numpy(X_out.astype(np.float32)), torch.from_numpy(y_out.astype(np.int64))
 
+
 # -----------------------------
 # Train / Eval Epochs (Iterable) with accumulation
 # -----------------------------
 
-def train_epoch_iter(model: nn.Module,
-                     loader: DataLoader,
-                     device: str,
-                     criterion: nn.Module,
-                     optimizer: torch.optim.Optimizer,
-                     accumulate: int = 1) -> Tuple[float, float, int]:
+def train_epoch_iter(
+    model: nn.Module,
+    loader: DataLoader,
+    device: str,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    accumulate: int = 1,
+) -> Tuple[float, float, int]:
     model.train()
     total_loss = 0.0
     total_correct = 0
     n = 0
     step = 0
     optimizer.zero_grad(set_to_none=True)
+
     for xb, yb in loader:
         xb = xb.to(device, non_blocking=True)
         yb = yb.to(device, non_blocking=True)
@@ -317,10 +444,8 @@ def train_epoch_iter(model: nn.Module,
     acc = total_correct / max(1, n)
     return avg_loss, acc, n
 
-def eval_epoch_iter(model: nn.Module,
-                    loader: DataLoader,
-                    device: str,
-                    criterion: nn.Module) -> Tuple[float, float, int]:
+
+def eval_epoch_iter(model: nn.Module, loader: DataLoader, device: str, criterion: nn.Module) -> Tuple[float, float, int]:
     model.eval()
     total_loss = 0.0
     total_correct = 0
@@ -337,6 +462,7 @@ def eval_epoch_iter(model: nn.Module,
             n += bs
     return total_loss / max(1, n), total_correct / max(1, n), n
 
+
 # -----------------------------
 # Argparse (new + legacy aliases)
 # -----------------------------
@@ -344,44 +470,51 @@ def eval_epoch_iter(model: nn.Module,
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Chunked LSTM training (directory or single CSV).")
     # IO
-    p.add_argument("--data", type=str, default="eth_1m_data",
-                   help="Path to a CSV file or a directory of CSVs (default: eth_1m_data)")
-    p.add_argument("--output-dir", type=str, default=None,
-                   help="Where to save artifacts. Defaults to SM_MODEL_DIR if set, else ./model")
+    p.add_argument("--data", type=str, default="eth_1m_data", help="CSV file or directory of CSVs (default: eth_1m_data)")
+    p.add_argument("--output-dir", type=str, default=None, help="Defaults to SM_MODEL_DIR if set, else ./model")
+
+    # Label handling
+    p.add_argument("--label-col", type=str, default="label", help="Name of label column if it exists. Default: 'label'")
+    p.add_argument("--auto-label", type=int, default=0, help="If 1, create labels from future returns when training.")
+    p.add_argument("--horizon", type=int, default=1, help="Bars ahead for auto-labels.")
+    p.add_argument("--up-bps", type=float, default=10.0, help="UP threshold in basis points (0.01%% = 1 bps).")
+    p.add_argument("--down-bps", type=float, default=10.0, help="DOWN threshold in basis points.")
+    p.add_argument("--price-col", type=str, default="close", help="Price column used for auto-labels (auto-detected if missing).")
+
     # Columns & sequences
-    p.add_argument("--label-col", type=str, default="label",
-                   help="Ground-truth label column (int classes). Default: 'label'")
-    p.add_argument("--price-col", type=str, default="close", help="Optional price column (unused for loss).")
-    p.add_argument("--time-col", type=str, default=None, help="Optional timestamp column (not required).")
+    p.add_argument("--time-col", type=str, default=None)
     p.add_argument("--feature-cols", type=str, nargs="*", default=None,
-                   help="Explicit list of feature columns; if omitted, auto-detect numeric minus label/price/time from a sample.")
+                   help="Explicit feature list; if omitted, auto-detect numeric minus label/price/time.")
     p.add_argument("--seq-len", type=int, default=60, help="Sequence length for windowing.")
     # Legacy alias for --seq-len
     p.add_argument("--window_size", dest="seq_len", type=int, help=argparse.SUPPRESS)
 
     # Scaling
     p.add_argument("--scale-features", type=int, default=1, help="1 to fit/apply StandardScaler; 0 to disable.")
+
     # Model hyperparams (+ legacy aliases)
     p.add_argument("--hidden-size", type=int, default=128)
-    p.add_argument("--hidden_size", dest="hidden-size", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--hidden_size", dest="hidden_size", type=int, help=argparse.SUPPRESS)
     p.add_argument("--num-layers", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--bidirectional", type=int, default=0)
     p.add_argument("--num-classes", type=int, default=3)
+
     # Training hyperparams (+ legacy aliases)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--batch_size", dest="batch-size", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--batch_size", dest="batch_size", type=int, help=argparse.SUPPRESS)
     p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--val-frac", type=float, default=0.2, help="Fraction of sequences at the END used for validation.")
     p.add_argument("--val_months", type=int, default=None,
-                   help="Legacy: use last N CSV files as validation (overrides --val-frac when set).")
+                   help="Use last N CSV files (by filename) as validation; overrides --val-frac when set.")
     p.add_argument("--shuffle-train", type=int, default=0, help="(unused for streaming; kept for API parity)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--use-class-weights", type=int, default=1)
-    p.add_argument("--accumulate", type=int, default=1, help="Gradient accumulation steps (legacy flag supported).")
+    p.add_argument("--accumulate", type=int, default=1, help="Gradient accumulation steps.")
     return p
+
 
 # -----------------------------
 # Main
@@ -391,13 +524,6 @@ def main():
     load_dotenv()
     args = build_arg_parser().parse_args()
     set_seed(args.seed)
-
-    # Normalize hyphenated dest names that argparse stores as attributes with dashes replaced by underscores
-    # e.g. --hidden-size becomes args.hidden_size
-    if hasattr(args, "hidden-size"):
-        args.hidden_size = getattr(args, "hidden-size")
-    if hasattr(args, "batch-size"):
-        args.batch_size = getattr(args, "batch-size")
 
     # Resolve output dir (SageMaker-compatible)
     output_dir = args.output_dir or os.environ.get("SM_MODEL_DIR", "./model")
@@ -409,22 +535,39 @@ def main():
     # Files to read
     files = list_csvs_sorted(args.data)
 
-    # Infer feature columns from a small sample (first file head)
+    # Quick sample to infer features and determine label/price availability
     sample = pd.read_csv(files[0], nrows=2000)
+
+    # Auto-detect price column up-front in case --auto-label is used
+    resolved_price = _resolve_price_col_from_columns(sample.columns.tolist(), args.price_col)
+    if resolved_price is None:
+        # Don't fail yet; iterators will raise with full context if needed.
+        print(f"[WARN] Could not find requested price-col '{args.price_col}' in sample; "
+              f"will try aliases {PRICE_CANDIDATES} per-chunk.")
+    else:
+        if resolved_price != args.price_col:
+            print(f"[INFO] Using price column '{resolved_price}' (resolved from '{args.price_col}').")
+        args.price_col = resolved_price
+
+    label_in_sample = args.label_col in sample.columns
+
+    # If no label in sample and auto-label not requested, auto-enable it to avoid crashes
+    if int(args.auto_label) == 0 and not label_in_sample:
+        args.auto_label = 1
+        print(f"[INFO] No '{args.label_col}' column in sample; enabling --auto-label 1 "
+              f"(horizon={args.horizon}, up_bps={args.up_bps}, down_bps={args.down_bps}).")
+
+    # Infer feature columns from sample (drop label/time/price if present)
     feature_cols = infer_feature_cols_from_sample(
         sample_df=sample,
-        label_col=args.label_col,
+        label_col=(args.label_col if int(args.auto_label) == 0 else None),
         time_col=args.time_col,
         price_col=args.price_col,
         explicit_feature_cols=args.feature_cols,
     )
     print(f"[INFO] Using {len(feature_cols)} feature columns")
 
-    if args.label_col not in sample.columns:
-        raise ValueError(f"Label column '{args.label_col}' not found in sample. "
-                         f"Pass --label-col or create a '{args.label_col}' column.")
-
-    # Chunk size from .env
+    # CHUNK_SIZE from .env (or passed via SageMaker environment)
     chunk_size_env = os.getenv("CHUNK_SIZE", "200000")
     try:
         chunksize = max(10_000, int(chunk_size_env))
@@ -435,25 +578,33 @@ def main():
     # -----------------------------
     # PASS 0: Count sequences & decide split
     # -----------------------------
-    # Default: index-based split by --val-frac.
     total_sequences = count_total_sequences(
         files=files,
         feature_cols=feature_cols,
         label_col=args.label_col,
         seq_len=args.seq_len,
         chunksize=chunksize,
+        auto_label=int(args.auto_label),
+        price_col=args.price_col,
+        horizon=int(args.horizon),
+        up_bps=float(args.up_bps),
+        down_bps=float(args.down_bps),
     )
     if total_sequences == 0:
-        raise RuntimeError("No sequences produced. Check seq-len and your data.")
+        raise RuntimeError("No sequences produced. Check seq-len / horizon / data content.")
 
     if args.val_months and len(files) > 1 and args.val_months > 0:
-        # Last N files' sequences are validation; rest are training
         n_val = count_total_sequences(
             files=files[-int(args.val_months):],
             feature_cols=feature_cols,
             label_col=args.label_col,
             seq_len=args.seq_len,
             chunksize=chunksize,
+            auto_label=int(args.auto_label),
+            price_col=args.price_col,
+            horizon=int(args.horizon),
+            up_bps=float(args.up_bps),
+            down_bps=float(args.down_bps),
         )
         n_train = max(1, total_sequences - n_val)
         print(f"[INFO] Validation by last {args.val_months} file(s): train={n_train} | val={n_val}")
@@ -472,7 +623,16 @@ def main():
         scaler = StandardScaler()
         seen = 0
         for X_chunk, _ in iter_chunked_windows_and_labels(
-            files, feature_cols, args.label_col, args.seq_len, chunksize
+            files,
+            feature_cols,
+            args.label_col,
+            args.seq_len,
+            chunksize,
+            auto_label=int(args.auto_label),
+            price_col=args.price_col,
+            horizon=int(args.horizon),
+            up_bps=float(args.up_bps),
+            down_bps=float(args.down_bps),
         ):
             if seen >= n_train:
                 break
@@ -506,7 +666,16 @@ def main():
         counts = np.zeros(args.num_classes, dtype=np.int64)
         seen = 0
         for _, y_chunk in iter_chunked_windows_and_labels(
-            files, feature_cols, args.label_col, args.seq_len, chunksize
+            files,
+            feature_cols,
+            args.label_col,
+            args.seq_len,
+            chunksize,
+            auto_label=int(args.auto_label),
+            price_col=args.price_col,
+            horizon=int(args.horizon),
+            up_bps=float(args.up_bps),
+            down_bps=float(args.down_bps),
         ):
             if seen >= n_train:
                 break
@@ -526,7 +695,7 @@ def main():
         if weights.sum() > 0:
             weights = weights * (len(weights) / (weights.sum()))
         cw = torch.tensor(weights, dtype=torch.float32, device=device)
-        print(f"[INFO] Class weights: {np.round(weights,4).tolist()}")
+        print(f"[INFO] Class weights: {np.round(weights, 4).tolist()}")
         criterion = nn.CrossEntropyLoss(weight=cw)
     else:
         criterion = nn.CrossEntropyLoss()
@@ -550,6 +719,11 @@ def main():
         n_train=n_train,
         n_total=total_sequences,
         scaler=scaler,
+        auto_label=int(args.auto_label),
+        price_col=args.price_col,
+        horizon=int(args.horizon),
+        up_bps=float(args.up_bps),
+        down_bps=float(args.down_bps),
         batch_size=int(args.batch_size),
     )
     val_ds = SeqIterableDataset(
@@ -562,6 +736,11 @@ def main():
         n_train=n_train,
         n_total=total_sequences,
         scaler=scaler,
+        auto_label=int(args.auto_label),
+        price_col=args.price_col,
+        horizon=int(args.horizon),
+        up_bps=float(args.up_bps),
+        down_bps=float(args.down_bps),
         batch_size=int(args.batch_size),
     )
 
@@ -579,9 +758,11 @@ def main():
         )
         va_loss, va_acc, va_n = eval_epoch_iter(model, val_loader, device, criterion)
 
-        print(f"[EPOCH {epoch:03d}] "
-              f"train_n={tr_n} train_loss={tr_loss:.5f} train_acc={tr_acc:.4f} | "
-              f"val_n={va_n} val_loss={va_loss:.5f} val_acc={va_acc:.4f}")
+        print(
+            f"[EPOCH {epoch:03d}] "
+            f"train_n={tr_n} train_loss={tr_loss:.5f} train_acc={tr_acc:.4f} | "
+            f"val_n={va_n} val_loss={va_loss:.5f} val_acc={va_acc:.4f}"
+        )
 
         if va_loss < best_val_loss:
             best_val_loss = va_loss
@@ -627,6 +808,7 @@ def main():
     print(f"[SAVE] Meta -> {meta_path}")
 
     print("[DONE] Training complete.")
+
 
 if __name__ == "__main__":
     main()
