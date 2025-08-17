@@ -14,7 +14,7 @@ role = get_execution_role()
 # Step 3: Define Your Model
 # ------------------------------
 model = Model(
-    model_data='s3://sagemaker-us-east-1-469090608362/pytorch-training-2025-07-27-17-01-52-031/model.tar.gz',
+    model_data='s3://sagemaker-us-east-1-469090608362/eth-price-prediction-data-train-2025-08-17-20-16-27-317/output/model.tar.gz',
     image_uri='469090608362.dkr.ecr.us-east-1.amazonaws.com/sklearn-inference:0.24-1-cpu-py3',
    role=role
 )

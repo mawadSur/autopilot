@@ -122,12 +122,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--down-bps", type=float, default=_env_float("DOWN_BPS", 10.0))
     p.add_argument("--price-col", type=str, default=_env("PRICE_COL", "close"))
 
-    p.add_argument("--epochs", type=int, default=_env_int("EPOCHS", 10))
-    p.add_argument("--batch-size", type=int, default=_env_int("BATCH_SIZE", 128))
-    p.add_argument("--hidden-size", type=int, default=_env_int("HIDDEN_SIZE", 128))
-    p.add_argument("--num-layers", type=int, default=_env_int("NUM_LAYERS", 2))
-    p.add_argument("--dropout", type=float, default=_env_float("DROPOUT", 0.1))
-    p.add_argument("--bidirectional", type=int, default=_env_bool_or_int("BIDIRECTIONAL", 0))
+    p.add_argument("--epochs", type=int, default=_env_int("EPOCHS", 50))
+    p.add_argument("--batch-size", type=int, default=_env_int("BATCH_SIZE", 512))
+    p.add_argument("--hidden-size", type=int, default=_env_int("HIDDEN_SIZE", 512))
+    p.add_argument("--num-layers", type=int, default=_env_int("NUM_LAYERS", 3))
+    p.add_argument("--dropout", type=float, default=_env_float("DROPOUT", 0.3))
+    p.add_argument("--bidirectional", type=int, default=_env_bool_or_int("BIDIRECTIONAL", 1))
     p.add_argument("--num-classes", type=int, default=_env_int("NUM_CLASSES", 3))
     p.add_argument("--seq-len", type=int, default=_env_int("SEQ_LEN", 60))
     p.add_argument("--val-frac", type=float, default=_env_float("VAL_FRAC", 0.2))
@@ -271,10 +271,24 @@ def main():
         est_kwargs["image_uri"] = args.image_uri
 
     estimator = PyTorch(**est_kwargs)
-    job_name = args.job_name or sagemaker.utils.name_from_base(f"{args.prefix.replace('/', '-')}-train")
+    job_name = args.job_name or sagemaker.utils.name_from_base(f"{args.prefix.replace('/', '-')}")
     print(f"[INFO] Launching job: {job_name}")
     estimator.fit(inputs=inputs, job_name=job_name)
     print("[DONE] Job submitted. Check SageMaker console for status.")
+
+    # === NEW: deploy a real-time endpoint and print its name ===
+    endpoint_name = f"{job_name}"
+    model = estimator.create_model(
+        entry_point="inference.py",         # must be in the same repo_root
+        source_dir=str(repo_root),
+        role=role_arn,
+    )
+    predictor = model.deploy(
+        initial_instance_count=1,
+        instance_type="ml.m5.large",        # adjust here if you need GPU/other size
+        endpoint_name=endpoint_name,
+    )
+    print(f"[DEPLOYED] Endpoint: {predictor.endpoint_name}")
 
 if __name__ == "__main__":
     main()
