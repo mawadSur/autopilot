@@ -1,213 +1,230 @@
-# paper_trade.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+paper_trade.py — forward-only paper trading with TP/SL and threshold
+
+Defaults:
+  • Data directory: ./eth_1m_data
+  • Model artifacts: ./ (model_meta.json, model.pt, scaler.joblib)
+  • Buy when P(class=1) >= threshold; exit via intra-bar TP/SL
+  • Prints a trade blotter and a $-formatted summary
+
+Examples
+--------
+python paper_trade.py --capital 10000
+python paper_trade.py --threshold 0.65 --tp-pct 0.005 --sl-pct 0.0025 --fee-pct 0.0008
+"""
+
 from __future__ import annotations
 
+import argparse
+import glob
+import json
+import math
 import os
-import time
-from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-
-from dotenv import load_dotenv
-from binance.exceptions import BinanceAPIException
-
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
 from utils import (
-    SignalGenerator,
-    get_binance_client,
-    prefill_history,
-    fetch_latest_bar,
-    _get_bool,
+    read_csv_concat_sorted, resolve_price_col, build_windows,
+    load_model_bundle, fmt_money, DEFAULT_FEATURE_COLS
 )
 
-# -----------------------------
-# Config (env-driven)
-# -----------------------------
-load_dotenv()
+try:
+    import joblib
+except Exception:
+    joblib = None
 
-SYMBOL = os.getenv("TRADE_SYMBOL", "ETHUSDT")
-INTERVAL = os.getenv("INTERVAL", "1m")
-ENDPOINT_NAME = os.getenv("ENDPOINT_NAME")
-POLL_MS = int(os.getenv("POLL_MS", "1000"))  # chart refresh interval (ms)
-
-# risk/fees
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "1.5")) / 100.0
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.75")) / 100.0
-FEE_PCT = float(os.getenv("FEE_PCT", "0.075")) / 100.0  # per side
-
-TESTNET = _get_bool("TESTNET", True)
-
-if not ENDPOINT_NAME:
-    raise RuntimeError("ENDPOINT_NAME is not set in the environment.")
-
-# -----------------------------
-# Small helpers
-# -----------------------------
-def ms_to_dt(ms: int) -> datetime:
-    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
-
-# -----------------------------
-# State containers (mutable)
-# -----------------------------
-class TradeState:
-    def __init__(self):
-        self.position_open: bool = False
-        self.entry_price: Optional[float] = None
-        self.tp_price: Optional[float] = None
-        self.sl_price: Optional[float] = None
-        self.trade_count: int = 0
-        self.pnl_realized: float = 0.0  # fraction (e.g., 0.012 = +1.2%)
-        self.last_open_time: int = -1
-
-        # plotting data
-        self.times: List[datetime] = []
-        self.prices: List[float] = []
-        self.buy_times: List[datetime] = []
-        self.buy_prices: List[float] = []
-        self.sell_times: List[datetime] = []
-        self.sell_prices: List[float] = []
-
-# -----------------------------
-# Init core services
-# -----------------------------
-client = get_binance_client(testnet=TESTNET)
-sig = SignalGenerator(endpoint_name=ENDPOINT_NAME)
-prefill_history(sig, client, SYMBOL, INTERVAL)
-state = TradeState()
-
-# -----------------------------
-# Matplotlib setup
-# -----------------------------
-plt.style.use("default")
-fig, ax = plt.subplots(figsize=(12, 6))
-line_price, = ax.plot([], [], lw=1.5)  # price line
-scat_buys = ax.scatter([], [], marker="^", s=60)   # will be recolored each frame
-scat_sells = ax.scatter([], [], marker="v", s=60)
-
-tp_line = ax.axhline(y=0, color="gray", linestyle="--", lw=1, alpha=0.5)  # reused/hidden when flat
-sl_line = ax.axhline(y=0, color="gray", linestyle="--", lw=1, alpha=0.5)
-tp_line.set_visible(False)
-sl_line.set_visible(False)
-
-title = ax.set_title(f"{SYMBOL} paper trading (testnet={TESTNET})")
-ax.set_xlabel("Time (UTC)")
-ax.set_ylabel("Price (USDT)")
-
-fig.tight_layout()
-
-# -----------------------------
-# Core trading step
-# -----------------------------
-def trading_step() -> Tuple[float, Optional[float], Optional[int], int]:
-    """
-    Returns: price, confidence (or None), signal (or None), open_time
-    """
-    bar, open_time = fetch_latest_bar(client, SYMBOL, INTERVAL)
-    # Update plotting series once per candle (for a clean OHLC step view)
-    if not state.times or open_time != state.last_open_time:
-        state.times.append(ms_to_dt(open_time))
-        state.prices.append(bar["close"])
-        state.last_open_time = open_time
-    else:
-        # same candle: update last price so plot reflects latest tick
-        state.prices[-1] = bar["close"]
-
-    res = sig.get_signal(bar)  # appends/updates internal history
-    price = bar["close"]
-    conf = res.get("confidence")
-    signal = res.get("signal")
-
-    # Entry/exit logic ONLY when a new candle closes/opens (debounce intra-bar)
-    if open_time == state.last_open_time and len(state.times) > 1:
-        # Still same candle; we only update the chart, not trading decisions.
-        pass
-
-    # On NEW candle, make decisions using the *previous* close (just updated by SignalGenerator)
-    if len(state.times) >= 1 and open_time == state.last_open_time:
-        # decisions below will still run once per new bar because of SignalGenerator debouncing
-        if not state.position_open:
-            if signal == 1 and conf is not None and conf >= sig.threshold:
-                # open long
-                state.position_open = True
-                state.entry_price = price
-                state.tp_price = state.entry_price * (1.0 + TAKE_PROFIT_PCT)
-                state.sl_price = state.entry_price * (1.0 - STOP_LOSS_PCT)
-                state.trade_count += 1
-                state.buy_times.append(state.times[-1])
-                state.buy_prices.append(price)
-        else:
-            # manage exits with TP/SL
-            assert state.entry_price is not None
-            assert state.tp_price is not None
-            assert state.sl_price is not None
-            hit_tp = price >= state.tp_price
-            hit_sl = price <= state.sl_price
-            if hit_tp or hit_sl:
-                gross_ret = (price / state.entry_price) - 1.0
-                net_ret = gross_ret - (2.0 * FEE_PCT)
-                state.pnl_realized += net_ret
-
-                # close position
-                state.position_open = False
-                state.sell_times.append(state.times[-1])
-                state.sell_prices.append(price)
-
-                # clear targets
-                state.entry_price = None
-                state.tp_price = None
-                state.sl_price = None
-
-    return price, (None if conf is None else float(conf)), (None if signal is None else int(signal)), open_time
-
-# -----------------------------
-# Animation callback
-# -----------------------------
-def update(_frame):
-    try:
-        price, conf, signal, _ot = trading_step()
-    except BinanceAPIException as e:
-        print(f"BinanceAPIException {e.status_code}: {e.message}")
-        time.sleep(2)
-        return []
-    except Exception as e:
-        print(f"update() error: {e}")
-        time.sleep(2)
-        return []
-
-    # update price line
-    line_price.set_data(state.times, state.prices)
-    ax.relim()
-    ax.autoscale_view()
-
-    # update trade markers
-    scat_buys.set_offsets(list(zip(state.buy_times, state.buy_prices)))
-    scat_buys.set_color("tab:green")
-    scat_sells.set_offsets(list(zip(state.sell_times, state.sell_prices)))
-    scat_sells.set_color("tab:red")
-
-    # show TP/SL while in position
-    if state.position_open and state.tp_price and state.sl_price:
-        tp_line.set_ydata([state.tp_price])
-        sl_line.set_ydata([state.sl_price])
-        tp_line.set_visible(True); sl_line.set_visible(True)
-    else:
-        tp_line.set_visible(False); sl_line.set_visible(False)
-
-    # dynamic title with latest stats
-    pos_txt = "OPEN" if state.position_open else "FLAT"
-    conf_txt = "—" if conf is None else f"{conf:.3f}"
-    sig_txt = "—" if signal is None else str(signal)
-    title.set_text(
-        f"{SYMBOL}  price={price:.2f}  conf={conf_txt}  signal={sig_txt}  "
-        f"pnl={state.pnl_realized*100:.2f}%  trades={state.trade_count}  ({pos_txt})"
+try:
+    from models import LSTMClassifier
+except Exception as e:
+    raise SystemExit(
+        "Could not import LSTMClassifier from models.py. Ensure models.py is on PYTHONPATH.\n"
+        f"Underlying error: {e}"
     )
 
-    return [line_price, scat_buys, scat_sells, tp_line, sl_line, title]
+PRICE_CANDIDATES = ["close", "adj_close", "adj close", "close_price", "price", "last", "mid", "c"]
 
-# -----------------------------
-# Run
-# -----------------------------
+DEFAULT_COLS_6 = ["timestamp", "open", "high", "low", "close", "volume"]
+DEFAULT_COLS_7 = ["timestamp", "open", "high", "low", "close", "volume", "trades"]
+
+def _columns_look_headerless(cols: List[str]) -> bool:
+    lowers = [str(c).strip().lower() for c in cols]
+    if any(k in lowers for k in ["open","high","low","close","volume","timestamp","time","c","o","h","l","v"]):
+        return False
+    numeric_like = 0
+    for c in cols:
+        s = str(c).strip().replace(".", "", 1).replace("-", "", 1)
+        if s.isdigit():
+            numeric_like += 1
+    return numeric_like >= max(3, len(cols)//2)
+
+def _apply_default_headers(df: pd.DataFrame) -> pd.DataFrame:
+    n = df.shape[1]
+    if n == 6:
+        df.columns = DEFAULT_COLS_6
+    elif n == 7:
+        df.columns = DEFAULT_COLS_7
+    else:
+        df.columns = [f"col{i}" for i in range(n)]
+    return df
+
+def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    if _columns_look_headerless(list(df.columns)):
+        df = _apply_default_headers(df)
+    return df
+
+def load_meta(model_dir: str) -> Dict:
+    meta_path = Path(model_dir) / "model_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"model_meta.json not found in {model_dir}")
+    with open(meta_path, "r") as f:
+        return json.load(f)
+
+def main():
+    ap = argparse.ArgumentParser(description="Paper (simulated) trading with TP/SL and threshold.")
+    ap.add_argument("--data-dir", type=str, default="eth_1m_data", help="Dir or single CSV")
+    ap.add_argument("--model-dir", type=str, default=".", help="Where model_meta.json & model.pt live")
+    ap.add_argument("--capital", type=float, default=10_000.0)
+    ap.add_argument("--threshold", type=float, default=None)
+    ap.add_argument("--tp-pct", type=float, default=None)
+    ap.add_argument("--sl-pct", type=float, default=None)
+    ap.add_argument("--fee-pct", type=float, default=None)
+    ap.add_argument("--batch-size", type=int, default=2048)
+    args = ap.parse_args()
+
+    # Load model + meta
+    model, scaler, meta = load_model_bundle(args.model_dir)
+    feature_cols = list(meta.get("feature_cols", []))
+    window_size = int(meta.get("window_size", 150))
+    buy_threshold = float(meta.get("buy_threshold", 0.60)) if args.threshold is None else float(args.threshold)
+    fee_pct = float(meta.get("tx_cost", 0.0008)) if args.fee_pct is None else float(args.fee_pct)
+    tp_pct = 0.005 if args.tp_pct is None else float(args.tp_pct)
+    sl_pct = 0.0025 if args.sl_pct is None else float(args.sl_pct)
+
+    # Load data
+    df = read_csv_concat_sorted(args.data_dir)
+    price_col = resolve_price_col(df.columns.tolist(), meta.get("price_col", "close"))
+    if price_col is None:
+        raise SystemExit(f"Could not find a price column. Available: {list(df.columns)}")
+
+    # Features
+    drop_cols = {price_col, "timestamp", "time"}
+    feat_cols = [c for c in feature_cols if c in df.columns and c not in drop_cols]
+    if not feat_cols:
+        raise SystemExit("No valid feature columns found for inference.")
+    X_flat = df[feat_cols].to_numpy(dtype=np.float32)
+
+    # Windows
+    X = build_windows(X_flat, window_size)
+    if len(X) == 0:
+        raise SystemExit("Not enough rows to build any sequences. Increase data or reduce window size.")
+
+    # Align OHLC arrays to window ends
+    opens = df["open"].to_numpy(dtype=float)[window_size - 1:]
+    highs = df["high"].to_numpy(dtype=float)[window_size - 1:]
+    lows  = df["low"].to_numpy(dtype=float)[window_size - 1:]
+    closes= df[price_col].to_numpy(dtype=float)[window_size - 1:]
+    times = df["timestamp"].iloc[window_size - 1:] if "timestamp" in df.columns else pd.Series(range(len(closes)))
+
+    # Scale if scaler exists
+    if scaler is not None:
+        n, t, f = X.shape
+        X = scaler.transform(X.reshape(n*t, f)).reshape(n, t, f)
+
+    # Predict probabilities (class 1)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    probs = np.zeros(len(X), dtype=np.float32)
+    with torch.no_grad():
+        BS = int(args.batch_size)
+        for i in range(0, len(X), BS):
+            xb = torch.from_numpy(X[i:i+BS]).to(device)
+            logits = model(xb)
+            p = F.softmax(logits, dim=-1)[:, 1].cpu().numpy()
+            probs[i:i+BS] = p
+
+    # Paper trading loop (same logic as backtester)
+    cash = float(args.capital)
+    in_trade = False
+    entry_price = None
+    tp_price = None
+    sl_price = None
+    trades = []
+    wins = losses = 0
+
+    for i in range(1, len(closes)):
+        o, h, l, c = float(opens[i]), float(highs[i]), float(lows[i]), float(closes[i])
+        t = times.iloc[i] if hasattr(times, "iloc") else times[i]
+
+        if not in_trade:
+            if probs[i-1] >= buy_threshold:
+                entry_price = o
+                tp_price = entry_price * (1.0 + tp_pct)
+                sl_price = entry_price * (1.0 - sl_pct)
+                cash *= (1.0 - fee_pct)  # entry fee
+                in_trade = True
+                trades.append({
+                    "time": t, "side": "BUY", "price": entry_price, "prob": float(probs[i-1])
+                })
+        else:
+            exit_px = None
+            win = None
+            # conservative order: SL before TP if both touched (path dependent)
+            if l <= sl_price <= h:
+                exit_px = sl_price
+                win = False
+            elif h >= tp_price:
+                exit_px = tp_price
+                win = True
+            elif l <= sl_price:
+                exit_px = sl_price
+                win = False
+
+            if exit_px is not None:
+                gross_ret = (exit_px / entry_price) - 1.0
+                cash *= (1.0 + gross_ret)
+                cash *= (1.0 - fee_pct)  # exit fee
+                in_trade = False
+                trades.append({
+                    "time": t, "side": "SELL", "price": exit_px, "result": "WIN" if win else "LOSS"
+                })
+                if win: wins += 1
+                else: losses += 1
+
+    # If still open at end, close at last close
+    if in_trade and entry_price is not None:
+        final_exit = float(closes[-1])
+        gross_ret = (final_exit / entry_price) - 1.0
+        cash *= (1.0 + gross_ret)
+        cash *= (1.0 - fee_pct)
+        trades.append({"time": times.iloc[-1] if hasattr(times,"iloc") else times[-1], "side": "SELL", "price": final_exit, "result": "CLOSE_END"})
+
+    # Blotter + summary
+    print("\n=== PAPER TRADE BLOTTER ===")
+    for tr in trades:
+        if tr["side"] == "BUY":
+            print(f"{tr['time']}  BUY  @ {fmt_money(tr['price'])}  (prob={tr['prob']:.3f})")
+        else:
+            res = tr.get("result", "")
+            print(f"{tr['time']}  SELL @ {fmt_money(tr['price'])}  {res}")
+
+    start = float(args.capital)
+    end = cash
+    multiple = end / start if start else float("nan")
+    ret = multiple - 1.0
+    print("\n=== PAPER TRADE SUMMARY ===")
+    print(f"Start capital  : {fmt_money(start)}")
+    print(f"End equity     : {fmt_money(end)}")
+    print(f"Return         : {ret*100:.2f}%  (×{multiple:.2f})")
+    total_trades = sum(1 for tr in trades if tr["side"] == "SELL")
+    if total_trades:
+        print(f"Trades         : {total_trades}  (wins {wins}, losses {losses}, win rate {wins/max(1,total_trades):.2%})")
+    print("")
+
 if __name__ == "__main__":
-    print(f"Paper trading with live plot on {SYMBOL} (interval={INTERVAL}) | TESTNET={TESTNET}")
-    ani = animation.FuncAnimation(fig, update, interval=POLL_MS, blit=False)
-    plt.show()
+    main()

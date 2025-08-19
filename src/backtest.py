@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Unified backtest script with pretty $ output.
+backtest.py — Unified backtester with TP/SL and pretty $ output
 
-Modes
------
---mode simple
-    Quick accuracy/precision-style report (no capital curve).
-
---mode portfolio
-    Full equity simulation with configurable fees/slippage and shorting.
-
-Assumptions
------------
-- Trained artifacts live in ./model (or pass --model-dir).
-- Data lives in ./eth_1m_data (or pass --data-dir).
-- If CSVs are headerless, we auto-assign OHLCV headers.
+Defaults:
+  • Data directory: ./eth_1m_data
+  • Model artifacts: ./ (expects model_meta.json, model.pt, scaler.joblib)
+  • Binary classification: 1 = buy, 0 = no-trade
+  • TP/SL checked intra-bar via high/low
+  • Confidence threshold from model_meta.json (buy_threshold), CLI override possible
 
 Examples
 --------
-python src/backtest.py --mode simple
-python src/backtest.py --mode portfolio --capital 10000 --allow-shorts
+python backtest.py --mode portfolio --capital 10000
+python backtest.py --mode portfolio --capital 10000 --tp-pct 0.005 --sl-pct 0.0025 --fee-pct 0.0008 --threshold 0.65
+python backtest.py --mode simple
 """
 
 from __future__ import annotations
@@ -37,42 +31,43 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-
-# optional scaler
+from utils import (
+    read_csv_concat_sorted, resolve_price_col, build_windows,
+    load_model_bundle, fmt_money, fmt_pct, DEFAULT_FEATURE_COLS
+)
+# Optional scaler
 try:
     import joblib
 except Exception:
     joblib = None
 
-# Our shared model helpers
+# --- import your project model ---
 try:
-    # Requires models.py with LSTMClassifier + ModelMeta in PYTHONPATH
-    from models import LSTMClassifier, ModelMeta  # type: ignore
+    from models import LSTMClassifier
 except Exception as e:
     raise SystemExit(
-        "Could not import LSTMClassifier/ModelMeta from models.py. "
-        "Make sure models.py is on PYTHONPATH.\n"
+        "Could not import LSTMClassifier from models.py. Ensure models.py is on PYTHONPATH.\n"
         f"Underlying error: {e}"
     )
 
 # ---------------------------
-# CSV header repair (for headerless files)
+# IO + CSV helpers
 # ---------------------------
+PRICE_CANDIDATES = ["close", "adj_close", "adj close", "close_price", "price", "last", "mid", "c"]
 
 DEFAULT_COLS_6 = ["timestamp", "open", "high", "low", "close", "volume"]
 DEFAULT_COLS_7 = ["timestamp", "open", "high", "low", "close", "volume", "trades"]
-PRICE_CANDIDATES = ["close", "adj_close", "adj close", "close_price", "price", "last", "mid", "c"]
 
 def _columns_look_headerless(cols: List[str]) -> bool:
     lowers = [str(c).strip().lower() for c in cols]
-    if any(k in lowers for k in ["open", "high", "low", "close", "volume", "timestamp", "time", "c", "o", "h", "l", "v"]):
+    if any(k in lowers for k in ["open","high","low","close","volume","timestamp","time","c","o","h","l","v"]):
         return False
     numeric_like = 0
     for c in cols:
         s = str(c).strip().replace(".", "", 1).replace("-", "", 1)
         if s.isdigit():
             numeric_like += 1
-    return numeric_like >= max(3, len(cols) // 2)
+    return numeric_like >= max(3, len(cols)//2)
 
 def _apply_default_headers(df: pd.DataFrame) -> pd.DataFrame:
     n = df.shape[1]
@@ -89,106 +84,21 @@ def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
         df = _apply_default_headers(df)
     return df
 
-def read_csv_concat_sorted(data_dir: str) -> pd.DataFrame:
-    """Read all CSVs (or a single file) and return one concatenated DataFrame with normalized headers."""
-    p = Path(data_dir)
-    files: List[str]
-    if p.is_dir():
-        files = sorted(glob.glob(str(p / "*.csv")))
-        if not files:
-            raise FileNotFoundError(f"No CSV files found in directory: {data_dir}")
-    else:
-        if p.suffix.lower() != ".csv":
-            raise ValueError(f"Expected .csv file or directory, got: {data_dir}")
-        files = [str(p)]
-    parts = []
-    for f in files:
-        df = pd.read_csv(f)
-        parts.append(_normalize_headers(df))
-    out = pd.concat(parts, ignore_index=True)
-    return out
-
-def resolve_price_col(columns: List[str], preferred: Optional[str]) -> Optional[str]:
-    lower_map = {str(c).lower(): c for c in columns}
-    if preferred:
-        if preferred in columns:
-            return preferred
-        if preferred.lower() in lower_map:
-            return lower_map[preferred.lower()]
-    for cand in PRICE_CANDIDATES:
-        if cand in lower_map:
-            return lower_map[cand]
-    return None
-
 # ---------------------------
-# Model loading
+# Model + meta loading
 # ---------------------------
 
-def load_model_bundle(model_dir: str):
-    """Load model_meta.json, weights, and scaler.joblib (optional)."""
+def load_meta(model_dir: str) -> Dict:
     meta_path = Path(model_dir) / "model_meta.json"
     if not meta_path.exists():
         raise FileNotFoundError(f"model_meta.json not found in {model_dir}")
     with open(meta_path, "r") as f:
-        meta = json.load(f)
-
-    model = LSTMClassifier(
-        input_size=int(meta["input_size"]),
-        hidden_size=int(meta["hidden_size"]),
-        num_layers=int(meta["num_layers"]),
-        dropout=float(meta.get("dropout", 0.0)),
-        bidirectional=bool(meta.get("bidirectional", False)),
-        num_classes=int(meta["num_classes"]),
-    )
-    weights_path = Path(model_dir) / meta.get("model_state_path", "model.pt")
-    if not weights_path.exists():
-        raise FileNotFoundError(f"Weights not found at {weights_path}")
-    state = torch.load(weights_path, map_location="cpu")
-    model.load_state_dict(state)
-
-    scaler = None
-    scaler_rel = meta.get("scaler_path")
-    if scaler_rel:
-        sp = Path(model_dir) / scaler_rel
-        if sp.exists() and joblib is not None:
-            scaler = joblib.load(sp)
-    return model.eval(), scaler, meta
-
-# ---------------------------
-# Window building (same as training)
-# ---------------------------
-
-def build_windows(features: np.ndarray, seq_len: int) -> np.ndarray:
-    N, F = features.shape
-    if N < seq_len:
-        return np.empty((0, seq_len, F), dtype=np.float32)
-    stride0, stride1 = features.strides
-    shape = (N - seq_len + 1, seq_len, F)
-    strides = (stride0, stride0, stride1)
-    return np.lib.stride_tricks.as_strided(features, shape=shape, strides=strides).copy()
+        return json.load(f)
 
 # ---------------------------
 # Pretty formatting
 # ---------------------------
-
-def _fmt_money(x, currency="$"):
-    if x is None or (isinstance(x, float) and not math.isfinite(x)):
-        return "—"
-    try:
-        x = float(x)
-    except Exception:
-        return str(x)
-    if abs(x) >= 1e12:
-        return f"{currency}{x:.3e}"
-    return f"{currency}{x:,.2f}"
-
-def _fmt_pct(x):
-    if x is None or (isinstance(x, float) and not math.isfinite(x)):
-        return "—"
-    try:
-        return f"{float(x)*100:.2f}%"
-    except Exception:
-        return str(x)
+import math as _math
 
 def print_portfolio_report(report: Dict, currency="$") -> None:
     m = (report or {}).get("metrics", {}) or {}
@@ -197,99 +107,147 @@ def print_portfolio_report(report: Dict, currency="$") -> None:
     start = p.get("start_capital", 0.0)
     end = p.get("end_equity", None)
     trades = int(p.get("trades", 0))
+    wins = int(p.get("wins", 0))
+    losses = int(p.get("losses", 0))
     mdd = p.get("max_drawdown", None)
-
-    multiple = None
     ret_frac = None
-    try:
-        if start not in (None, 0) and end is not None and math.isfinite(float(start)) and math.isfinite(float(end)):
-            multiple = float(end) / float(start)
-            ret_frac = multiple - 1.0
-    except Exception:
-        pass
+    multiple = None
+    if start not in (None, 0) and end is not None:
+        multiple = float(end) / float(start)
+        ret_frac = multiple - 1.0
 
     print("\n=== PORTFOLIO MODE — SUMMARY ===")
     print(f"Bars processed : {n:,}")
-    print(f"Trades         : {trades:,}")
-    print(f"Start capital  : {_fmt_money(start, currency)}")
-    print(f"End equity     : {_fmt_money(end, currency)}")
-    if multiple is not None and math.isfinite(multiple):
+    print(f"Trades         : {trades:,}  (wins {wins}, losses {losses}, win rate {wins/max(1,trades):.2%})")
+    print(f"Start capital  : {fmt_money(start, currency)}")
+    print(f"End equity     : {fmt_money(end, currency)}")
+    if multiple is not None and _math.isfinite(multiple):
         if multiple >= 1e6:
             print(f"Return         : ×{multiple:.3e}  (⚠️ extremely large; check return scaling)")
         else:
-            print(f"Return         : {_fmt_pct(ret_frac)}  (×{multiple:.2f})")
+            print(f"Return         : {fmt_pct(ret_frac)}  (×{multiple:.2f})")
     else:
         print("Return         : —")
     if mdd is not None:
-        print(f"Max drawdown   : {_fmt_pct(mdd)}")
+        print(f"Max drawdown   : {fmt_pct(mdd)}")
     print("")  # newline
 
 # ---------------------------
-# Backtest logic
+# Trade simulation with TP/SL (intra-bar)
 # ---------------------------
 
-def simulate_portfolio(close: np.ndarray,
-                      signals: np.ndarray,
-                      start_capital: float = 10_000.0,
-                      allow_shorts: bool = False,
-                      fee_bps: float = 1.0,
-                      slippage_bps: float = 1.0) -> Tuple[Dict, pd.DataFrame]:
+def simulate_trades_with_tp_sl(
+    opens: np.ndarray, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
+    probs: np.ndarray, *,
+    threshold: float,
+    start_capital: float,
+    fee_pct: float = 0.0008,
+    tp_pct: float = 0.005,
+    sl_pct: float = 0.0025,
+) -> Tuple[Dict, pd.DataFrame]:
     """
-    Vectorized equity simulation.
-    - signals in {-1, 0, +1}. If allow_shorts=False, negatives are clipped to 0.
-    - per-bar fractional return r_t = close[t+1]/close[t] - 1
-    - cost (bps) applied when position changes.
-
-    Safety guards to prevent absurd equity explosions:
-      * Clip per-bar |r_t| to 20% to guard against bad ticks.
-      * Bound signals to [-1, 1].
-      * Ensure multiplicative gross return never drops below epsilon.
+    One-position-at-a-time long strategy:
+      - Enter at bar close when prob >= threshold and not already in a trade.
+      - Set TP = entry * (1 + tp_pct), SL = entry * (1 - sl_pct).
+      - While in trade, check **intra-bar**: if high >= TP => exit at TP; elif low <= SL => exit at SL; else hold.
+      - Fees applied on both entry and exit.
     """
-    c = close.astype(float)
-    r = np.zeros_like(c, dtype=float)
-    r[:-1] = c[1:] / c[:-1] - 1.0
-    # Clip outliers to ±20% per bar (defensive; adjust if your data warrants)
-    np.clip(r, -0.2, 0.2, out=r)
+    n = len(closes)
+    cash = float(start_capital)
+    position = 0.0  # units of asset; here we simulate with notional equity (no partial fills needed)
+    entry_price = None
+    tp_price = None
+    sl_price = None
 
-    pos = signals.astype(float).copy()
-    if not allow_shorts:
-        pos = np.maximum(pos, 0.0)  # 0 or +1
-    pos = np.clip(pos, -1.0, 1.0)
+    equity_curve = np.empty(n, dtype=float)
+    equity_curve[0] = cash
+    in_trade = False
+    trades = 0
+    wins = 0
+    losses = 0
 
-    # Trades: position changes
-    pos_shift = np.roll(pos, 1)
-    pos_shift[0] = 0.0
-    changed = (pos != pos_shift).astype(float)
-    trades = int(changed.sum())
+    for i in range(1, n):
+        price_open = float(opens[i])
+        price_high = float(highs[i])
+        price_low  = float(lows[i])
+        price_close= float(closes[i])
 
-    # Transaction costs when changing position
-    cost_frac = (fee_bps + slippage_bps) / 1e4
-    costs = changed * cost_frac
+        if not in_trade:
+            # consider entry at close of bar i-1 -> we act on bar i opening range
+            if probs[i-1] >= threshold:
+                # enter at bar i open (more conservative than exact close fill)
+                entry = price_open
+                # pay entry fee
+                cash *= (1.0 - fee_pct)
+                entry_price = entry
+                tp_price = entry_price * (1.0 + tp_pct)
+                sl_price = entry_price * (1.0 - sl_pct)
+                in_trade = True
+                trades += 1
+                # equity stays as cash (no leverage). We mark-to-market by reference to price movement.
+        else:
+            # in trade: check intrabar SL/TP
+            exit_price = None
+            win = None
+            if price_low <= sl_price <= price_high:
+                # both TP and SL within range; assume worst (SL first) unless you prefer best; realistic is path-dependent
+                exit_price = sl_price
+                win = False
+            elif price_high >= tp_price:
+                exit_price = tp_price
+                win = True
+            elif price_low <= sl_price:
+                exit_price = sl_price
+                win = False
 
-    # Equity curve
-    equity = np.empty_like(r)
-    equity[0] = start_capital
-    for t in range(1, len(r)):
-        gross = 1.0 + pos[t-1] * r[t-1]           # use prior position over [t-1, t)
-        gross = max(gross, 1e-6)                  # never allow <= 0 multiplicative return
-        equity[t] = equity[t-1] * gross * (1.0 - costs[t])  # pay cost when we *enter* new pos at t
+            if exit_price is not None:
+                # realize PnL from entry -> exit (notional)
+                gross_ret = (exit_price / entry_price) - 1.0
+                cash *= (1.0 + gross_ret)
+                # pay exit fee
+                cash *= (1.0 - fee_pct)
+                in_trade = False
+                entry_price = tp_price = sl_price = None
+                if win:
+                    wins += 1
+                else:
+                    losses += 1
+            else:
+                # still in trade: mark-to-market on close
+                mtm = (price_close / entry_price) - 1.0
+                equity_curve[i] = cash * (1.0 + mtm)
+                continue
 
-    # Max drawdown (reported as positive fraction)
-    peaks = np.maximum.accumulate(equity)
-    dd = (equity - peaks) / peaks
+        equity_curve[i] = cash
+
+    # if still in trade at the end, close at last close with exit fee
+    if in_trade and entry_price is not None:
+        gross_ret = (closes[-1] / entry_price) - 1.0
+        cash *= (1.0 + gross_ret)
+        cash *= (1.0 - fee_pct)
+        # no win/loss counted; partial close at end
+
+    # Compute drawdown
+    peaks = np.maximum.accumulate(equity_curve)
+    dd = (equity_curve - peaks) / peaks
     max_dd = float(np.min(dd)) if len(dd) else 0.0
 
     report = {
-        "metrics": {"n": int(len(r))},
+        "metrics": {"n": int(n)},
         "portfolio": {
             "start_capital": float(start_capital),
-            "end_equity": float(equity[-1]),
-            "return": float(equity[-1] / max(1e-12, start_capital) - 1.0),
+            "end_equity": float(equity_curve[-1]),
+            "return": float(equity_curve[-1] / max(1e-12, start_capital) - 1.0),
             "max_drawdown": float(abs(max_dd)),
             "trades": int(trades),
+            "wins": int(wins),
+            "losses": int(losses),
         },
     }
-    df_curve = pd.DataFrame({"close": c, "equity": equity, "pos": pos})
+    df_curve = pd.DataFrame({
+        "open": opens, "high": highs, "low": lows, "close": closes,
+        "equity": equity_curve, "prob": probs
+    })
     return report, df_curve
 
 # ---------------------------
@@ -297,24 +255,20 @@ def simulate_portfolio(close: np.ndarray,
 # ---------------------------
 
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Unified backtester")
+    p = argparse.ArgumentParser(description="Backtester with TP/SL and probability threshold.")
     p.add_argument("--mode", choices=["simple", "portfolio"], default="portfolio")
-    p.add_argument("--data-dir", type=str, default="eth_1m_data", help="Dir or single CSV")
-    p.add_argument("--model-dir", type=str, default="model", help="Where model_meta.json & model.pt live")
-    p.add_argument("--seq-len", type=int, default=60, help="Sequence/window length used in training")
-    p.add_argument("--label-col", type=str, default="label", help="Optional label col (not required)")
-    p.add_argument("--price-col", type=str, default="close")
+    p.add_argument("--data-dir", type=str, default="eth_1m_data", help="Dir or a single CSV")
+    p.add_argument("--model-dir", type=str, default=".", help="Root where model_meta.json & model.pt live")
 
-    # portfolio-only options
-    p.add_argument("--capital", type=float, default=10_000.0)
-    p.add_argument("--allow-shorts", action="store_true")
-    p.add_argument("--fee-bps", type=float, default=1.0)
-    p.add_argument("--slippage-bps", type=float, default=1.0)
+    # overrides / knobs
+    p.add_argument("--threshold", type=float, default=None, help="Buy probability threshold (default from model_meta.json)")
+    p.add_argument("--tp-pct", type=float, default=None, help="Take-profit as fraction (0.005 = 0.5%)")
+    p.add_argument("--sl-pct", type=float, default=None, help="Stop-loss as fraction (0.0025 = 0.25%)")
+    p.add_argument("--fee-pct", type=float, default=None, help="Per-side fee fraction (0.0008 = 0.08%)")
+    p.add_argument("--capital", type=float, default=10_000.0, help="Starting capital for portfolio mode")
 
-    # decision threshold / mapping
-    p.add_argument("--long-class", type=int, default=2, help="Which class means LONG")
-    p.add_argument("--short-class", type=int, default=0, help="Which class means SHORT")
-
+    # performance
+    p.add_argument("--batch-size", type=int, default=2048, help="Prediction batch size")
     return p
 
 # ---------------------------
@@ -324,79 +278,81 @@ def build_argparser() -> argparse.ArgumentParser:
 def main():
     args = build_argparser().parse_args()
 
+    # Load model + meta
+    model, scaler, meta = load_model_bundle(args.model_dir)
+    feature_cols = list(meta.get("feature_cols", DEFAULT_FEATURE_COLS))
+    window_size = int(meta.get("window_size", 150))
+    buy_threshold = float(meta.get("buy_threshold", 0.60)) if args.threshold is None else float(args.threshold)
+    fee_pct = float(meta.get("tx_cost", 0.0008)) if args.fee_pct is None else float(args.fee_pct)
+    tp_pct = 0.005 if args.tp_pct is None else float(args.tp_pct)
+    sl_pct = 0.0025 if args.sl_pct is None else float(args.sl_pct)
+
     # Load data
     df = read_csv_concat_sorted(args.data_dir)
-    price_col = resolve_price_col(df.columns.tolist(), args.price_col)
+    price_col = resolve_price_col(df.columns.tolist(), meta.get("price_col", "close"))
     if price_col is None:
-        raise SystemExit(
-            f"Could not find a price column. Tried '{args.price_col}' and aliases {PRICE_CANDIDATES}. "
-            f"Available: {list(df.columns)}"
-        )
+        raise SystemExit(f"Could not locate a price column. Available: {list(df.columns)}")
 
-    # Features for inference: numeric columns except obvious non-features
-    drop_cols = {price_col, args.label_col, "timestamp", "time"}
-    feat_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in drop_cols]
+    # Build features
+    drop_cols = {price_col, "timestamp", "time"}
+    # keep numeric features that appear in feature_cols (order preserved)
+    feat_cols = [c for c in feature_cols if c in df.columns and c not in drop_cols]
+    if len(feat_cols) != len(feature_cols):
+        missing = [c for c in feature_cols if c not in feat_cols]
+        print(f"[WARN] Missing features in data (will drop): {missing}")
     if not feat_cols:
-        raise SystemExit("No numeric feature columns found for inference.")
-
+        raise SystemExit("No valid feature columns found in data for inference.")
     X_flat = df[feat_cols].to_numpy(dtype=np.float32)
-    X = build_windows(X_flat, args.seq_len)  # [N, T, F]
+
+    # Windows
+    X = build_windows(X_flat, window_size)
     if len(X) == 0:
-        raise SystemExit("Not enough rows to build any sequences. Increase data or reduce --seq-len.")
+        raise SystemExit("Not enough rows to build any sequences. Increase data or reduce window size.")
 
-    # Align price series to window end
-    close = df[price_col].to_numpy(dtype=float)[args.seq_len - 1:]
+    # Align OHLC arrays to window ends
+    opens = df["open"].to_numpy(dtype=float)[window_size - 1:]
+    highs = df["high"].to_numpy(dtype=float)[window_size - 1:]
+    lows  = df["low"].to_numpy(dtype=float)[window_size - 1:]
+    closes= df[price_col].to_numpy(dtype=float)[window_size - 1:]
 
-    # Load model & scaler
-    model, scaler, meta = load_model_bundle(args.model_dir)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
-
-    # Apply scaler if available
+    # Scale if scaler exists
     if scaler is not None:
         n, t, f = X.shape
-        X = scaler.transform(X.reshape(n * t, f)).reshape(n, t, f)
+        X = scaler.transform(X.reshape(n*t, f)).reshape(n, t, f)
 
-    # Predict
+    # Predict probabilities (class 1 = buy)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    probs = np.zeros(len(X), dtype=np.float32)
     with torch.no_grad():
-        logits = []
-        BS = 1024
+        BS = int(args.batch_size)
         for i in range(0, len(X), BS):
             xb = torch.from_numpy(X[i:i+BS]).to(device)
-            out = model(xb)  # [B, C]
-            logits.append(out.cpu())
-        logits = torch.cat(logits, dim=0)
-        probs = F.softmax(logits, dim=-1).numpy()
-        preds = probs.argmax(axis=-1)
+            logits = model(xb)  # [B, 2]
+            p = F.softmax(logits, dim=-1)[:, 1].cpu().numpy()
+            probs[i:i+BS] = p
 
     if args.mode == "simple":
-        # quick counts if you have labels
-        out = {"metrics": {"n": int(len(preds))}}
-        if args.label_col in df.columns:
-            y = df[args.label_col].to_numpy(dtype=int)[args.seq_len - 1:]
-            acc = float((y == preds).mean())
-            out["metrics"]["accuracy"] = acc
-        print(json.dumps(out, indent=2))
+        print(json.dumps({
+            "metrics": {"n": int(len(probs))},
+            "threshold": buy_threshold,
+            "mean_prob": float(probs.mean()),
+            "p90_prob": float(np.percentile(probs, 90)),
+        }, indent=2))
         return
 
-    # portfolio mode: map class -> position
-    signals = np.zeros_like(preds, dtype=int)
-    signals[preds == int(args.long_class)] = 1
-    signals[preds == int(args.short_class)] = -1
-
-    report, curve = simulate_portfolio(
-        close=close,
-        signals=signals,
+    # Portfolio simulation with TP/SL
+    report, curve = simulate_trades_with_tp_sl(
+        opens, highs, lows, closes, probs,
+        threshold=buy_threshold,
         start_capital=float(args.capital),
-        allow_shorts=bool(args.allow_shorts),
-        fee_bps=float(args.fee_bps),
-        slippage_bps=float(args.slippage_bps),
+        fee_pct=fee_pct,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
     )
 
-    # Pretty output ($ values)
     print_portfolio_report(report, currency="$")
-
-    # If you still want the raw JSON, uncomment:
+    # If you want raw JSON too, uncomment:
     # print("Raw JSON:\n" + json.dumps(report, indent=2))
 
 if __name__ == "__main__":

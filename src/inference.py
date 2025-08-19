@@ -1,239 +1,193 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Production-safe inference entrypoint that:
-  - Reads `model_meta.json`
-  - Builds the LSTM model dynamically from metadata
-  - Loads the correct weights and scaler artifacts
-  - Supports SageMaker (model_fn / input_fn / predict_fn / output_fn)
-  - Works locally via `python inference.py --input path/to.json`
+inference.py — SageMaker-compatible inference script.
 
-Expected input JSON (examples):
-
-1) Batch of sequences (recommended)
-{
-  "features": [[[... F features ...], ... T timesteps ...], ... B batch ...]
-}
-
-2) Single sequence
-{
-  "features": [[... F features ...], ... T timesteps ...]
-}
-
-Output:
-{
-  "logits": [[... C ...], ... B ...],
-  "probs":  [[... C ...], ... B ...],
-  "preds":  [class_index, ... B ...]
-}
-
-If you use thresholds/decision rules post-probabilities, apply them in your caller
-or extend `postprocess()` below to add your strategy.
+Loads model_meta.json, model.pt, scaler.joblib from model_dir,
+accepts JSON or CSV, builds windows, returns probabilities for class=1 (buy).
 """
 
 from __future__ import annotations
 
-import argparse
 import io
 import json
 import os
-from typing import Any, Dict, Tuple, Union, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from models import (
-    build_model_from_meta,
-    load_meta,
-    load_model_state,
-    load_scaler,
-    resolve_path,
-)
+# Optional deps
+try:
+    import pandas as pd
+except Exception:
+    pd = None
 
-# ----------------------------
-# Core load
-# ----------------------------
+try:
+    import joblib
+except Exception:
+    joblib = None
 
-def _detect_model_dir(env: Dict[str, str]) -> str:
-    """
-    For SageMaker, SM_MODEL_DIR points to the model artifact directory.
-    Locally, default to current working directory.
-    """
-    return env.get("SM_MODEL_DIR") or os.getcwd()
+# Project utils/models
+from utils import load_meta, build_windows, DEFAULT_FEATURE_COLS
+from models import LSTMClassifier
 
 
-def _get_paths(model_dir: str) -> Tuple[str, str, Union[str, None]]:
-    """
-    Returns (meta_path, weights_path, scaler_path)
-    """
-    meta_path = os.path.join(model_dir, "model_meta.json")
-    if not os.path.exists(meta_path):
-        raise FileNotFoundError(
-            f"model_meta.json not found in: {model_dir}. "
-            "Ensure training exported metadata alongside weights."
-        )
-
-    meta = load_meta(meta_path)
-    weights_path = resolve_path(model_dir, meta.model_state_path)
-    scaler_path = resolve_path(model_dir, meta.scaler_path) if meta.feature_scaling else None
-
-    if not os.path.exists(weights_path):
-        # Backward-compat: check common alternatives
-        alt_candidates = ["model.pt", "best_model.pth", "weights.pt"]
-        for cand in alt_candidates:
-            alt = os.path.join(model_dir, cand)
-            if os.path.exists(alt):
-                weights_path = alt
-                break
-
-    if not os.path.exists(weights_path):
-        raise FileNotFoundError(
-            f"Model weights not found. Tried: {weights_path}. "
-            "Check model_meta.json->model_state_path or export path."
-        )
-
-    return meta_path, weights_path, scaler_path
-
+# ---------- SageMaker entrypoints ----------
 
 def model_fn(model_dir: str):
     """
-    SageMaker entrypoint: load model + scaler from artifacts dir.
+    Load artifacts from model_dir.
+    Returns a tuple (model.eval(), scaler_or_None, meta_dict).
     """
-    meta_path, weights_path, scaler_path = _get_paths(model_dir)
-    meta = load_meta(meta_path)
+    meta = load_meta(model_dir)
+    feature_cols: List[str] = list(meta.get("feature_cols", DEFAULT_FEATURE_COLS))
+    hidden_size = int(meta.get("hidden_size", 512))
+    num_layers = int(meta.get("num_layers", 3))
+    dropout = float(meta.get("dropout", 0.3))
+    bidirectional = bool(meta.get("bidirectional", True))
+    num_classes = int(meta.get("num_classes", 2))
 
-    model = build_model_from_meta(meta)
-    load_model_state(model, weights_path, strict=False)
+    model = LSTMClassifier(
+        input_size=len(feature_cols),
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        bidirectional=bidirectional,
+        num_classes=num_classes,
+    )
+
+    weights_path = os.path.join(model_dir, meta.get("model_state_path", "model.pt"))
+    state = torch.load(weights_path, map_location="cpu")
+    model.load_state_dict(state)
     model.eval()
 
-    scaler = load_scaler(scaler_path)
+    scaler = None
+    spath = meta.get("scaler_path", "scaler.joblib")
+    if spath and joblib is not None:
+        sfile = os.path.join(model_dir, spath)
+        if os.path.exists(sfile):
+            scaler = joblib.load(sfile)
+
+    return (model, scaler, meta)
+
+
+def _json_to_matrix(payload: Dict[str, Any], feature_cols: List[str]) -> np.ndarray:
+    """
+    Accept either:
+      {"rows":[{feature:value,...}, ...]}
+      {"instances":[[f1,f2,...], ...]}
+    Returns np.ndarray [N, F] ordered by feature_cols.
+    """
+    if "rows" in payload and isinstance(payload["rows"], list):
+        rows = payload["rows"]
+        if not rows:
+            return np.zeros((0, len(feature_cols)), dtype=np.float32)
+        out = []
+        for r in rows:
+            out.append([float(r[c]) for c in feature_cols])
+        return np.array(out, dtype=np.float32)
+
+    if "instances" in payload and isinstance(payload["instances"], list):
+        arr = np.array(payload["instances"], dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError("'instances' must be 2D: [N, F]")
+        if arr.shape[1] != len(feature_cols):
+            raise ValueError(f"instances columns ({arr.shape[1]}) != required features ({len(feature_cols)})")
+        return arr
+
+    raise ValueError("JSON must contain 'rows' (list of dicts) or 'instances' (2D list).")
+
+
+def _csv_to_matrix(body: str, feature_cols: List[str]) -> np.ndarray:
+    """
+    CSV with header including feature columns; extra columns ignored but must contain at least all needed features.
+    """
+    if pd is None:
+        raise RuntimeError("pandas is required for CSV input. Install pandas or send JSON instead.")
+    df = pd.read_csv(io.StringIO(body))
+    missing = [c for c in feature_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV is missing required features: {missing}")
+    X = df[feature_cols].to_numpy(dtype=np.float32, copy=False)
+    return X
+
+
+def input_fn(request_body: str, content_type: str):
+    """
+    Parse incoming request to a flat features matrix [N, F].
+    """
+    # We'll also pass-through meta in the input object for convenience
+    # (SageMaker calls predict_fn(model, input_object)).
+    if not request_body:
+        raise ValueError("Empty request body.")
+
+    # Model/feature info will be retrieved inside predict_fn; keep only raw X here
+    content_type = (content_type or "application/json").lower().strip()
+    input_obj: Dict[str, Any] = {"flat": None, "content_type": content_type}
+
+    # Optional: allow clients to pass feature order explicitly
+    # Otherwise we rely on model_meta.json feature_cols.
+    if content_type == "application/json":
+        payload = json.loads(request_body)
+        input_obj["payload"] = payload  # we will process with meta later
+        return input_obj
+
+    if content_type in ("text/csv", "application/csv"):
+        input_obj["csv"] = request_body
+        return input_obj
+
+    raise ValueError(f"Unsupported content type: {content_type}")
+
+
+def predict_fn(input_object: Dict[str, Any], model_bundle):
+    """
+    Build windows and predict class-1 probabilities.
+    Output dict includes probs and hard labels using buy_threshold from meta.
+    """
+    model, scaler, meta = model_bundle
+    feature_cols: List[str] = list(meta.get("feature_cols", DEFAULT_FEATURE_COLS))
+    window_size = int(meta.get("window_size", 150))
+    threshold = float(meta.get("buy_threshold", 0.60))
+
+    # Parse input into flat matrix [N,F]
+    if "payload" in input_object:
+        X_flat = _json_to_matrix(input_object["payload"], feature_cols)
+    elif "csv" in input_object:
+        X_flat = _csv_to_matrix(input_object["csv"], feature_cols)
+    else:
+        raise ValueError("Missing payload.")
+
+    if X_flat.shape[0] < window_size:
+        # Not enough rows to form a single window
+        return {"probs": [], "labels": [], "threshold": threshold}
+
+    # Build windows and scale
+    X = build_windows(X_flat, window_size)  # [W, T, F]
+    if scaler is not None:
+        W, T, F = X.shape
+        X = scaler.transform(X.reshape(W * T, F)).reshape(W, T, F)
+
+    # Predict
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
-
-    return {
-        "model": model,
-        "scaler": scaler,
-        "device": device,
-        "meta": meta.to_dict(),
-    }
-
-
-# ----------------------------
-# Input / preprocessing
-# ----------------------------
-
-def _ensure_batch(features: Union[List, np.ndarray]) -> np.ndarray:
-    """
-    Converts features to shape [B, T, F]. Adds batch dim if needed.
-    """
-    arr = np.array(features, dtype=np.float32)
-    if arr.ndim == 2:
-        # [T, F] -> [1, T, F]
-        arr = arr[None, ...]
-    if arr.ndim != 3:
-        raise ValueError(f"Expected 2D or 3D array for features, got shape {arr.shape}")
-    return arr
-
-
-def _apply_scaler_if_any(arr_btf: np.ndarray, scaler) -> np.ndarray:
-    """
-    If scaler is provided (sklearn StandardScaler/MinMax/etc.), apply it across
-    the feature dimension. We reshape to [B*T, F], transform, then reshape back.
-    """
-    if scaler is None:
-        return arr_btf
-
-    b, t, f = arr_btf.shape
-    flat = arr_btf.reshape(b * t, f)
-    flat_scaled = scaler.transform(flat)
-    return flat_scaled.reshape(b, t, f)
-
-
-def input_fn(serialized_input_data: Union[str, bytes], content_type: str = "application/json"):
-    """
-    SageMaker input deserialization.
-    """
-    if "json" not in content_type:
-        raise ValueError(f"Unsupported content_type: {content_type}")
-
-    if isinstance(serialized_input_data, (bytes, bytearray)):
-        serialized_input_data = serialized_input_data.decode("utf-8")
-
-    payload = json.loads(serialized_input_data)
-    if "features" not in payload:
-        raise KeyError("Input JSON must contain a 'features' field.")
-
-    return payload
-
-
-def _to_tensor(batch_btf: np.ndarray, device: str) -> torch.Tensor:
-    return torch.from_numpy(batch_btf).to(device)
-
-
-# ----------------------------
-# Predict / postprocess
-# ----------------------------
-
-def predict_fn(payload: Dict[str, Any], model_artifacts: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    SageMaker predict.
-    """
-    model = model_artifacts["model"]
-    scaler = model_artifacts["scaler"]
-    device = model_artifacts["device"]
-    meta = model_artifacts["meta"]
-
-    arr_btf = _ensure_batch(payload["features"])
-    arr_btf = _apply_scaler_if_any(arr_btf, scaler)
-
-    x = _to_tensor(arr_btf, device)
+    model = model.to(device)
     with torch.no_grad():
-        logits = model(x)  # [B, C]
-        probs = F.softmax(logits, dim=-1)  # [B, C]
-        preds = probs.argmax(dim=-1)       # [B]
+        xb = torch.from_numpy(X).to(device)
+        logits = model(xb)  # [W, 2]
+        probs = F.softmax(logits, dim=-1)[:, 1].detach().cpu().numpy()
 
-    return {
-        "logits": logits.cpu().numpy().tolist(),
-        "probs": probs.cpu().numpy().tolist(),
-        "preds": preds.cpu().numpy().tolist(),
-        "meta": meta,
-    }
+    labels = (probs >= threshold).astype(int).tolist()
+    return {"probs": probs.tolist(), "labels": labels, "threshold": threshold}
 
 
 def output_fn(prediction: Dict[str, Any], accept: str = "application/json"):
     """
-    SageMaker output serialization.
+    Format the response.
     """
-    if "json" not in accept:
-        raise ValueError(f"Unsupported accept: {accept}")
-    return json.dumps(prediction)
-
-
-# ----------------------------
-# Local CLI
-# ----------------------------
-
-def _local_load() -> Dict[str, Any]:
-    """
-    Load model artifacts for local runs (no SageMaker).
-    """
-    model_dir = _detect_model_dir(os.environ)
-    return model_fn(model_dir)
-
-
-def _cli() -> None:
-    parser = argparse.ArgumentParser(description="Local inference runner")
-    parser.add_argument("--input", type=str, required=True, help="Path to JSON input with 'features'")
-    parser.add_argument("--accept", type=str, default="application/json")
-    args = parser.parse_args()
-
-    with open(args.input, "r") as f:
-        payload = json.load(f)
-
-    artifacts = _local_load()
-    result = predict_fn(payload, artifacts)
-    out = output_fn(result, accept=args.accept)
-    print(out)
-
-
-if __name__ == "__main__":
-    _cli()
+    accept = (accept or "application/json").lower().strip()
+    body = json.dumps(prediction)
+    if accept in ("application/json", "text/json"):
+        return body, accept
+    # Fallback to JSON
+    return body, "application/json"
