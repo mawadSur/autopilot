@@ -1,298 +1,317 @@
-# utils.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+utils.py — shared helpers for data IO, feature/window building, model/meta loading, and formatting.
+
+Centralizes functionality used by:
+- aws_train_model.py
+- backtest.py
+- paper_trade.py
+- inference.py
+- live_trader.py (if needed)
+
+This keeps the codebase consistent and avoids duplication errors.
+"""
+
 from __future__ import annotations
 
+import glob
 import json
+import math
 import os
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Generator, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import torch
+
+# Optional scaler persistence
+try:
+    import joblib
+except Exception:
+    joblib = None
+
+# Optional dotenv
+try:
+    from dotenv import load_dotenv as _load_dotenv
+except Exception:
+    def _load_dotenv(*_args, **_kwargs):
+        return False
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Defaults that are safe across train/backtest/inference
-# ────────────────────────────────────────────────────────────────────────────────
-DEFAULT_FEATURE_COLS: List[str] = [
-    "open", "high", "low", "close", "body", "range", "upper_wick", "lower_wick",
-    "return", "sma_ratio", "ema_20", "macd", "rsi_14", "vol_change", "atr",
-    "price_vs_hourly_trend", "bb_width",
+# ---------------------------
+# Defaults shared across scripts
+# ---------------------------
+
+DEFAULT_FEATURE_COLS = [
+    "open", "high", "low", "close",
+    "body", "range", "upper_wick", "lower_wick",
+    "return", "sma_ratio", "ema_20", "macd", "rsi_14",
+    "vol_change", "atr", "price_vs_hourly_trend", "bb_width",
 ]
-DEFAULT_WINDOW_SIZE: int = 150
+
+PRICE_CANDIDATES = ["close", "adj_close", "adj close", "close_price", "price", "last", "mid", "c"]
+
+DEFAULT_COLS_6 = ["timestamp", "open", "high", "low", "close", "volume"]
+DEFAULT_COLS_7 = ["timestamp", "open", "high", "low", "close", "volume", "trades"]
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Dataclass used by backtesting & training
-# ────────────────────────────────────────────────────────────────────────────────
-@dataclass(frozen=True)
-class FeatureSpec:
-    feature_cols: List[str]
-    window_size: int = DEFAULT_WINDOW_SIZE
-    buy_threshold: float = 0.5
-    sell_threshold: float = 0.5
-    label_def: str = "next_bar_up"
-    scaler_type: str = "standard"
+# ---------------------------
+# Env / seed utilities
+# ---------------------------
 
-    @staticmethod
-    def from_meta(meta: Dict[str, Any]) -> "FeatureSpec":
-        # accept either "feature_cols" or legacy "features"
-        feature_cols = meta.get("feature_cols", meta.get("features", DEFAULT_FEATURE_COLS))
-        if not isinstance(feature_cols, list) or not all(isinstance(x, str) for x in feature_cols):
-            feature_cols = DEFAULT_FEATURE_COLS
-
-        return FeatureSpec(
-            feature_cols=list(feature_cols),
-            window_size=int(meta.get("window_size", DEFAULT_WINDOW_SIZE)),
-            buy_threshold=float(meta.get("buy_threshold", 0.5)),
-            sell_threshold=float(meta.get("sell_threshold", 0.5)),
-            label_def=str(meta.get("label_def", "next_bar_up")),
-            scaler_type=str(meta.get("scaler_type", "standard")),
-        )
-
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Meta helpers
-# ────────────────────────────────────────────────────────────────────────────────
-def _resolve_meta_path(explicit: Optional[str] = None) -> Optional[Path]:
-    """
-    Resolve a model_meta.json location with the following preference:
-      1) explicit path argument
-      2) env MODEL_META_PATH
-      3) ./model_meta.json (cwd)
-      4) $SM_MODEL_DIR/model_meta.json (SageMaker)
-    """
-    candidates: List[Optional[str]] = [
-        explicit,
-        os.getenv("MODEL_META_PATH"),
-        os.path.join(os.getcwd(), "model_meta.json"),
-        os.path.join(os.getenv("SM_MODEL_DIR", "/opt/ml/model"), "model_meta.json"),
-    ]
-    for c in [Path(p) for p in candidates if p]:
-        if c.exists():
-            return c
-    return None
-
-
-def load_meta(path: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Load model_meta.json (tolerant to missing keys) and return a dict.
-    Always includes 'feature_cols' and 'window_size' at minimum.
-    """
-    meta_path = _resolve_meta_path(path)
-    base: Dict[str, Any] = {
-        "feature_cols": DEFAULT_FEATURE_COLS.copy(),
-        "window_size": DEFAULT_WINDOW_SIZE,
-        "buy_threshold": 0.5,
-        "sell_threshold": 0.5,
-        "label_def": "next_bar_up",
-        "scaler_type": "standard",
-    }
-
-    if meta_path is None:
-        return base
-
+def load_dotenv() -> None:
+    """Load environment variables from a local .env if present."""
     try:
-        with meta_path.open("r", encoding="utf-8") as f:
-            raw = json.load(f) or {}
-        if not isinstance(raw, dict):
-            return base
-
-        # Normalize keys and merge
-        if "feature_cols" not in raw and "features" in raw:
-            raw["feature_cols"] = raw["features"]
-
-        out = {**base, **raw}
-
-        # Coerce types
-        if not isinstance(out.get("feature_cols"), list) or not all(
-            isinstance(x, str) for x in out["feature_cols"]
-        ):
-            out["feature_cols"] = DEFAULT_FEATURE_COLS.copy()
-        out["window_size"] = int(out.get("window_size", DEFAULT_WINDOW_SIZE))
-        out["buy_threshold"] = float(out.get("buy_threshold", 0.5))
-        out["sell_threshold"] = float(out.get("sell_threshold", 0.5))
-        out["label_def"] = str(out.get("label_def", "next_bar_up"))
-        out["scaler_type"] = str(out.get("scaler_type", "standard"))
-        return out
-    except Exception:
-        # On any error, fall back to safe defaults
-        return base
-
-
-def load_feature_spec(path: Optional[str] = None) -> FeatureSpec:
-    """Convenience: directly get a FeatureSpec from model_meta.json."""
-    return FeatureSpec.from_meta(load_meta(path))
-
-
-# ────────────────────────────────────────────────────────────────────────────────
-# CSV / OHLCV loading (robust) + chunk iterator expected by backtests
-# ────────────────────────────────────────────────────────────────────────────────
-def _norm(s: str) -> str:
-    return str(s).strip().lower()
-
-_BINANCE_12 = {0: "ts", 1: "open", 2: "high", 3: "low", 4: "close", 5: "volume"}
-
-def _map_ohlcv_columns(df: pd.DataFrame, path: str) -> pd.DataFrame:
-    cols = list(df.columns)
-    norm = [_norm(c) for c in cols]
-    out = df.copy()
-
-    if {"open", "high", "low", "close", "volume"}.issubset(set(norm)):
-        rename = {}
-        for c in cols:
-            n = _norm(c)
-            if n in {"open", "high", "low", "close", "volume"}:
-                rename[c] = n
-            elif n in {"date", "time", "timestamp"}:
-                rename[c] = "ts"
-        out = out.rename(columns=rename)
-    else:
-        if len(cols) >= 6:
-            rename = {c: _BINANCE_12.get(i, f"c{i}") for i, c in enumerate(cols)}
-            out = out.rename(columns=rename)
-        else:
-            raise ValueError(f"Unrecognized CSV schema: {path}")
-
-    if "ts" in out.columns:
-        out["ts"] = pd.to_datetime(out["ts"], unit="ms", errors="coerce").fillna(method="ffill")
-    else:
-        out["ts"] = pd.date_range(start=pd.Timestamp.utcnow(), periods=len(out), freq="min")
-
-    out = out.dropna(subset=["ts", "open", "high", "low", "close", "volume"]).set_index("ts").sort_index()
-    return out[["open", "high", "low", "close", "volume"]]
-
-def _read_csv_robust(path: str) -> pd.DataFrame:
-    # Try headered
-    try:
-        df = pd.read_csv(path)
-        if all(str(c).replace(".", "", 1).isdigit() for c in df.columns):
-            raise ValueError("numeric headers -> headerless")
-        return _map_ohlcv_columns(df, path)
+        _load_dotenv()
     except Exception:
         pass
-    # Headerless
-    probe = pd.read_csv(path, header=None, nrows=1)
-    n = probe.shape[1]
-    if n >= 6:
-        df = pd.read_csv(path, header=None)
-        df.columns = list(range(n))
-        return _map_ohlcv_columns(df, path)
-    raise ValueError(f"Could not parse CSV: {path}")
 
-def load_ohlc_chunks(path_or_glob: str, *, recursive: bool = True) -> Iterator[Tuple[str, pd.DataFrame]]:
-    """
-    Yield (key, df) for each CSV under the given file/dir/glob.
-    - key: a short identifier (filename without extension)
-    - df : DataFrame indexed by datetime with columns open/high/low/close/volume
-    """
-    import glob as _glob
-    p = Path(path_or_glob)
-    files: List[str] = []
+def set_seed(seed: int) -> None:
+    """Reproducible seeding for numpy/torch."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    if p.exists():
-        if p.is_dir():
-            pattern = str(p / ("**/*.csv" if recursive else "*.csv"))
-            files = sorted(_glob.glob(pattern, recursive=recursive))
-        else:
-            files = [str(p)]
+def get_device_str() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ---------------------------
+# CSV header repair & loading
+# ---------------------------
+
+def _columns_look_headerless(cols: List[str]) -> bool:
+    lowers = [str(c).strip().lower() for c in cols]
+    if any(k in lowers for k in ["open", "high", "low", "close", "volume", "timestamp", "time", "c", "o", "h", "l", "v"]):
+        return False
+    numeric_like = 0
+    for c in cols:
+        s = str(c).strip().replace(".", "", 1).replace("-", "", 1)
+        if s.isdigit():
+            numeric_like += 1
+    return numeric_like >= max(3, len(cols) // 2)
+
+def _apply_default_headers(df: pd.DataFrame) -> pd.DataFrame:
+    n = df.shape[1]
+    if n == 6:
+        df.columns = DEFAULT_COLS_6
+    elif n == 7:
+        df.columns = DEFAULT_COLS_7
     else:
-        files = sorted(_glob.glob(path_or_glob, recursive=True))
+        df.columns = [f"col{i}" for i in range(n)]
+    return df
 
+def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """Fix headerless CSVs by assigning default OHLCV columns when needed."""
+    if _columns_look_headerless(list(df.columns)):
+        df = _apply_default_headers(df)
+    return df
+
+def list_csvs_sorted(path: str) -> List[str]:
+    """Return sorted list of CSVs if directory, else a single CSV path."""
+    if os.path.isdir(path):
+        files = sorted(glob.glob(os.path.join(path, "*.csv")))
+        if not files:
+            raise FileNotFoundError(f"No CSV files found in directory: {path}")
+        return files
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    if os.path.splitext(path)[1].lower() != ".csv":
+        raise ValueError(f"Only .csv supported; got {path}")
+    return [path]
+
+def iter_csv_chunks_with_fix(path: str, chunksize: int) -> Generator[pd.DataFrame, None, None]:
+    """Yield normalized CSV chunks for very large files."""
+    for chunk in pd.read_csv(path, chunksize=chunksize):
+        yield normalize_headers(chunk)
+
+def read_csv_concat_sorted(data_dir: str) -> pd.DataFrame:
+    """Read all CSVs (or one CSV) and return a single concatenated, normalized DataFrame."""
+    p = Path(data_dir)
+    files: List[str]
+    if p.is_dir():
+        files = sorted(glob.glob(str(p / "*.csv")))
+        if not files:
+            raise FileNotFoundError(f"No CSV files found in directory: {data_dir}")
+    else:
+        if p.suffix.lower() != ".csv":
+            raise ValueError(f"Expected a .csv file or directory, got: {data_dir}")
+        files = [str(p)]
+    parts = []
     for f in files:
-        key = Path(f).stem
-        df = _read_csv_robust(f)
-        yield key, df
+        parts.append(normalize_headers(pd.read_csv(f)))
+    return pd.concat(parts, ignore_index=True)
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Feature engineering shared by train/backtest/inference
-# ────────────────────────────────────────────────────────────────────────────────
-def _ema(a: pd.Series, span: int) -> pd.Series:
-    return a.ewm(span=span, adjust=False).mean()
+# ---------------------------
+# Feature / price helpers
+# ---------------------------
 
-def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    gain = up.rolling(window=period, min_periods=period).mean()
-    loss = down.rolling(window=period, min_periods=period).mean()
-    rs = gain / (loss + 1e-12)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50.0)
+def resolve_price_col(columns: List[str], preferred: Optional[str]) -> Optional[str]:
+    lower_map = {str(c).lower(): c for c in columns}
+    if preferred:
+        if preferred in columns:
+            return preferred
+        if preferred.lower() in lower_map:
+            return lower_map[preferred.lower()]
+    for cand in PRICE_CANDIDATES:
+        if cand in lower_map:
+            return lower_map[cand]
+    return None
 
-def build_features(df: pd.DataFrame, compat_inf_to_zero: bool = False) -> pd.DataFrame:
+def infer_feature_cols(sample_df: pd.DataFrame, feature_cols: Optional[List[str]], label_col: Optional[str], price_col: Optional[str]) -> List[str]:
+    """Infer numeric feature columns if not explicitly provided."""
+    if feature_cols:
+        return list(feature_cols)
+    drop = {c for c in [label_col, price_col, "timestamp", "time"] if c is not None}
+    numeric = sample_df.select_dtypes(include=[np.number]).columns.tolist()
+    feats = [c for c in numeric if c not in drop]
+    if not feats:
+        raise ValueError("Could not infer numeric feature columns from the sample.")
+    return feats
+
+
+# ---------------------------
+# Windows
+# ---------------------------
+
+def build_windows_from_flat(features: np.ndarray, seq_len: int) -> np.ndarray:
+    """Create overlapping [N-seq_len+1, seq_len, F] windows from [N, F] flat features."""
+    N, F = features.shape
+    if N < seq_len:
+        return np.empty((0, seq_len, F), dtype=np.float32)
+    stride0, stride1 = features.strides
+    shape = (N - seq_len + 1, seq_len, F)
+    strides = (stride0, stride0, stride1)
+    return np.lib.stride_tricks.as_strided(features, shape=shape, strides=strides).copy()
+
+def build_windows(features: np.ndarray, seq_len: int) -> np.ndarray:
+    """Alias used by some scripts."""
+    return build_windows_from_flat(features, seq_len)
+
+
+# ---------------------------
+# Formatting helpers
+# ---------------------------
+
+def fmt_money(x, currency="$") -> str:
+    """Format a number as money."""
+    if x is None or (isinstance(x, float) and not math.isfinite(x)):
+        return "—"
+    try:
+        x = float(x)
+    except Exception:
+        return str(x)
+    if abs(x) >= 1e12:
+        return f"{currency}{x:.3e}"
+    return f"{currency}{x:,.2f}"
+
+def fmt_pct(x) -> str:
+    """Format a fraction as percent with two decimals."""
+    if x is None or (isinstance(x, float) and not math.isfinite(x)):
+        return "—"
+    try:
+        return f"{float(x)*100:.2f}%"
+    except Exception:
+        return str(x)
+
+
+# ---------------------------
+# Meta / model loading
+# ---------------------------
+
+def load_meta(model_dir_or_path: str) -> Dict:
     """
-    Expect df columns: ['open','high','low','close','volume'] at minimum.
-    Produces a superset that includes DEFAULT_FEATURE_COLS.
+    Load model_meta.json from either a directory or a direct file path.
     """
-    required = {"open", "high", "low", "close", "volume"}
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"build_features expected columns {sorted(required)}, missing {missing}")
+    p = Path(model_dir_or_path)
+    meta_path = p if p.is_file() else (p / "model_meta.json")
+    if not meta_path.exists():
+        raise FileNotFoundError(f"model_meta.json not found at {meta_path}")
+    with open(meta_path, "r") as f:
+        return json.load(f)
 
-    out = df.copy().sort_index()
-
-    # Candle anatomy
-    out["body"] = out["close"] - out["open"]
-    out["range"] = out["high"] - out["low"]
-    out["upper_wick"] = out["high"] - out[["open", "close"]].max(axis=1)
-    out["lower_wick"] = out[["open", "close"]].min(axis=1) - out["low"]
-    out["return"] = out["close"].pct_change().fillna(0.0)
-
-    # Trend & momentum
-    sma20 = out["close"].rolling(20, min_periods=1).mean()
-    out["sma_ratio"] = (out["close"] / (sma20 + 1e-12)).astype(np.float32)
-    out["ema_20"] = _ema(out["close"], 20)
-
-    ema12 = _ema(out["close"], 12)
-    ema26 = _ema(out["close"], 26)
-    out["macd"] = ema12 - ema26
-
-    out["rsi_14"] = _rsi(out["close"], 14)
-
-    # Volatility / volume
-    out["vol_change"] = (
-        out["volume"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
-    )
-    prev_close = out["close"].shift(1)
-    tr = pd.concat(
-        [
-            (out["high"] - out["low"]),
-            (out["high"] - prev_close).abs(),
-            (out["low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    out["atr"] = tr.rolling(14, min_periods=1).mean()
-
-    hourly = out["close"].rolling(60, min_periods=1).mean()
-    out["price_vs_hourly_trend"] = out["close"] / (hourly + 1e-12)
-
-    std20 = out["close"].rolling(20, min_periods=1).std()
-    upper = sma20 + 2 * std20
-    lower = sma20 - 2 * std20
-    out["bb_width"] = (upper - lower) / (sma20 + 1e-12)
-
-    if compat_inf_to_zero:
-        out = out.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-
-    # Ensure numeric dtype
-    for c in out.columns:
-        if c not in ("open", "high", "low", "close", "volume"):
-            out[c] = out[c].astype("float32", copy=False)
-    return out
-
-
-def find_eth_1m_data() -> str:
+def load_model_bundle(model_dir: str):
     """
-    Return the eth_1m_data directory that sits one level above /src.
-    Only this path is considered.
+    Returns (model.eval(), scaler_or_None, meta_dict).
+    Requires a models.py with LSTMClassifier in the Python path.
     """
-    p = Path(__file__).resolve().parent.parent / "eth_1m_data"
-    if not p.exists() or not p.is_dir():
-        raise FileNotFoundError(
-            f"Expected ETH 1m data directory at: {p}\n"
-            "Please ensure the folder exists or pass --data explicitly."
+    # Late import avoids circular imports when used inside SageMaker
+    try:
+        from models import LSTMClassifier
+    except Exception as e:
+        raise SystemExit(
+            "Could not import LSTMClassifier from models.py. Ensure models.py is on PYTHONPATH.\n"
+            f"Underlying error: {e}"
         )
-    return str(p)
+
+    meta = load_meta(model_dir)
+    feature_cols = list(meta.get("feature_cols", DEFAULT_FEATURE_COLS))
+    window_size = int(meta.get("window_size", 150))
+    hidden_size = int(meta.get("hidden_size", 512))
+    num_layers = int(meta.get("num_layers", 3))
+    dropout = float(meta.get("dropout", 0.3))
+    bidirectional = bool(meta.get("bidirectional", True))
+    num_classes = int(meta.get("num_classes", 2))
+
+    model = LSTMClassifier(
+        input_size=len(feature_cols),
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        bidirectional=bidirectional,
+        num_classes=num_classes,
+    )
+
+    weights_path = Path(model_dir) / meta.get("model_state_path", "model.pt")
+    if not weights_path.exists():
+        raise FileNotFoundError(f"Weights not found: {weights_path}")
+    state = torch.load(weights_path, map_location="cpu")
+    model.load_state_dict(state)
+
+    scaler = None
+    spath = meta.get("scaler_path", "scaler.joblib")
+    if spath and joblib is not None:
+        sp = Path(model_dir) / spath
+        if sp.exists():
+            scaler = joblib.load(sp)
+
+    return model.eval(), scaler, meta
+
+
+# ---------------------------
+# Simple binary label helper (optional)
+# ---------------------------
+
+def binary_label_next_bar_up(closes: np.ndarray) -> np.ndarray:
+    """
+    y[i] = 1 if close[i] > close[i-1], else 0. First element is 0 by construction.
+    """
+    y = np.zeros_like(closes, dtype=np.int64)
+    y[1:] = (closes[1:] > closes[:-1]).astype(np.int64)
+    return y
+
+
+__all__ = [
+    # defaults
+    "DEFAULT_FEATURE_COLS", "PRICE_CANDIDATES",
+    # env / device / seed
+    "load_dotenv", "set_seed", "get_device_str",
+    # csv utils
+    "normalize_headers", "list_csvs_sorted", "iter_csv_chunks_with_fix", "read_csv_concat_sorted",
+    # feature / price
+    "resolve_price_col", "infer_feature_cols",
+    # windows
+    "build_windows_from_flat", "build_windows",
+    # formatting
+    "fmt_money", "fmt_pct",
+    # meta/model
+    "load_meta", "load_model_bundle",
+    # labels
+    "binary_label_next_bar_up",
+]

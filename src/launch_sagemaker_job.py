@@ -1,294 +1,268 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-launch_sagemaker_job.py
+Launch a SageMaker PyTorch training job with ONLY supported hyperparameters,
+then optionally deploy the trained model to a real-time endpoint.
 
-- Region comes ONLY from --region or .env AWS_REGION.
-- Trainer entry_point is fixed to ./aws_train_model.py (must exist).
-- Data defaults to ./eth_1m_data (uploads to S3 unless you pass an s3:// URI).
-- CHUNK_SIZE from .env is passed into the container environment.
+Enhancements:
+- Loads defaults from .env (via python-dotenv)
+- Ensures local training data directory is uploaded to S3 if not present
+- Uses absolute source_dir for entry point so "No file named aws_train_model.py" error is avoided
 """
-
-from __future__ import annotations
 
 import argparse
 import os
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+import mimetypes
 
 import boto3
-import sagemaker
-from sagemaker.pytorch import PyTorch
-from sagemaker.s3 import S3Uploader
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+from sagemaker.pytorch import PyTorch, PyTorchModel
+from sagemaker.inputs import TrainingInput
 
-# ---- .env support ----
-try:
-    from dotenv import load_dotenv
-except Exception:  # pragma: no cover
-    def load_dotenv(*_, **__):
-        return False
-
+# Load environment variables from .env if present
 load_dotenv()
 
-
-# ---------- env helpers ----------
-def _env(key: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(key)
-    return v if v not in (None, "") else default
-
-
-def _env_int(key: str, default: Optional[int] = None) -> Optional[int]:
-    v = _env(key)
+# ---------- Helpers ----------
+def _bool_env(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
     if v is None:
         return default
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+def _s3_uri(bucket: str, key_prefix: str) -> str:
+    key_prefix = key_prefix.lstrip("/")
+    return f"s3://{bucket}/{key_prefix}"
+
+def ensure_data_in_s3(local_dir: Path, s3_client, bucket: str, prefix: str) -> str:
+    """
+    Ensure training data is available in S3 under {prefix}/train/.
+    If nothing exists under that prefix, upload all files from local_dir (recursively).
+    Returns the s3:// URI used for the training channel.
+    """
+    train_prefix = f"{prefix.rstrip('/')}/train/"
+    # 1) Check if objects already present
     try:
-        return int(v)
-    except Exception:
-        return default
+        resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=train_prefix, MaxKeys=1)
+        already_there = ("Contents" in resp and len(resp["Contents"]) > 0)
+    except ClientError as e:
+        raise RuntimeError(f"Failed to list s3://{bucket}/{train_prefix} - {e}")
+
+    if already_there:
+        print(f"\nFound existing training data under s3://{bucket}/{train_prefix} — will reuse.")
+        return _s3_uri(bucket, train_prefix)
+
+    # 2) Otherwise upload local files
+    if not local_dir.exists() or not local_dir.is_dir():
+        raise FileNotFoundError(f"Local training data directory not found: {local_dir}")
+
+    print(f"\nUploading local training data from {local_dir} to s3://{bucket}/{train_prefix} ...")
+    uploaded = 0
+    for p in local_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(local_dir).as_posix()
+        key = f"{train_prefix}{rel}"
+        extra = {}
+        ctype, _ = mimetypes.guess_type(p.name)
+        if ctype:
+            extra["ContentType"] = ctype
+        try:
+            s3_client.upload_file(str(p), bucket, key, ExtraArgs=extra if extra else None)
+            uploaded += 1
+        except ClientError as e:
+            raise RuntimeError(f"Failed to upload {p} to s3://{bucket}/{key}: {e}")
+
+    print(f"Uploaded {uploaded} files to s3://{bucket}/{train_prefix}")
+    return _s3_uri(bucket, train_prefix)
 
 
-def _env_float(key: str, default: Optional[float] = None) -> Optional[float]:
-    v = _env(key)
-    if v is None:
-        return default
-    try:
-        return float(v)
-    except Exception:
-        return default
+def build_parser():
+    p = argparse.ArgumentParser(description="Launch SageMaker training with supported flags only")
 
+    # Infra / job settings (defaults from .env)
+    p.add_argument("--role-arn", default=os.getenv("SAGEMAKER_ROLE_ARN"), required=False)
+    p.add_argument("--region", default=os.getenv("AWS_REGION", "us-east-1"))
+    p.add_argument("--bucket", default=os.getenv("S3_BUCKET_NAME"), required=False)
+    p.add_argument("--prefix", default=os.getenv("S3_PREFIX", "eth-1m"))
+    p.add_argument("--instance-type", default=os.getenv("TRAIN_INSTANCE_TYPE", "ml.g5.2xlarge"))
+    p.add_argument("--instance-count", type=int, default=int(os.getenv("TRAIN_INSTANCE_COUNT", 1)))
+    p.add_argument("--py-version", default=os.getenv("PY_VERSION", "py311"))
+    p.add_argument("--framework-version", default=os.getenv("FRAMEWORK_VERSION", "2.3"))
+    p.add_argument("--image-uri", default=None, help="Optional custom image")
+    p.add_argument("--job-name", default=None)
 
-def _env_bool_or_int(key: str, default: int = 0) -> int:
-    v = _env(key)
-    if v is None:
-        return int(default)
-    vl = v.strip().lower()
-    if vl in ("1", "true", "yes", "y", "on"):
-        return 1
-    if vl in ("0", "false", "no", "n", "off"):
-        return 0
-    try:
-        return int(v)
-    except Exception:
-        return int(default)
-
-
-# ---------- argparse ----------
-def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Launch SageMaker training job for ./aws_train_model.py")
-
-    # AWS / infra
+    # Data location
     p.add_argument(
-        "--region",
-        type=str,
-        default=_env("AWS_REGION"),                     # ONLY AWS_REGION (no other fallback)
-        help="AWS region (required via --region or .env AWS_REGION).",
+        "--local-train-dir",
+        default=os.getenv("DATA_DIR", "eth_1m_data"),
+        help="Local directory of CSVs to upload if S3 is empty (defaults from .env DATA_DIR).",
     )
     p.add_argument(
-        "--role",
-        type=str,
-        default=_env("SAGEMAKER_ROLE_ARN", _env("SM_ROLE_ARN", _env("IAM_ROLE_NAME"))),
-        help="SageMaker role ARN or role NAME.",
-    )
-    p.add_argument(
-        "--bucket",
-        type=str,
-        default=_env("S3_BUCKET", _env("S3_BUCKET_NAME")),
-        help="S3 bucket (defaults to SDK session bucket if omitted).",
-    )
-    p.add_argument("--prefix", type=str, default=_env("S3_PREFIX", "autopilot-lstm"), help="S3 prefix for artifacts.")
-    p.add_argument(
-        "--instance-type",
-        type=str,
-        default=_env("INSTANCE_TYPE", _env("TRAIN_INSTANCE_TYPE", "ml.c5.2xlarge")),
-        help="Training instance type.",
-    )
-    p.add_argument("--instance-count", type=int, default=_env_int("INSTANCE_COUNT", 1), help="Number of instances.")
-    p.add_argument("--image-uri", type=str, default=_env("IMAGE_URI"), help="(Optional) custom training image URI.")
-    p.add_argument("--job-name", type=str, default=_env("JOB_NAME"), help="(Optional) explicit job name.")
-
-    # Data (default fixed to eth_1m_data/)
-    p.add_argument(
-        "--data",
-        type=str,
-        default=_env("DATA_PATH", _env("DATA_DIR", "eth_1m_data")),
-        help="Local data dir (uploaded) or s3:// URI (default: ./eth_1m_data)",
+        "--train-s3-uri",
+        default=os.getenv("TRAIN_S3_URI"),
+        required=False,
+        help="If provided, use this S3 path directly for the 'train' channel. "
+             "If omitted, we ensure s3://{bucket}/{prefix}/train/ exists (upload if needed).",
     )
 
-    # Trainer hyperparams (forwarded as-is; adjust as needed)
-    p.add_argument("--label-col", type=str, default=_env("LABEL_COL", "label"))
-    p.add_argument("--auto-label", type=int, default=_env_bool_or_int("AUTO_LABEL", 0))
-    p.add_argument("--horizon", type=int, default=_env_int("HORIZON", 1))
-    p.add_argument("--up-bps", type=float, default=_env_float("UP_BPS", 10.0))
-    p.add_argument("--down-bps", type=float, default=_env_float("DOWN_BPS", 10.0))
-    p.add_argument("--price-col", type=str, default=_env("PRICE_COL", "close"))
+    # Trainer flags (SUPPORTED ONLY; optimistic defaults)
+    p.add_argument("--window-size", type=int, default=192)
+    p.add_argument("--hidden-size", type=int, default=768)
+    p.add_argument("--num-layers", type=int, default=3)
+    p.add_argument("--dropout", type=float, default=0.10)
+    p.add_argument("--bidirectional", type=bool, default=True)
+    p.add_argument("--disable-scaling", type=bool, default=False)
+    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--learning-rate", type=float, default=3e-3)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--val-frac", type=float, default=0.15)
+    p.add_argument("--accumulate", type=int, default=2)
+    p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--price-col", default="close")
 
-    p.add_argument("--epochs", type=int, default=_env_int("EPOCHS", 50))
-    p.add_argument("--batch-size", type=int, default=_env_int("BATCH_SIZE", 1024))
-    p.add_argument("--hidden-size", type=int, default=_env_int("HIDDEN_SIZE", 512))
-    p.add_argument("--num-layers", type=int, default=_env_int("NUM_LAYERS", 3))
-    p.add_argument("--dropout", type=float, default=_env_float("DROPOUT", 0.3))
-    p.add_argument("--bidirectional", type=int, default=_env_bool_or_int("BIDIRECTIONAL", 1))
-    p.add_argument("--num-classes", type=int, default=_env_int("NUM_CLASSES", 3))
-    p.add_argument("--seq-len", type=int, default=_env_int("SEQ_LEN", 60))
-    p.add_argument("--val-frac", type=float, default=_env_float("VAL_FRAC", 0.2))
-    p.add_argument("--val-months", type=int, default=_env_int("VAL_MONTHS"))
-    p.add_argument("--learning-rate", type=float, default=_env_float("LEARNING_RATE", 1e-3))
-    p.add_argument("--weight-decay", type=float, default=_env_float("WEIGHT_DECAY", 0.0))
-    p.add_argument("--scale-features", type=int, default=_env_bool_or_int("SCALE_FEATURES", 1))
-    p.add_argument("--use-class-weights", type=int, default=_env_bool_or_int("USE_CLASS_WEIGHTS", 1))
-    p.add_argument("--accumulate", type=int, default=_env_int("ACCUMULATE", 1), help="Gradient accumulation steps.")
+    # Deployment controls (defaults from .env)
+    p.add_argument("--deploy", action="store_true", default=True,
+                   help="If set/true, deploy the trained model to a real-time endpoint.")
+    p.add_argument("--endpoint-name", default=os.getenv("ENDPOINT_NAME"),
+                   help="Optional endpoint name. Defaults to <job-name>-endpoint.")
+    p.add_argument("--endpoint-instance-type", default=os.getenv("ENDPOINT_INSTANCE_TYPE", "ml.m5.large"),
+                   help="Instance type for endpoint hosting.")
+    p.add_argument("--endpoint-initial-count", type=int,
+                   default=int(os.getenv("ENDPOINT_INSTANCES", 1)),
+                   help="Initial instance count for endpoint hosting.")
+    p.add_argument("--deploy-entry-point", default="inference.py",
+                   help="Serving entry point script (must exist in source_dir).")
 
-    # Env / runtime
-    p.add_argument(
-        "--chunk-size",
-        type=int,
-        default=_env_int("CHUNK_SIZE", 200000),
-        help="Rows per chunk for trainer; exported as env CHUNK_SIZE.",
-    )
     return p
 
 
-# ---------- region, role, s3 ----------
-def _resolve_region(region_opt: Optional[str]) -> str:
-    # Strict: must be provided by CLI or .env AWS_REGION
-    if region_opt:
-        return region_opt
-    raise RuntimeError("No AWS region set. Pass --region or set AWS_REGION in your .env.")
+def main():
+    args = build_parser().parse_args()
 
+    # Validate required base config (can come from .env)
+    if not args.role_arn:
+        raise ValueError("Missing --role-arn (or SAGEMAKER_ROLE_ARN in .env)")
+    if not args.bucket:
+        raise ValueError("Missing --bucket (or S3_BUCKET_NAME in .env)")
 
-def _resolve_role_arn(role_or_arn: str, region: str) -> str:
-    if role_or_arn.startswith("arn:aws:iam::"):
-        return role_or_arn
-    iam = boto3.client("iam", region_name=region)
-    try:
-        resp = iam.get_role(RoleName=role_or_arn)
-        return resp["Role"]["Arn"]
-    except Exception as e:
-        raise SystemExit(
-            f"Could not resolve role name '{role_or_arn}' to an ARN. "
-            f"Set SAGEMAKER_ROLE_ARN in .env or pass --role. Underlying error: {e}"
+    # Compute script directory; ensure entry point exists here.
+    script_dir = Path(__file__).resolve().parent  # e.g., <repo>/src
+    entry_point_path = script_dir / "aws_train_model.py"
+    if not entry_point_path.exists():
+        raise ValueError(
+            f'No file named "aws_train_model.py" was found in directory "{script_dir}". '
+            "Ensure aws_train_model.py is alongside launch_sagemaker_job.py."
         )
 
-
-def _prepare_s3_data_uri(sess: sagemaker.Session, bucket: Optional[str], prefix: str, data_arg: str) -> str:
-    # If data_arg is s3://... use it; otherwise upload local dir/file to s3://bucket/prefix/eth_1m_data
-    if data_arg.startswith("s3://"):
-        return data_arg
-    local_path = Path(data_arg).expanduser().resolve()
-    if not local_path.exists():
-        raise FileNotFoundError(f"Data path not found: {local_path}")
-    dest_bucket = bucket or sess.default_bucket()
-    dest_prefix = f"{prefix}/eth_1m_data"
-    s3_uri = f"s3://{dest_bucket}/{dest_prefix}"
-    print(f"[INFO] Uploading {local_path} -> {s3_uri}")
-    uploaded = S3Uploader.upload(str(local_path), s3_uri)
-    return uploaded
-
-
-def _hyperparams_from_args(a: argparse.Namespace) -> Dict[str, str]:
-    hp = {
-        "data": "/opt/ml/input/data/train",
-        "label-col": a.label_col,
-        "auto-label": str(int(a.auto_label)),
-        "horizon": str(int(a.horizon)),
-        "up-bps": str(float(a.up_bps)),
-        "down-bps": str(float(a.down_bps)),
-        "price-col": a.price_col,
-        "epochs": str(a.epochs),
-        "batch-size": str(a.batch_size),
-        "hidden-size": str(a.hidden_size),
-        "num-layers": str(a.num_layers),
-        "dropout": str(a.dropout),
-        "bidirectional": str(int(a.bidirectional)),
-        "num-classes": str(a.num_classes),
-        "seq-len": str(a.seq_len),
-        "learning-rate": str(a.learning_rate),
-        "weight-decay": str(a.weight_decay),
-        "scale-features": str(int(a.scale_features)),
-        "use-class-weights": str(int(a.use_class_weights)),
-        "accumulate": str(int(a.accumulate)),
-    }
-    if a.val_months is not None:
-        hp["val_months"] = str(int(a.val_months))
+    # Build/train data S3 URI: use provided --train-s3-uri, or ensure upload to s3://bucket/prefix/train/
+    if args.train_s3_uri:
+        train_s3_uri = args.train_s3_uri
+        print(f"\nUsing provided training S3 URI: {train_s3_uri}")
     else:
-        hp["val-frac"] = str(a.val_frac)
-    return hp
+        s3 = boto3.client("s3", region_name=args.region)
+        local_dir = (Path(args.local_train_dir)
+                     if Path(args.local_train_dir).is_absolute()
+                     else (script_dir / args.local_train_dir).resolve())
+        train_s3_uri = ensure_data_in_s3(local_dir, s3, args.bucket, args.prefix)
 
+    # Derive a sensible default job name if none provided
+    job_name = args.job_name or f"eth-lstm-opt-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    print("\n=== SageMaker Training Job Configuration ===")
+    print(f"Region:             {args.region}")
+    print(f"Role ARN:           {args.role_arn}")
+    print(f"Instance Type:      {args.instance_type}")
+    print(f"Instance Count:     {args.instance_count}")
+    print(f"Framework Version:  {args.framework_version}")
+    print(f"Python Version:     {args.py_version}")
+    print(f"Image URI:          {args.image_uri or '[default for framework]'}")
+    print(f"Train S3 URI:       {train_s3_uri}")
+    print(f"Bucket/Prefix:      {args.bucket} / {args.prefix}")
+    print(f"Job Name:           {job_name}")
 
-# ---------- main ----------
-def main():
-    args = build_arg_parser().parse_args()
+    # Construct hyperparameters (only supported keys)
+    hyperparameters = {
+        "window-size": args.window_size,
+        "hidden-size": args.hidden_size,
+        "num-layers": args.num_layers,
+        "dropout": args.dropout,
+        "bidirectional": True if args.bidirectional else False,
+        "epochs": args.epochs,
+        "batch-size": args.batch_size,
+        "learning-rate": args.learning_rate,
+        "weight-decay": args.weight_decay,
+        "val-frac": args.val_frac,
+        "accumulate": args.accumulate,
+        "seed": args.seed,
+        "price-col": args.price_col,
+    }
+    if args.disable_scaling:
+        hyperparameters["disable-scaling"] = True
 
-    # Fixed trainer location: ./aws_train_model.py
-    repo_root = Path(__file__).resolve().parent
-    entry_point_rel = "aws_train_model.py"
-    trainer_path = repo_root / entry_point_rel
-    if not trainer_path.exists():
-        raise SystemExit(f"Trainer not found at {trainer_path}. Expected './aws_train_model.py'.")
+    print("\n--- Trainer Hyperparameters (supported only) ---")
+    for k in sorted(hyperparameters.keys()):
+        print(f"{k:16s}: {hyperparameters[k]}")
 
-    if not args.role:
-        raise SystemExit("Missing SageMaker role. Set SAGEMAKER_ROLE_ARN (or IAM_ROLE_NAME) in .env or pass --role.")
-
-    region = _resolve_region(args.region)
-    role_arn = _resolve_role_arn(args.role, region)
-    print(f"[INFO] Using region: {region}")
-    print(f"[INFO] Using role:   {role_arn}")
-    print(f"[INFO] Using source_dir: {repo_root}")
-    print(f"[INFO] Using entry_point: {entry_point_rel}")
-
-    # (Optional) print account to avoid console/region confusion
-    try:
-        acct = boto3.client("sts", region_name=region).get_caller_identity()["Account"]
-        print(f"[INFO] AWS account: {acct}")
-    except Exception:
-        pass
-
-    sm_sess = sagemaker.Session(boto3.session.Session(region_name=region))
-    bucket = args.bucket or sm_sess.default_bucket()
-    print(f"[INFO] Using bucket: {bucket}")
-    print(f"[INFO] Using prefix: {args.prefix}")
-
-    # Data: default to local eth_1m_data/ (or s3:// if you pass it)
-    s3_data_uri = _prepare_s3_data_uri(sm_sess, bucket, args.prefix, args.data)
-    inputs = {"train": s3_data_uri}
-    print(f"[INFO] Training data channel 'train' -> {s3_data_uri}")
-
-    est_kwargs = dict(
-        entry_point=entry_point_rel,  # relative to source_dir
-        source_dir=str(repo_root),    # package project root
-        role=role_arn,
+    # Prepare estimator (training) — use absolute source_dir so entry point is found
+    estimator_kwargs = dict(
+        entry_point=entry_point_path.name,   # "aws_train_model.py"
+        source_dir=str(script_dir),          # absolute path to folder containing entry point & code
+        role=args.role_arn,
         instance_type=args.instance_type,
         instance_count=args.instance_count,
-        hyperparameters=_hyperparams_from_args(args),
-        environment={"CHUNK_SIZE": str(int(args.chunk_size))},
-        framework_version="2.1",
-        py_version="py310",
-        disable_profiler=True,
-        debugger_hook_config=False,
-        sagemaker_session=sm_sess,
+        framework_version=args.framework_version,
+        py_version=args.py_version,
+        image_uri=args.image_uri,
+        hyperparameters=hyperparameters,
     )
-    if args.image_uri:
-        est_kwargs["image_uri"] = args.image_uri
+    est = PyTorch(**{k: v for k, v in estimator_kwargs.items() if v is not None})
 
-    estimator = PyTorch(**est_kwargs)
-    job_name = args.job_name or sagemaker.utils.name_from_base(f"{args.prefix.replace('/', '-')}")
-    print(f"[INFO] Launching job: {job_name}")
-    estimator.fit(inputs=inputs, job_name=job_name)
-    print("[DONE] Job submitted. Check SageMaker console for status.")
+    # Channel mapping
+    inputs = {
+        "train": TrainingInput(
+            s3_data=train_s3_uri,
+            content_type="text/csv"
+        )
+    }
 
-    # === NEW: deploy a real-time endpoint and print its name ===
-    endpoint_name = f"{job_name}"
-    model = estimator.create_model(
-        entry_point="inference.py",         # must be in the same repo_root
-        source_dir=str(repo_root),
-        role=role_arn,
-    )
-    predictor = model.deploy(
-        initial_instance_count=1,
-        instance_type="ml.m5.large",        # adjust here if you need GPU/other size
-        endpoint_name=endpoint_name,
-    )
-    print(f"[DEPLOYED] Endpoint: {predictor.endpoint_name}")
+    print("\nStarting SageMaker training job...")
+    est.fit(inputs=inputs, job_name=job_name)
+    print("\nTraining job submitted. Check SageMaker Console for live logs and metrics.")
+    print(f"Job Name: {job_name}")
+
+    # Deployment
+    if args.deploy:
+        endpoint_name = args.endpoint_name or f"{job_name}-endpoint"
+        print("\n=== Deployment Configuration ===")
+        print(f"Endpoint Name:           {endpoint_name}")
+        print(f"Endpoint Instance Type:  {args.endpoint_instance_type}")
+        print(f"Endpoint Initial Count:  {args.endpoint_initial_count}")
+        print(f"Serving Entry Point:     {args.deploy_entry_point}")
+
+        model_data = est.latest_training_job.model_artifacts
+        sm_model = PyTorchModel(
+            model_data=model_data,
+            role=args.role_arn,
+            entry_point=args.deploy_entry_point,
+            source_dir=str(script_dir),   # serve from same source_dir (has inference.py)
+            framework_version=args.framework_version,
+            py_version=args.py_version,
+            image_uri=args.image_uri,
+        )
+
+        print("\nDeploying model to endpoint...")
+        predictor = sm_model.deploy(
+            initial_instance_count=args.endpoint_initial_count,
+            instance_type=args.endpoint_instance_type,
+            endpoint_name=endpoint_name,
+        )
+        print(f"Endpoint deployed: {predictor.endpoint_name}")
+        print("\n=== Deployment Complete ===")
+    else:
+        print("\n--deploy was disabled; skipping endpoint creation.")
+
 
 if __name__ == "__main__":
     main()
