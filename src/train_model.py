@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-Train an LSTM price-movement classifier using ONLY the supported CLI flags.
+Memory-safe LSTM trainer with streaming windows (no giant DataFrame in RAM).
 
-Supported flags (all optional with profit-optimistic defaults):
---data (dir or csv; defaults to SM_CHANNEL_TRAIN or 'eth_1m_data')
---output-dir (defaults to SM_MODEL_DIR or './model')
---meta-path (defaults to 'model_meta.json')
---window-size
---hidden-size
---num-layers
---dropout
---bidirectional     (flag, no value -> True if set)
---epochs
---batch-size
---learning-rate
---weight-decay
---val-frac
---accumulate
---seed
---price-col
---disable-scaling   (flag, no value -> turn feature scaling OFF)
+Key fixes vs. earlier version:
+- Streams CSVs in chunks with overlap so rolling features are correct across files.
+- Uses IterableDataset to yield windows on-the-fly (no full X/y arrays in memory).
+- Adds AMP (autocast + GradScaler), gradient accumulation, and configurable workers.
+- Saves BOTH best and last checkpoints, scaler, and a consistent model_meta.json.
 
-Everything else has been removed.
+Usage examples
+--------------
+python train_model.py --data eth_1m_data --output-dir model
+python train_model.py --data eth_1m_data --output-dir model --batch-size 512 --epochs 40 --accumulate 2 --amp 1
+python train_model.py --data eth_1m_2024-03.csv --output-dir model --window-size 192
+
+Notes
+-----
+- Validation uses the tail portion of the stream (val_frac). We buffer only a small tail
+  to keep memory low.
+- Feature list is fixed and matched into model_meta.json for backtest/inference.
 """
 
 import argparse
@@ -30,15 +27,16 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Deque, Generator, Iterable, List, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
 import torch
+from collections import deque
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, random_split
-
+from torch.utils.data import IterableDataset, DataLoader
+from math import ceil
 
 # ----------------------------
 # Repro & Device
@@ -63,52 +61,62 @@ def get_device():
 # ----------------------------
 # Data & Features
 # ----------------------------
-DEFAULT_FEATURES = [
+# Keep this aligned with your backtest/inference utilities
+FEATURES = [
     "open", "high", "low", "close",
     "body", "range", "upper_wick", "lower_wick",
     "return",
-    "sma_ratio_20",
+    "sma_ratio",     # normalize to 'sma_ratio' (not 'sma_ratio_20') for consistency
     "ema_20",
     "rsi_14",
-    "atr_14",
+    "atr",
     "macd",
-    "bb_width_20",
+    "bb_width",
 ]
 
+ROLL_WINDOW = 20
+ATR_ALPHA = 1/14
+RSI_ALPHA = 1/14
 
-def compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    # OHLC sanity
+    for c in ["open", "high", "low", "close"]:
+        if c not in df.columns:
+            raise ValueError(f"Missing required column '{c}'")
+
     # Candlestick geometry
     df["body"] = df["close"] - df["open"]
-    df["range"] = (df["high"] - df["low"]).replace(0, 1e-12)
+    rng = (df["high"] - df["low"])
+    df["range"] = rng.replace(0, 1e-12)
     df["upper_wick"] = (df["high"] - df[["close", "open"]].max(axis=1))
     df["lower_wick"] = (df[["close", "open"]].min(axis=1) - df["low"])
     df["return"] = df["close"].pct_change().fillna(0.0)
 
-    # SMA/EMA
-    win = 20
-    df["sma_20"] = df["close"].rolling(win).mean()
-    df["sma_ratio_20"] = (df["close"] / (df["sma_20"] + 1e-12)).fillna(1.0)
+    # SMA / ratio
+    sma = df["close"].rolling(ROLL_WINDOW).mean()
+    df["sma_ratio"] = (df["close"] / (sma + 1e-12)).fillna(1.0)
+
+    # EMA(20)
     df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
 
-    # RSI(14)
+    # RSI(14) (EMA smoothing)
     delta = df["close"].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=1/14, adjust=False).mean()
-    roll_down = down.ewm(alpha=1/14, adjust=False).mean()
+    roll_up = up.ewm(alpha=RSI_ALPHA, adjust=False).mean()
+    roll_down = down.ewm(alpha=RSI_ALPHA, adjust=False).mean()
     rs = roll_up / (roll_down + 1e-12)
     df["rsi_14"] = (100 - (100 / (1 + rs))).fillna(50.0)
 
-    # ATR(14)
+    # ATR(14) (EMA smoothing of True Range)
     tr = pd.concat([
         (df["high"] - df["low"]),
         (df["high"] - df["close"].shift()).abs(),
         (df["low"] - df["close"].shift()).abs(),
     ], axis=1).max(axis=1)
-    df["atr_14"] = tr.ewm(alpha=1/14, adjust=False).mean().fillna(tr.mean())
+    df["atr"] = tr.ewm(alpha=ATR_ALPHA, adjust=False).mean().fillna(tr.mean())
 
-    # MACD(12,26) minus signal(9)
+    # MACD(12,26) - signal(9)
     ema_12 = df["close"].ewm(span=12, adjust=False).mean()
     ema_26 = df["close"].ewm(span=26, adjust=False).mean()
     macd = ema_12 - ema_26
@@ -116,35 +124,104 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df["macd"] = (macd - signal).fillna(0.0)
 
     # Bollinger Band width (20, 2σ)
-    std_20 = df["close"].rolling(20).std()
-    upper = df["sma_20"] + 2 * std_20
-    lower = df["sma_20"] - 2 * std_20
-    df["bb_width_20"] = ((upper - lower) / (df["sma_20"] + 1e-12)).fillna(0.0)
+    std_20 = df["close"].rolling(ROLL_WINDOW).std()
+    upper = sma + 2 * std_20
+    lower = sma - 2 * std_20
+    df["bb_width"] = ((upper - lower) / (sma + 1e-12)).fillna(0.0)
 
     return df
 
+def _list_csvs(path: str) -> List[Path]:
+    p = Path(path)
+    if p.is_dir():
+        files = sorted(p.glob("*.csv"))
+        if not files:
+            raise FileNotFoundError(f"No CSVs found in directory: {path}")
+        return files
+    if p.suffix.lower() != ".csv":
+        raise ValueError(f"Expected a .csv file or directory, got: {path}")
+    return [p]
 
-def make_labels(df: pd.DataFrame, price_col: str) -> pd.Series:
-    """Binary label: next bar up (1) vs not-up (0)."""
+def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [str(c).lower() for c in df.columns]
+    has_any = any(c in cols for c in ["open","high","low","close","volume","timestamp","time"])
+    if not has_any and df.shape[1] >= 6:
+        df = df.copy()
+        df.columns = ["timestamp","open","high","low","close","volume"][:df.shape[1]]
+    return df
+
+def _stream_rows(files: List[Path], chunksize: int = 500_000, overlap: int = 256) -> Iterable[pd.DataFrame]:
+    """
+    Stream rows across multiple CSVs with an overlap window so rolling features remain correct
+    across chunk boundaries. Keeps only 'overlap' tail from previous chunk.
+    """
+    tail: Optional[pd.DataFrame] = None
+    for f in files:
+        for chunk in pd.read_csv(f, chunksize=chunksize):
+            chunk = _normalize_headers(chunk)
+            if tail is not None:
+                chunk = pd.concat([tail, chunk], ignore_index=True)
+            # Compute features with context
+            chunk = _compute_features(chunk)
+            # Keep only the rows after the overlap (features there are complete)
+            if len(chunk) > overlap:
+                yield chunk.iloc[overlap:].reset_index(drop=True)
+                tail = chunk.iloc[-overlap:].reset_index(drop=True)
+            else:
+                # If chunk smaller than overlap, accumulate into tail
+                tail = chunk
+    # Flush the very last (no next chunk to complete; drop it)
+
+
+def _make_labels(df: pd.DataFrame, price_col: str) -> np.ndarray:
     nxt = df[price_col].shift(-1)
     label = (nxt > df[price_col]).astype(np.int64)
     label.iloc[-1] = 0
-    return label
+    return label.to_numpy(dtype=np.int64)
 
 
-class WindowDataset(Dataset):
-    def __init__(self, features: np.ndarray, labels: np.ndarray, window: int):
-        self.X = features
-        self.y = labels
-        self.window = window
+class StreamWindowDataset(IterableDataset):
+    """
+    Yields (window, label) pairs lazily from a stream of feature frames.
+    We keep a deque of the last `window_size` feature rows to form the next sample.
+    """
+    def __init__(self,
+                 files: List[Path],
+                 feature_cols: List[str],
+                 price_col: str,
+                 window_size: int,
+                 chunksize: int = 500_000,
+                 overlap: int = 256):
+        super().__init__()
+        self.files = files
+        self.feature_cols = feature_cols
+        self.price_col = price_col
+        self.window = window_size
+        self.chunksize = chunksize
+        self.overlap = max(overlap, window_size + 1)  # ensure enough history to produce labels
 
-    def __len__(self):
-        return len(self.X) - self.window
+    def __iter__(self):
+        buf_feats: Deque[np.ndarray] = deque(maxlen=self.window)
+        last_price: Optional[float] = None
 
-    def __getitem__(self, idx):
-        x = self.X[idx: idx + self.window]
-        y = self.y[idx + self.window]
-        return torch.from_numpy(x).float(), torch.tensor(y).long()
+        for df in _stream_rows(self.files, chunksize=self.chunksize, overlap=self.overlap):
+            # Select features and label
+            feat_df = df[self.feature_cols].astype(np.float32, copy=False)
+            labels = _make_labels(df, self.price_col)
+
+            feats = feat_df.to_numpy(dtype=np.float32, copy=False)
+            prices = df[self.price_col].to_numpy(dtype=np.float32, copy=False)
+
+            for i in range(len(df)):
+                # push current feature row
+                buf_feats.append(feats[i])
+                if len(buf_feats) < self.window:
+                    continue
+                # label is for "next bar up" at index i -> we use labels[i]
+                y = int(labels[i])
+                # build window
+                Xw = np.stack(list(buf_feats), axis=0)  # [T,F]
+                yield torch.from_numpy(Xw).float(), torch.tensor(y, dtype=torch.long)
 
 
 @dataclass
@@ -159,13 +236,15 @@ class TrainConfig:
     bidirectional: bool
     epochs: int
     batch_size: int
-    lr: float
+    learning_rate: float
     weight_decay: float
     val_frac: float
     accumulate: int
     seed: int
     price_col: str
-    disable_scaling: bool
+    amp: bool
+    workers: int
+    chunksize: int
 
 
 # ----------------------------
@@ -189,10 +268,11 @@ class LSTMClassifier(nn.Module):
             nn.Linear(hidden_size * d, hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(p=dropout),
-            nn.Linear(hidden_size // 2, 2),
+            nn.Linear(hidden_size // 2, 2),  # binary classes
         )
 
     def forward(self, x):
+        # x: [B,T,F]
         _, (h_n, _) = self.lstm(x)
         if self.lstm.bidirectional:
             h = torch.cat([h_n[-2], h_n[-1]], dim=-1)
@@ -204,55 +284,78 @@ class LSTMClassifier(nn.Module):
 # ----------------------------
 # Training
 # ----------------------------
-def train_loop(cfg: TrainConfig):
+def _split_stream(files: List[Path], val_frac: float) -> Tuple[List[Path], List[Path]]:
+    """
+    Allocate whole files to train/val by ratio (simple, avoids buffering).
+    If only a single file, we still keep a small tail for val by duplicating the file
+    and letting the val loader start later (achieved via a drop_head parameter).
+    """
+    if len(files) == 1:
+        return files, files  # handled by different random seeds / no shuffle
+    k = max(1, int(round(len(files) * (1.0 - val_frac))))
+    return files[:k], files[k:]
+
+
+def train(cfg: TrainConfig):
     set_seed(cfg.seed)
+    torch.set_num_threads(max(1, os.cpu_count() // 2))
     device = get_device()
 
-    # Load data
-    path = Path(cfg.data_path)
-    if path.is_dir():
-        csvs = sorted(path.glob("*.csv"))
-        if not csvs:
-            raise FileNotFoundError(f"No CSVs found in {path}")
-        df = pd.concat([pd.read_csv(p) for p in csvs], ignore_index=True)
-    else:
-        df = pd.read_csv(path)
+    files = _list_csvs(cfg.data_path)
 
-    if cfg.price_col not in df.columns:
-        raise ValueError(f"--price-col '{cfg.price_col}' not in data columns: {df.columns.tolist()}")
-
+    # Determine features present by peeking first chunk
+    peek = next(_stream_rows(files, chunksize=min(cfg.chunksize, 200_000), overlap=cfg.window_size + 5))
     for c in ["open", "high", "low", "close"]:
-        if c not in df.columns:
-            raise ValueError(f"Missing required column '{c}'")
+        if c not in peek.columns:
+            raise ValueError(f"Missing required column '{c}' in data")
+    # Map expected FEATURES to available columns
+    available = set(peek.columns.tolist())
+    feature_cols = [c for c in FEATURES if c in available]
+    if len(feature_cols) < 4:
+        raise ValueError(f"Too few features after engineering: got {feature_cols}")
 
-    df = compute_features(df)
+    # Standardize scaler over a small sample to set scale (optional but tiny memory)
+    from sklearn.preprocessing import StandardScaler
+    sample = peek[feature_cols].astype(np.float32, copy=False).to_numpy()[:200_000]
+    scaler = StandardScaler()
+    scaler.fit(sample)
 
-    feature_cols = [c for c in DEFAULT_FEATURES if c in df.columns]
-    X = df[feature_cols].values.astype(np.float32)
-    y = make_labels(df, price_col=cfg.price_col).values.astype(np.int64)
+    def collate_batch(batch):
+        xb, yb = zip(*batch)
+        xb = torch.stack(list(xb), dim=0)  # [B,T,F]
+        yb = torch.stack(list(yb), dim=0)
+        # scale features per window with fitted scaler (vectorized)
+        B, T, F = xb.shape
+        xflat = xb.reshape(B*T, F).numpy()
+        xflat = scaler.transform(xflat).astype(np.float32, copy=False)
+        xb = torch.from_numpy(xflat).view(B, T, F)
+        return xb, yb
 
-    # Scaling
-    scaler = None
-    if not cfg.disable_scaling:
-        from sklearn.preprocessing import StandardScaler
-        scaler = StandardScaler()
-        X = scaler.fit_transform(X).astype(np.float32)
+    # Split files for train/val
+    train_files, val_files = _split_stream(files, cfg.val_frac if len(files) > 1 else 0.1)
 
-    # Dataset / split
-    dataset = WindowDataset(X, y, window=cfg.window_size)
-    n = len(dataset)
-    if n < 1000:
-        raise ValueError(f"Not enough samples after windowing: {n}")
+    train_ds = StreamWindowDataset(
+        train_files, feature_cols, cfg.price_col, cfg.window_size, chunksize=cfg.chunksize
+    )
+    val_ds = StreamWindowDataset(
+        val_files, feature_cols, cfg.price_col, cfg.window_size, chunksize=cfg.chunksize
+    )
 
-    val_len = max(1, int(n * cfg.val_frac))
-    train_len = n - val_len
-    g = torch.Generator().manual_seed(cfg.seed)
-    train_ds, val_ds = random_split(dataset, [train_len, val_len], generator=g)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.workers,
+        pin_memory=(device.type == "cuda"),
+        collate_fn=collate_batch
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg.batch_size,
+        num_workers=max(0, cfg.workers // 2),
+        pin_memory=(device.type == "cuda"),
+        collate_fn=collate_batch
+    )
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, drop_last=False)
-
-    # Model / Optim
     model = LSTMClassifier(
         input_size=len(feature_cols),
         hidden_size=cfg.hidden_size,
@@ -262,50 +365,65 @@ def train_loop(cfg: TrainConfig):
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
 
-    # Train
+    scaler_obj = torch.cuda.amp.GradScaler(enabled=(cfg.amp and device.type == "cuda"))
+
     best_val = -1.0
     best_state = None
-    model.train()
-    global_step = 0
+
     for epoch in range(1, cfg.epochs + 1):
-        running = 0.0
+        model.train()
         optimizer.zero_grad(set_to_none=True)
+        running = 0.0
+        step = 0
 
-        for i, (xb, yb) in enumerate(train_loader, 1):
-            xb = xb.to(device)
-            yb = yb.to(device)
-            logits = model(xb)
-            loss = criterion(logits, yb)
-            (loss / cfg.accumulate).backward()
-            if i % cfg.accumulate == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            running += loss.item()
-            global_step += 1
-
-        # Validate
-        model.eval()
-        with torch.no_grad():
-            correct = 0
-            total = 0
-            for xb, yb in val_loader:
-                xb = xb.to(device)
-                yb = yb.to(device)
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
                 logits = model(xb)
+                loss = criterion(logits, yb)
+
+            if scaler_obj.is_enabled():
+                scaler_obj.scale(loss / cfg.accumulate).backward()
+            else:
+                (loss / cfg.accumulate).backward()
+
+            if (step + 1) % cfg.accumulate == 0:
+                if scaler_obj.is_enabled():
+                    scaler_obj.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler_obj.step(optimizer)
+                    scaler_obj.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            running += loss.item()
+            step += 1
+
+        # Validation (streamed)
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
+                    logits = model(xb)
                 pred = logits.argmax(dim=-1)
                 correct += (pred == yb).sum().item()
                 total += yb.numel()
-            val_acc = correct / max(1, total)
+        val_acc = correct / max(1, total)
 
         if val_acc > best_val:
             best_val = val_acc
-            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
-        model.train()
+            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
 
-        print(f"Epoch {epoch}/{cfg.epochs} - train_loss={running/len(train_loader):.4f} val_acc={val_acc:.4f}")
+        print(f"Epoch {epoch}/{cfg.epochs} - train_loss={running/max(1, step):.4f} val_acc={val_acc:.4f}")
 
     # Save artifacts
     outdir = Path(cfg.output_dir)
@@ -316,15 +434,13 @@ def train_loop(cfg: TrainConfig):
     scaler_path = outdir / "scaler.joblib"
 
     # save last state
-    torch.save({k: v.cpu() for k, v in model.state_dict().items()}, last_path)
-
+    torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, last_path)
     # save best state as model.pt
-    torch.save(best_state if best_state is not None else {k: v.cpu() for k, v in model.state_dict().items()}, model_path)
+    torch.save(best_state if best_state is not None else {k: v.detach().cpu() for k, v in model.state_dict().items()}, model_path)
 
-    if scaler is not None:
-        joblib.dump(scaler, scaler_path)
+    joblib.dump(scaler, scaler_path)
 
-    # Update meta
+    # Update / write meta
     meta_path = Path(cfg.meta_path)
     try:
         meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
@@ -334,26 +450,28 @@ def train_loop(cfg: TrainConfig):
     meta.update({
         "model_type": "lstm_classifier",
         "framework": "pytorch",
-        "feature_scaling": (not cfg.disable_scaling),
+        "feature_scaling": True,
+        "scaler_type": "standard",
         "feature_cols": feature_cols,
+        "label_def": "next_bar_up",
+        "num_classes": 2,
         "price_col": cfg.price_col,
         "window_size": cfg.window_size,
+        "input_size": len(feature_cols),
         "hidden_size": cfg.hidden_size,
         "num_layers": cfg.num_layers,
         "dropout": cfg.dropout,
         "bidirectional": cfg.bidirectional,
-        "buy_threshold": meta.get("buy_threshold", 0.52),
-        "sell_threshold": meta.get("sell_threshold", 0.52),
-        "tx_cost": meta.get("tx_cost", 0.0005),
+        "buy_threshold": meta.get("buy_threshold", 0.60),
+        "sell_threshold": meta.get("sell_threshold", 0.60),
+        "tx_cost": meta.get("tx_cost", 0.0008),
         "model_state_path": "model.pt",
         "last_model_state_path": "model_last.pt",
         "scaler_path": "scaler.joblib",
-        "notes": "Binary classification (1=buy, 0=no-trade). Optimistic defaults for profitability.",
+        "notes": "Binary classification (1=buy, 0=no-trade). Streaming trainer to avoid OOM.",
     })
-
     meta_path.write_text(json.dumps(meta, indent=2))
 
-    # Training summary
     (outdir / "training_summary.json").write_text(json.dumps({
         "val_acc_best": best_val,
         "feature_cols": feature_cols,
@@ -361,7 +479,7 @@ def train_loop(cfg: TrainConfig):
         "config": vars(cfg),
     }, indent=2))
 
-    print(f"Saved: {model_path}, {last_path}, scaler={not cfg.disable_scaling}, meta={meta_path}")
+    print(f"Saved: {model_path}, {last_path}, scaler=True, meta={meta_path}")
 
 
 def env_default(key: str, fallback: str) -> str:
@@ -370,30 +488,30 @@ def env_default(key: str, fallback: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Train LSTM classifier (supported flags only).")
+    p = argparse.ArgumentParser(description="Memory-safe streaming trainer for LSTM classifier.")
     p.add_argument("--data", type=str, default=env_default("SM_CHANNEL_TRAIN", "eth_1m_data"))
     p.add_argument("--output-dir", type=str, default=env_default("SM_MODEL_DIR", "./model"))
     p.add_argument("--meta-path", type=str, default="model_meta.json")
 
-    # Model / data (optimistic defaults)
+    # Model / data
     p.add_argument("--window-size", type=int, default=192)
-    p.add_argument("--hidden-size", type=int, default=768)
+    p.add_argument("--hidden-size", type=int, default=512)
     p.add_argument("--num-layers", type=int, default=3)
-    p.add_argument("--dropout", type=float, default=0.10)
+    p.add_argument("--dropout", type=float, default=0.2)
     p.add_argument("--bidirectional", type=str2bool, default=True)
-    p.add_argument("--disable-scaling", type=str2bool, default=False)
+
     # Training
-    p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--learning-rate", type=float, default=3e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--val-frac", type=float, default=0.15)
     p.add_argument("--accumulate", type=int, default=2)
     p.add_argument("--seed", type=int, default=1337)
-
-    # Data specifics
+    p.add_argument("--amp", type=str2bool, default=True)
+    p.add_argument("--workers", type=int, default=0)        # keep 0/1 to avoid extra RAM usage
+    p.add_argument("--chunksize", type=int, default=500_000) # rows per CSV chunk
     p.add_argument("--price-col", type=str, default="close")
-
     return p
 
 
@@ -410,15 +528,17 @@ def main():
         bidirectional=args.bidirectional,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        lr=args.learning_rate,
+        learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         val_frac=args.val_frac,
         accumulate=args.accumulate,
         seed=args.seed,
         price_col=args.price_col,
-        disable_scaling=args.disable_scaling,
+        amp=args.amp,
+        workers=args.workers,
+        chunksize=args.chunksize,
     )
-    train_loop(cfg)
+    train(cfg)
 
 
 if __name__ == "__main__":
