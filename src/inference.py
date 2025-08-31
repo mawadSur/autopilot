@@ -12,7 +12,7 @@ from __future__ import annotations
 import io
 import json
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import numpy as np
 import torch
@@ -118,20 +118,15 @@ def input_fn(request_body: str, content_type: str):
     """
     Parse incoming request to a flat features matrix [N, F].
     """
-    # We'll also pass-through meta in the input object for convenience
-    # (SageMaker calls predict_fn(model, input_object)).
     if not request_body:
         raise ValueError("Empty request body.")
 
-    # Model/feature info will be retrieved inside predict_fn; keep only raw X here
     content_type = (content_type or "application/json").lower().strip()
     input_obj: Dict[str, Any] = {"flat": None, "content_type": content_type}
 
-    # Optional: allow clients to pass feature order explicitly
-    # Otherwise we rely on model_meta.json feature_cols.
     if content_type == "application/json":
         payload = json.loads(request_body)
-        input_obj["payload"] = payload  # we will process with meta later
+        input_obj["payload"] = payload
         return input_obj
 
     if content_type in ("text/csv", "application/csv"):

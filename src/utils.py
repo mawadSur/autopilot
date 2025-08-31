@@ -20,7 +20,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Dict, Generator, List, Optional, Tuple
+from typing import Dict, Generator, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -68,6 +68,7 @@ def load_dotenv() -> None:
     except Exception:
         pass
 
+
 def set_seed(seed: int) -> None:
     """Reproducible seeding for numpy/torch."""
     import random
@@ -76,6 +77,7 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
 
 def get_device_str() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
@@ -96,6 +98,7 @@ def _columns_look_headerless(cols: List[str]) -> bool:
             numeric_like += 1
     return numeric_like >= max(3, len(cols) // 2)
 
+
 def _apply_default_headers(df: pd.DataFrame) -> pd.DataFrame:
     n = df.shape[1]
     if n == 6:
@@ -106,11 +109,13 @@ def _apply_default_headers(df: pd.DataFrame) -> pd.DataFrame:
         df.columns = [f"col{i}" for i in range(n)]
     return df
 
+
 def normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     """Fix headerless CSVs by assigning default OHLCV columns when needed."""
     if _columns_look_headerless(list(df.columns)):
         df = _apply_default_headers(df)
     return df
+
 
 def list_csvs_sorted(path: str) -> List[str]:
     """Return sorted list of CSVs if directory, else a single CSV path."""
@@ -125,10 +130,12 @@ def list_csvs_sorted(path: str) -> List[str]:
         raise ValueError(f"Only .csv supported; got {path}")
     return [path]
 
+
 def iter_csv_chunks_with_fix(path: str, chunksize: int) -> Generator[pd.DataFrame, None, None]:
     """Yield normalized CSV chunks for very large files."""
     for chunk in pd.read_csv(path, chunksize=chunksize):
         yield normalize_headers(chunk)
+
 
 def read_csv_concat_sorted(data_dir: str) -> pd.DataFrame:
     """Read all CSVs (or one CSV) and return a single concatenated, normalized DataFrame."""
@@ -164,6 +171,7 @@ def resolve_price_col(columns: List[str], preferred: Optional[str]) -> Optional[
             return lower_map[cand]
     return None
 
+
 def infer_feature_cols(sample_df: pd.DataFrame, feature_cols: Optional[List[str]], label_col: Optional[str], price_col: Optional[str]) -> List[str]:
     """Infer numeric feature columns if not explicitly provided."""
     if feature_cols:
@@ -190,6 +198,7 @@ def build_windows_from_flat(features: np.ndarray, seq_len: int) -> np.ndarray:
     strides = (stride0, stride0, stride1)
     return np.lib.stride_tricks.as_strided(features, shape=shape, strides=strides).copy()
 
+
 def build_windows(features: np.ndarray, seq_len: int) -> np.ndarray:
     """Alias used by some scripts."""
     return build_windows_from_flat(features, seq_len)
@@ -199,7 +208,7 @@ def build_windows(features: np.ndarray, seq_len: int) -> np.ndarray:
 # Formatting helpers
 # ---------------------------
 
-def fmt_money(x, currency="$") -> str:
+def fmt_money(x, currency: str = "$") -> str:
     """Format a number as money."""
     if x is None or (isinstance(x, float) and not math.isfinite(x)):
         return "—"
@@ -210,6 +219,7 @@ def fmt_money(x, currency="$") -> str:
     if abs(x) >= 1e12:
         return f"{currency}{x:.3e}"
     return f"{currency}{x:,.2f}"
+
 
 def fmt_pct(x) -> str:
     """Format a fraction as percent with two decimals."""
@@ -227,7 +237,8 @@ def fmt_pct(x) -> str:
 
 def load_meta(model_dir_or_path: str) -> Dict:
     """
-    Load model_meta.json from either a directory or a direct file path.
+    Load model_meta.json from either a directory (e.g. 'model')
+    or a direct file path (e.g. 'model/model_meta.json').
     """
     p = Path(model_dir_or_path)
     meta_path = p if p.is_file() else (p / "model_meta.json")
@@ -236,14 +247,14 @@ def load_meta(model_dir_or_path: str) -> Dict:
     with open(meta_path, "r") as f:
         return json.load(f)
 
+
 def load_model_bundle(model_dir: str):
     """
     Returns (model.eval(), scaler_or_None, meta_dict).
     Requires a models.py with LSTMClassifier in the Python path.
     """
-    # Late import avoids circular imports when used inside SageMaker
     try:
-        from models import LSTMClassifier
+        from models import LSTMClassifier  # late import
     except Exception as e:
         raise SystemExit(
             "Could not import LSTMClassifier from models.py. Ensure models.py is on PYTHONPATH.\n"
@@ -252,13 +263,13 @@ def load_model_bundle(model_dir: str):
 
     meta = load_meta(model_dir)
     feature_cols = list(meta.get("feature_cols", DEFAULT_FEATURE_COLS))
-    window_size = int(meta.get("window_size", 150))
     hidden_size = int(meta.get("hidden_size", 512))
     num_layers = int(meta.get("num_layers", 3))
     dropout = float(meta.get("dropout", 0.3))
     bidirectional = bool(meta.get("bidirectional", True))
     num_classes = int(meta.get("num_classes", 2))
 
+    # window_size is not needed to construct the model; features length is
     model = LSTMClassifier(
         input_size=len(feature_cols),
         hidden_size=hidden_size,
