@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-backtest.py — Unified backtester with TP/SL and pretty $ output
+backtest.py — Backtester with TP/SL, reading model_meta.json and
+recomputing the same features used at training.
 
-Defaults:
-  • Data directory: ./eth_1m_data
-  • Model artifacts: ./model  (expects model_meta.json, model.pt, scaler.joblib)
-  • Binary classification: 1 = buy, 0 = no-trade
-  • TP/SL checked intra-bar via high/low
-  • Confidence threshold from model_meta.json (buy_threshold), CLI override possible
-
-Examples
---------
-python backtest.py --mode portfolio --capital 10000
-python backtest.py --mode portfolio --capital 10000 --tp-pct 0.005 --sl-pct 0.0025 --fee-pct 0.0008 --threshold 0.65
-python backtest.py --mode simple
+Usage
+-----
+python backtest.py --data-dir eth_1m_data --model-dir model
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import math as _math
 from typing import Dict, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -30,25 +25,92 @@ import torch.nn.functional as F
 
 from utils import (
     read_csv_concat_sorted, resolve_price_col, build_windows,
-    load_model_bundle, fmt_money, fmt_pct, DEFAULT_FEATURE_COLS
+    fmt_money, fmt_pct, DEFAULT_FEATURE_COLS
 )
 
-# --- import your project model ---
-try:
-    from models import LSTMClassifier  # noqa: F401 (loaded inside utils.load_model_bundle)
-except Exception as e:
-    raise SystemExit(
-        "Could not import LSTMClassifier from models.py. Ensure models.py is on PYTHONPATH.\n"
-        f"Underlying error: {e}"
-    )
+from train_model import LSTMClassifier  # matches the trained architecture
 
+# =========================
+# Feature engineering (same as train_model.py)
+# =========================
+ROLL_WINDOW = 20
+ATR_ALPHA = 1 / 14
+RSI_ALPHA = 1 / 14
 
-# ---------------------------
+def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    for c in ["open", "high", "low", "close"]:
+        if c not in df.columns:
+            raise ValueError(f"Missing required column '{c}'")
+    df = df.copy()
+    df["body"] = df["close"] - df["open"]
+    rng = (df["high"] - df["low"])
+    df["range"] = rng.replace(0, 1e-12)
+    df["upper_wick"] = (df["high"] - df[["close", "open"]].max(axis=1))
+    df["lower_wick"] = (df[["close", "open"]].min(axis=1) - df["low"])
+    df["return"] = df["close"].pct_change().fillna(0.0)
+    sma = df["close"].rolling(ROLL_WINDOW).mean()
+    df["sma_ratio"] = (df["close"] / (sma + 1e-12)).fillna(1.0)
+    df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
+    delta = df["close"].diff()
+    up = delta.clip(lower=0); down = -delta.clip(upper=0)
+    roll_up = up.ewm(alpha=RSI_ALPHA, adjust=False).mean()
+    roll_down = down.ewm(alpha=RSI_ALPHA, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    df["rsi_14"] = (100 - (100 / (1 + rs))).fillna(50.0)
+    if "volume" in df.columns:
+        df["vol_change"] = df["volume"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    else:
+        df["vol_change"] = 0.0
+    tr = pd.concat([
+        (df["high"] - df["low"]),
+        (df["high"] - df["close"].shift()).abs(),
+        (df["low"] - df["close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(alpha=ATR_ALPHA, adjust=False).mean().fillna(tr.mean())
+    ema_12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema_26 = df["close"].ewm(span=26, adjust=False).mean()
+    macd = ema_12 - ema_26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    df["macd"] = (macd - signal).fillna(0.0)
+    hourly = df["close"].ewm(span=60, adjust=False).mean()
+    df["price_vs_hourly_trend"] = (df["close"] / (hourly + 1e-12)).fillna(1.0)
+    std_20 = df["close"].rolling(ROLL_WINDOW).std()
+    upper = sma + 2 * std_20
+    lower = sma - 2 * std_20
+    df["bb_width"] = ((upper - lower) / (sma + 1e-12)).fillna(0.0)
+    return df
+
+# =========================
+# Model/scaler loader
+# =========================
+def load_model_bundle(model_dir: str):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    meta_path = os.path.join(model_dir, "model_meta.json")
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"Missing {meta_path}")
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+    model = LSTMClassifier(
+        input_size=meta["input_size"],
+        hidden_size=meta["hidden_size"],
+        num_layers=meta["num_layers"],
+        dropout=meta["dropout"],
+        bidirectional=meta["bidirectional"],
+    ).to(device)
+    ckpt_path = os.path.join(model_dir, meta.get("model_state_path", "model.pt"))
+    state = torch.load(ckpt_path, map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    model.load_state_dict(state, strict=True)
+    scaler = None
+    scaler_path = os.path.join(model_dir, meta.get("scaler_path", "scaler.joblib"))
+    if os.path.exists(scaler_path):
+        scaler = joblib.load(scaler_path)
+    return model, scaler, meta
+
+# =========================
 # Pretty formatting
-# ---------------------------
-import math as _math  # noqa: E402
-
-
+# =========================
 def print_portfolio_report(report: Dict, currency: str = "$") -> None:
     m = (report or {}).get("metrics", {}) or {}
     p = (report or {}).get("portfolio", {}) or {}
@@ -59,166 +121,121 @@ def print_portfolio_report(report: Dict, currency: str = "$") -> None:
     wins = int(p.get("wins", 0))
     losses = int(p.get("losses", 0))
     mdd = p.get("max_drawdown", None)
-    ret_frac = None
-    multiple = None
-    if start not in (None, 0) and end is not None:
-        multiple = float(end) / float(start)
-        ret_frac = multiple - 1.0
-
+    multiple = float(end) / float(start) if start not in (None, 0) and end is not None else None
     print("\n=== PORTFOLIO MODE — SUMMARY ===")
     print(f"Bars processed : {n:,}")
     print(f"Trades         : {trades:,}  (wins {wins}, losses {losses}, win rate {wins/max(1,trades):.2%})")
     print(f"Start capital  : {fmt_money(start, currency)}")
     print(f"End equity     : {fmt_money(end, currency)}")
-    if multiple is not None and _math.isfinite(multiple):
-        if multiple >= 1e6:
-            print(f"Return         : ×{multiple:.3e}  (⚠️ extremely large; check return scaling)")
-        else:
-            print(f"Return         : {fmt_pct(ret_frac)}  (×{multiple:.2f})")
+    if multiple is not None and np.isfinite(multiple):
+        print(f"Return         : {fmt_pct(multiple-1.0)}  (×{multiple:.2f})")
     else:
         print("Return         : —")
     if mdd is not None:
         print(f"Max drawdown   : {fmt_pct(mdd)}")
-    print("")  # newline
+    print("")
 
-
-# ---------------------------
-# Trade simulation with TP/SL (intra-bar)
-# ---------------------------
-
-def simulate_trades_with_tp_sl(
-    opens: np.ndarray, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray,
-    probs: np.ndarray, *,
-    threshold: float,
-    start_capital: float,
-    fee_pct: float = 0.0008,
-    tp_pct: float = 0.005,
-    sl_pct: float = 0.0025,
-) -> Tuple[Dict, pd.DataFrame]:
-    """
-    One-position-at-a-time long strategy:
-      - Enter at next bar open when prob >= threshold and not already in a trade.
-      - Set TP = entry * (1 + tp_pct), SL = entry * (1 - sl_pct).
-      - While in trade, check **intra-bar**: if high >= TP => exit at TP; elif low <= SL => exit at SL; else hold.
-      - Fees applied on both entry and exit.
-    """
-    n = len(closes)
-    cash = float(start_capital)
-    entry_price = None
-    tp_price = None
-    sl_price = None
-
-    equity_curve = np.empty(n, dtype=float)
-    equity_curve[0] = cash
-    in_trade = False
-    trades = 0
-    wins = 0
-    losses = 0
-
+# =========================
+# Trade simulation
+# =========================
+def simulate_trades_with_tp_sl(opens, highs, lows, closes, probs, *, threshold, start_capital,
+                               fee_pct=0.0008, tp_pct=0.005, sl_pct=0.0025) -> Tuple[Dict, pd.DataFrame]:
+    n = len(closes); cash = float(start_capital); in_trade = False
+    entry_price = tp_price = sl_price = None
+    equity_curve = np.empty(n, dtype=float); equity_curve[0] = cash
+    trades = wins = losses = 0
     for i in range(1, n):
-        price_open = float(opens[i])
-        price_high = float(highs[i])
-        price_low = float(lows[i])
-        price_close = float(closes[i])
-
+        o, hi, lo, c = float(opens[i]), float(highs[i]), float(lows[i]), float(closes[i])
         if not in_trade:
-            if probs[i - 1] >= threshold:
-                # enter at next bar open
-                entry = price_open
-                cash *= (1.0 - fee_pct)  # entry fee
-                entry_price = entry
-                tp_price = entry_price * (1.0 + tp_pct)
-                sl_price = entry_price * (1.0 - sl_pct)
-                in_trade = True
-                trades += 1
+            if probs[i-1] >= threshold:
+                cash *= (1.0 - fee_pct); entry_price = o
+                tp_price = entry_price * (1.0 + tp_pct); sl_price = entry_price * (1.0 - sl_pct)
+                in_trade = True; trades += 1
         else:
-            exit_price = None
-            win = None
-            # worst-case path if both touched within bar
-            if price_low <= sl_price <= price_high:
-                exit_price = sl_price
-                win = False
-            elif price_high >= tp_price:
-                exit_price = tp_price
-                win = True
-            elif price_low <= sl_price:
-                exit_price = sl_price
-                win = False
-
+            exit_price = None; win = None
+            if lo <= sl_price <= hi:   exit_price = sl_price; win = False
+            elif hi >= tp_price:       exit_price = tp_price; win = True
+            elif lo <= sl_price:       exit_price = sl_price; win = False
             if exit_price is not None:
-                gross_ret = (exit_price / entry_price) - 1.0
-                cash *= (1.0 + gross_ret)
-                cash *= (1.0 - fee_pct)  # exit fee
-                in_trade = False
-                entry_price = tp_price = sl_price = None
-                if win:
-                    wins += 1
-                else:
-                    losses += 1
+                cash *= (1.0 + (exit_price / entry_price) - 1.0); cash *= (1.0 - fee_pct)
+                in_trade = False; entry_price = tp_price = sl_price = None
+                wins += int(win); losses += int(not win)
             else:
-                # still in trade: mark-to-market on close
-                mtm = (price_close / entry_price) - 1.0
-                equity_curve[i] = cash * (1.0 + mtm)
-                continue
-
+                mtm = (c / entry_price) - 1.0
+                equity_curve[i] = cash * (1.0 + mtm); continue
         equity_curve[i] = cash
-
-    # close any open trade at final close with exit fee
     if in_trade and entry_price is not None:
-        gross_ret = (closes[-1] / entry_price) - 1.0
-        cash *= (1.0 + gross_ret)
-        cash *= (1.0 - fee_pct)
-
-    peaks = np.maximum.accumulate(equity_curve)
-    dd = (equity_curve - peaks) / peaks
-    max_dd = float(np.min(dd)) if len(dd) else 0.0
-
+        cash *= (1.0 + (closes[-1] / entry_price) - 1.0); cash *= (1.0 - fee_pct)
+    peaks = np.maximum.accumulate(equity_curve); dd = (equity_curve - peaks) / peaks
     report = {
         "metrics": {"n": int(n)},
         "portfolio": {
             "start_capital": float(start_capital),
             "end_equity": float(equity_curve[-1]),
             "return": float(equity_curve[-1] / max(1e-12, start_capital) - 1.0),
-            "max_drawdown": float(abs(max_dd)),
-            "trades": int(trades),
-            "wins": int(wins),
-            "losses": int(losses),
+            "max_drawdown": float(abs(np.min(dd)) if len(dd) else 0.0),
+            "trades": int(trades), "wins": int(wins), "losses": int(losses),
         },
     }
-    df_curve = pd.DataFrame({
-        "open": opens, "high": highs, "low": lows, "close": closes,
-        "equity": equity_curve, "prob": probs
-    })
+    df_curve = pd.DataFrame({"open": opens, "high": highs, "low": lows, "close": closes,
+                             "equity": equity_curve, "prob": probs})
     return report, df_curve
 
+# =========================
+# Robust prediction (auto-shrinks batch on CUDA OOM, CPU fallback)
+# =========================
+def predict_probs(model: torch.nn.Module, X: np.ndarray, batch_size: int, device: torch.device) -> np.ndarray:
+    probs = np.zeros(len(X), dtype=np.float32)
+    i = 0
+    bs = max(1, int(batch_size))
+    while i < len(X):
+        try:
+            xb_np = X[i:i+bs]
+            if len(xb_np) == 0:
+                break
+            xb = torch.from_numpy(xb_np).to(device, non_blocking=(device.type == "cuda"))
+            with torch.no_grad():
+                logits = model(xb)
+                p = F.softmax(logits, dim=-1)[:, 1].detach().cpu().numpy()
+            probs[i:i+len(p)] = p
+            i += len(p)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "out of memory" in msg and device.type == "cuda" and bs > 1:
+                torch.cuda.empty_cache()
+                bs = max(1, bs // 2)
+                print(f"[WARN] CUDA OOM — reducing batch size to {bs}")
+                continue
+            # If still failing on CUDA with bs=1, fall back to CPU
+            if "out of memory" in msg and device.type == "cuda":
+                print("[WARN] CUDA OOM at batch size 1 — falling back to CPU")
+                device = torch.device("cpu")
+                model = model.to(device)
+                torch.cuda.empty_cache()
+                continue
+            raise
+    return probs
 
-# ---------------------------
+# =========================
 # CLI
-# ---------------------------
-
+# =========================
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Backtester with TP/SL and probability threshold.")
     p.add_argument("--mode", choices=["simple", "portfolio"], default="portfolio")
     p.add_argument("--data-dir", type=str, default="eth_1m_data", help="Dir or a single CSV")
-    # ⬇️ default to 'model' so artifacts in ./model/ are found without flags
     p.add_argument("--model-dir", type=str, default="model", help="Root where model_meta.json & model.pt live")
-
-    # overrides / knobs
-    p.add_argument("--threshold", type=float, default=None, help="Buy probability threshold (default from model_meta.json)")
+    p.add_argument("--threshold", type=float, default=None, help="Buy threshold (default from model_meta.json)")
     p.add_argument("--tp-pct", type=float, default=None, help="Take-profit as fraction (0.005 = 0.5%)")
     p.add_argument("--sl-pct", type=float, default=None, help="Stop-loss as fraction (0.0025 = 0.25%)")
     p.add_argument("--fee-pct", type=float, default=None, help="Per-side fee fraction (0.0008 = 0.08%)")
     p.add_argument("--capital", type=float, default=10_000.0, help="Starting capital for portfolio mode")
-
-    # performance
-    p.add_argument("--batch-size", type=int, default=2048, help="Prediction batch size")
+    p.add_argument("--batch-size", type=int, default=512, help="Prediction batch size (auto-shrinks if OOM)")  # smaller default
+    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Force device (default auto)")
     return p
 
-
-# ---------------------------
+# =========================
 # Main
-# ---------------------------
-
+# =========================
 def main():
     args = build_argparser().parse_args()
 
@@ -231,17 +248,18 @@ def main():
     tp_pct = 0.005 if args.tp_pct is None else float(args.tp_pct)
     sl_pct = 0.0025 if args.sl_pct is None else float(args.sl_pct)
 
-    # Load data
+    # Load raw data and compute the SAME features as training
     df = read_csv_concat_sorted(args.data_dir)
     price_col = resolve_price_col(df.columns.tolist(), meta.get("price_col", "close"))
     if price_col is None:
         raise SystemExit(f"Could not locate a price column. Available: {list(df.columns)}")
+    df = compute_features(df)
 
-    # Build features
-    drop_cols = {price_col, "timestamp", "time"}
+    # Build feature matrix in the SAME order as meta (do NOT drop 'close')
+    drop_cols = {"timestamp", "time"}  # only drop non-features
     feat_cols = [c for c in feature_cols if c in df.columns and c not in drop_cols]
-    if len(feat_cols) != len(feature_cols):
-        missing = [c for c in feature_cols if c not in feat_cols]
+    missing = [c for c in feature_cols if c not in feat_cols]
+    if missing:
         print(f"[WARN] Missing features in data (will drop): {missing}")
     if not feat_cols:
         raise SystemExit("No valid feature columns found in data for inference.")
@@ -258,22 +276,22 @@ def main():
     lows = df["low"].to_numpy(dtype=float)[window_size - 1:]
     closes = df[price_col].to_numpy(dtype=float)[window_size - 1:]
 
-    # Scale if scaler exists
+    # Scale using same scaler (fit on all meta features)
     if scaler is not None:
         n, t, f = X.shape
         X = scaler.transform(X.reshape(n * t, f)).reshape(n, t, f)
 
-    # Predict probabilities (class 1 = buy)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Choose device
+    if args.device == "cpu":
+        device = torch.device("cpu")
+    elif args.device == "cuda" and torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    probs = np.zeros(len(X), dtype=np.float32)
-    with torch.no_grad():
-        BS = int(args.batch_size)
-        for i in range(0, len(X), BS):
-            xb = torch.from_numpy(X[i:i + BS]).to(device)
-            logits = model(xb)  # [B, 2]
-            p = F.softmax(logits, dim=-1)[:, 1].cpu().numpy()
-            probs[i:i + BS] = p
+
+    # Predict probabilities (auto-handles OOM)
+    probs = predict_probs(model, X, int(args.batch_size), device)
 
     if args.mode == "simple":
         print(json.dumps({
@@ -289,15 +307,9 @@ def main():
         opens, highs, lows, closes, probs,
         threshold=buy_threshold,
         start_capital=float(args.capital),
-        fee_pct=fee_pct,
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
+        fee_pct=fee_pct, tp_pct=tp_pct, sl_pct=sl_pct,
     )
-
     print_portfolio_report(report, currency="$")
-    # If you want raw JSON too, uncomment:
-    # print("Raw JSON:\n" + json.dumps(report, indent=2))
-
 
 if __name__ == "__main__":
     main()
