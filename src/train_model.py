@@ -6,6 +6,12 @@ Key changes:
 - Uses model_meta.json (if present) to lock feature_cols, window_size, and core dims.
 - Computes ALL features in meta by name (including vol_change, price_vs_hourly_trend).
 - Saves best and last checkpoints along with scaler and updated meta.
+
+Usage examples
+--------------
+python train_model.py --data-path eth_1m_data --output-dir model
+python train_model.py --data-path eth_1m_data --output-dir model --batch-size 512 --epochs 40 --accumulate 2 --amp 1
+python train_model.py --data-path eth_1m_2024-03.csv --output-dir model --window-size 192
 """
 
 import argparse
@@ -23,6 +29,7 @@ import torch
 from collections import deque
 from torch import nn
 from torch.utils.data import IterableDataset, DataLoader
+
 
 # ----------------------------
 # Repro & Device
@@ -115,7 +122,7 @@ def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
     macd = ema_12 - ema_26
     signal = macd.ewm(span=9, adjust=False).mean()
     df["macd"] = (macd - signal).fillna(0.0)
-
+    
     # Hourly trend ratio (1m data → 60)
     hourly = df["close"].ewm(span=60, adjust=False).mean()
     df["price_vs_hourly_trend"] = (df["close"] / (hourly + 1e-12)).fillna(1.0)
@@ -378,7 +385,7 @@ def train(cfg: TrainConfig):
 
     model_path = outdir / "model.pt"
     last_path  = outdir / "model_last.pt"
-    meta_path = outdir / "model_meta.json"   # <--- corrected path
+    meta_path = outdir / "model_meta.json"
     scaler_path = outdir / "scaler.joblib"
 
     torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, last_path)
@@ -413,13 +420,14 @@ def train(cfg: TrainConfig):
     meta_path.write_text(json.dumps(meta, indent=2))
 
     (outdir / "training_summary.json").write_text(json.dumps({
-    "val_acc_best": best_val,
-    "feature_cols": feature_cols,
-    "num_params": sum(p.numel() for p in model.parameters()),
-    "config": vars(cfg) | {"meta_path": str(meta_path)},
+        "val_acc_best": best_val,
+        "feature_cols": feature_cols,
+        "num_params": sum(p.numel() for p in model.parameters()),
+        "config": vars(cfg) | {"meta_path": str(meta_path)},
     }, indent=2))
 
     print(f"Saved: {model_path}, {last_path}, scaler=True, meta={meta_path}")
+
 
 def env_default(key: str, fallback: str) -> str:
     v = os.environ.get(key)
@@ -427,7 +435,7 @@ def env_default(key: str, fallback: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Memory-safe streaming trainer for LSTM classifier (meta-aware).")
-    p.add_argument("--data", type=str, default=env_default("SM_CHANNEL_TRAIN", "eth_1m_data"))
+    p.add_argument("--data-path", type=str, default=env_default("SM_CHANNEL_TRAIN", "eth_1m_data"))  # renamed
     p.add_argument("--output-dir", type=str, default=env_default("SM_MODEL_DIR", "./model"))
     p.add_argument("--meta-path", type=str, default="model/model_meta.json")  # default to inside output dir
 
@@ -459,7 +467,7 @@ def main():
     if not mp.is_absolute():
         mp = Path(args.output_dir) / mp
     cfg = TrainConfig(
-        data_path=args.data,
+        data_path=args.data_path,     # <-- uses data_path now
         output_dir=args.output_dir,
         meta_path=str(mp),
         window_size=args.window_size,
