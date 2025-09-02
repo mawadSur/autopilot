@@ -25,17 +25,17 @@
   "label_def": "next_bar_up",
   "num_classes": 2,
   "price_col": "close",
-  "window_size": 150,
+  "window_size": 192,
   "input_size": 17,
   "hidden_size": 512,
   "num_layers": 3,
-  "dropout": 0.3,
+  "dropout": 0.2,
   "bidirectional": true,
-  "buy_threshold": 0.60,
-  "sell_threshold": 0.60,
+  "buy_threshold": 0.6,
+  "sell_threshold": 0.6,
   "tx_cost": 0.0008,
   "model_state_path": "model.pt",
   "last_model_state_path": "model_last.pt",
   "scaler_path": "scaler.joblib",
-  "notes": "Binary classification (1=buy, 0=no-trade). Uses 17 engineered features (no time-of-day). Defaults tuned for higher precision; adjust thresholds via CLI if needed."
+  "notes": "Binary classification (1=buy, 0=no-trade). Streaming trainer with meta-locked features."
 }
