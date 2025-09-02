@@ -7,6 +7,11 @@ Enhancements:
 - Loads defaults from .env (via python-dotenv)
 - Ensures local training data directory is uploaded to S3 if not present
 - Uses absolute source_dir for entry point so "No file named aws_train_model.py" error is avoided
+
+Note:
+- The training entrypoint (train_model.py) now reads model_meta.json if present in the
+  output directory to lock features/window/hidden sizes to that file. You can still
+  override via CLI flags; the trainer will merge sensibly.
 """
 
 import argparse
@@ -24,7 +29,6 @@ from sagemaker.inputs import TrainingInput
 # Load environment variables from .env if present
 load_dotenv()
 
-# ---------- Helpers ----------
 def _bool_env(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
@@ -36,13 +40,7 @@ def _s3_uri(bucket: str, key_prefix: str) -> str:
     return f"s3://{bucket}/{key_prefix}"
 
 def ensure_data_in_s3(local_dir: Path, s3_client, bucket: str, prefix: str) -> str:
-    """
-    Ensure training data is available in S3 under {prefix}/train/.
-    If nothing exists under that prefix, upload all files from local_dir (recursively).
-    Returns the s3:// URI used for the training channel.
-    """
     train_prefix = f"{prefix.rstrip('/')}/train/"
-    # 1) Check if objects already present
     try:
         resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=train_prefix, MaxKeys=1)
         already_there = ("Contents" in resp and len(resp["Contents"]) > 0)
@@ -53,7 +51,6 @@ def ensure_data_in_s3(local_dir: Path, s3_client, bucket: str, prefix: str) -> s
         print(f"\nFound existing training data under s3://{bucket}/{train_prefix} — will reuse.")
         return _s3_uri(bucket, train_prefix)
 
-    # 2) Otherwise upload local files
     if not local_dir.exists() or not local_dir.is_dir():
         raise FileNotFoundError(f"Local training data directory not found: {local_dir}")
 
@@ -77,10 +74,8 @@ def ensure_data_in_s3(local_dir: Path, s3_client, bucket: str, prefix: str) -> s
     print(f"Uploaded {uploaded} files to s3://{bucket}/{train_prefix}")
     return _s3_uri(bucket, train_prefix)
 
-
 def build_parser():
     p = argparse.ArgumentParser(description="Launch SageMaker training with supported flags only")
-
     # Infra / job settings (defaults from .env)
     p.add_argument("--role-arn", default=os.getenv("SAGEMAKER_ROLE_ARN"), required=False)
     p.add_argument("--region", default=os.getenv("AWS_REGION", "us-east-1"))
@@ -94,18 +89,8 @@ def build_parser():
     p.add_argument("--job-name", default=None)
 
     # Data location
-    p.add_argument(
-        "--local-train-dir",
-        default=os.getenv("DATA_DIR", "eth_1m_data"),
-        help="Local directory of CSVs to upload if S3 is empty (defaults from .env DATA_DIR).",
-    )
-    p.add_argument(
-        "--train-s3-uri",
-        default=os.getenv("TRAIN_S3_URI"),
-        required=False,
-        help="If provided, use this S3 path directly for the 'train' channel. "
-             "If omitted, we ensure s3://{bucket}/{prefix}/train/ exists (upload if needed).",
-    )
+    p.add_argument("--local-train-dir", default=os.getenv("DATA_DIR", "eth_1m_data"))
+    p.add_argument("--train-s3-uri", default=os.getenv("TRAIN_S3_URI"), required=False)
 
     # Trainer flags (SUPPORTED ONLY; optimistic defaults)
     p.add_argument("--window-size", type=int, default=192)
@@ -124,32 +109,22 @@ def build_parser():
     p.add_argument("--price-col", default="close")
 
     # Deployment controls (defaults from .env)
-    p.add_argument("--deploy", action="store_true", default=True,
-                   help="If set/true, deploy the trained model to a real-time endpoint.")
-    p.add_argument("--endpoint-name", default=os.getenv("ENDPOINT_NAME"),
-                   help="Optional endpoint name. Defaults to <job-name>-endpoint.")
-    p.add_argument("--endpoint-instance-type", default=os.getenv("ENDPOINT_INSTANCE_TYPE", "ml.m5.large"),
-                   help="Instance type for endpoint hosting.")
-    p.add_argument("--endpoint-initial-count", type=int,
-                   default=int(os.getenv("ENDPOINT_INSTANCES", 1)),
-                   help="Initial instance count for endpoint hosting.")
-    p.add_argument("--deploy-entry-point", default="inference.py",
-                   help="Serving entry point script (must exist in source_dir).")
-
+    p.add_argument("--deploy", action="store_true", default=True)
+    p.add_argument("--endpoint-name", default=os.getenv("ENDPOINT_NAME"))
+    p.add_argument("--endpoint-instance-type", default=os.getenv("ENDPOINT_INSTANCE_TYPE", "ml.m5.large"))
+    p.add_argument("--endpoint-initial-count", type=int, default=int(os.getenv("ENDPOINT_INSTANCES", 1)))
+    p.add_argument("--deploy-entry-point", default="inference.py")
     return p
-
 
 def main():
     args = build_parser().parse_args()
 
-    # Validate required base config (can come from .env)
     if not args.role_arn:
         raise ValueError("Missing --role-arn (or SAGEMAKER_ROLE_ARN in .env)")
     if not args.bucket:
         raise ValueError("Missing --bucket (or S3_BUCKET_NAME in .env)")
 
-    # Compute script directory; ensure entry point exists here.
-    script_dir = Path(__file__).resolve().parent  # e.g., <repo>/src
+    script_dir = Path(__file__).resolve().parent
     entry_point_path = script_dir / "aws_train_model.py"
     if not entry_point_path.exists():
         raise ValueError(
@@ -157,7 +132,6 @@ def main():
             "Ensure aws_train_model.py is alongside launch_sagemaker_job.py."
         )
 
-    # Build/train data S3 URI: use provided --train-s3-uri, or ensure upload to s3://bucket/prefix/train/
     if args.train_s3_uri:
         train_s3_uri = args.train_s3_uri
         print(f"\nUsing provided training S3 URI: {train_s3_uri}")
@@ -168,7 +142,6 @@ def main():
                      else (script_dir / args.local_train_dir).resolve())
         train_s3_uri = ensure_data_in_s3(local_dir, s3, args.bucket, args.prefix)
 
-    # Derive a sensible default job name if none provided
     job_name = args.job_name or f"eth-lstm-opt-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     print("\n=== SageMaker Training Job Configuration ===")
     print(f"Region:             {args.region}")
@@ -182,7 +155,6 @@ def main():
     print(f"Bucket/Prefix:      {args.bucket} / {args.prefix}")
     print(f"Job Name:           {job_name}")
 
-    # Construct hyperparameters (only supported keys)
     hyperparameters = {
         "window-size": args.window_size,
         "hidden-size": args.hidden_size,
@@ -205,10 +177,9 @@ def main():
     for k in sorted(hyperparameters.keys()):
         print(f"{k:16s}: {hyperparameters[k]}")
 
-    # Prepare estimator (training) — use absolute source_dir so entry point is found
     estimator_kwargs = dict(
-        entry_point=entry_point_path.name,   # "aws_train_model.py"
-        source_dir=str(script_dir),          # absolute path to folder containing entry point & code
+        entry_point=entry_point_path.name,
+        source_dir=str(script_dir),
         role=args.role_arn,
         instance_type=args.instance_type,
         instance_count=args.instance_count,
@@ -219,20 +190,12 @@ def main():
     )
     est = PyTorch(**{k: v for k, v in estimator_kwargs.items() if v is not None})
 
-    # Channel mapping
-    inputs = {
-        "train": TrainingInput(
-            s3_data=train_s3_uri,
-            content_type="text/csv"
-        )
-    }
-
+    inputs = {"train": TrainingInput(s3_data=train_s3_uri, content_type="text/csv")}
     print("\nStarting SageMaker training job...")
     est.fit(inputs=inputs, job_name=job_name)
     print("\nTraining job submitted. Check SageMaker Console for live logs and metrics.")
     print(f"Job Name: {job_name}")
 
-    # Deployment
     if args.deploy:
         endpoint_name = args.endpoint_name or f"{job_name}-endpoint"
         print("\n=== Deployment Configuration ===")
@@ -246,12 +209,11 @@ def main():
             model_data=model_data,
             role=args.role_arn,
             entry_point=args.deploy_entry_point,
-            source_dir=str(script_dir),   # serve from same source_dir (has inference.py)
+            source_dir=str(script_dir),
             framework_version=args.framework_version,
             py_version=args.py_version,
             image_uri=args.image_uri,
         )
-
         print("\nDeploying model to endpoint...")
         predictor = sm_model.deploy(
             initial_instance_count=args.endpoint_initial_count,
@@ -262,7 +224,6 @@ def main():
         print("\n=== Deployment Complete ===")
     else:
         print("\n--deploy was disabled; skipping endpoint creation.")
-
 
 if __name__ == "__main__":
     main()
