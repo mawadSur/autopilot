@@ -30,7 +30,7 @@ except Exception:
     joblib = None
 
 # Project utils/models
-from utils import load_meta, build_windows, DEFAULT_FEATURE_COLS
+from utils import load_meta, build_windows
 from models import LSTMClassifier
 
 
@@ -42,7 +42,7 @@ def model_fn(model_dir: str):
     Returns a tuple (model.eval(), scaler_or_None, meta_dict).
     """
     meta = load_meta(model_dir)
-    feature_cols: List[str] = list(meta.get("feature_cols", DEFAULT_FEATURE_COLS))
+    feature_cols: List[str] = list(meta["feature_cols"])  # strict: must exist
     hidden_size = int(meta.get("hidden_size", 512))
     num_layers = int(meta.get("num_layers", 3))
     dropout = float(meta.get("dropout", 0.3))
@@ -142,7 +142,7 @@ def predict_fn(input_object: Dict[str, Any], model_bundle):
     Output dict includes probs and hard labels using buy_threshold from meta.
     """
     model, scaler, meta = model_bundle
-    feature_cols: List[str] = list(meta.get("feature_cols", DEFAULT_FEATURE_COLS))
+    feature_cols: List[str] = list(meta["feature_cols"])  # strict: must exist
     window_size = int(meta.get("window_size", 150))
     threshold = float(meta.get("buy_threshold", 0.60))
 

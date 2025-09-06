@@ -29,6 +29,7 @@ import torch
 from collections import deque
 from torch import nn
 from torch.utils.data import IterableDataset, DataLoader
+from utils import compute_features
 
 
 # ----------------------------
@@ -68,72 +69,6 @@ ALL_FEATURES = [
     "bb_width",
 ]
 
-ROLL_WINDOW = 20
-ATR_ALPHA = 1/14
-RSI_ALPHA = 1/14
-
-def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    # Ensure basic columns exist
-    for c in ["open", "high", "low", "close"]:
-        if c not in df.columns:
-            raise ValueError(f"Missing required column '{c}'")
-
-    # Candlestick geometry
-    df["body"] = df["close"] - df["open"]
-    rng = (df["high"] - df["low"])
-    df["range"] = rng.replace(0, 1e-12)
-    df["upper_wick"] = (df["high"] - df[["close", "open"]].max(axis=1))
-    df["lower_wick"] = (df[["close", "open"]].min(axis=1) - df["low"])
-    df["return"] = df["close"].pct_change().fillna(0.0)
-
-    # SMA ratio (20)
-    sma = df["close"].rolling(ROLL_WINDOW).mean()
-    df["sma_ratio"] = (df["close"] / (sma + 1e-12)).fillna(1.0)
-
-    # EMA(20)
-    df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
-
-    # RSI(14) with EMA smoothing
-    delta = df["close"].diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=RSI_ALPHA, adjust=False).mean()
-    roll_down = down.ewm(alpha=RSI_ALPHA, adjust=False).mean()
-    rs = roll_up / (roll_down + 1e-12)
-    df["rsi_14"] = (100 - (100 / (1 + rs))).fillna(50.0)
-
-    # Volume percent change
-    if "volume" in df.columns:
-        df["vol_change"] = df["volume"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
-    else:
-        df["vol_change"] = 0.0
-
-    # ATR(14) (EMA of True Range)
-    tr = pd.concat([
-        (df["high"] - df["low"]),
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs(),
-    ], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(alpha=ATR_ALPHA, adjust=False).mean().fillna(tr.mean())
-
-    # MACD(12,26) - signal(9)
-    ema_12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema_26 = df["close"].ewm(span=26, adjust=False).mean()
-    macd = ema_12 - ema_26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    df["macd"] = (macd - signal).fillna(0.0)
-    
-    # Hourly trend ratio (1m data → 60)
-    hourly = df["close"].ewm(span=60, adjust=False).mean()
-    df["price_vs_hourly_trend"] = (df["close"] / (hourly + 1e-12)).fillna(1.0)
-
-    # Bollinger Band width (20, 2σ)
-    std_20 = df["close"].rolling(ROLL_WINDOW).std()
-    upper = sma + 2 * std_20
-    lower = sma - 2 * std_20
-    df["bb_width"] = ((upper - lower) / (sma + 1e-12)).fillna(0.0)
-
-    return df
 
 def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     cols = [str(c).lower() for c in df.columns]
@@ -161,7 +96,7 @@ def _stream_rows(files: List[Path], chunksize: int = 500_000, overlap: int = 256
             chunk = _normalize_headers(chunk)
             if tail is not None:
                 chunk = pd.concat([tail, chunk], ignore_index=True)
-            chunk = _compute_features(chunk)
+            chunk = compute_features(chunk)
             if len(chunk) > overlap:
                 yield chunk.iloc[overlap:].reset_index(drop=True)
                 tail = chunk.iloc[-overlap:].reset_index(drop=True)

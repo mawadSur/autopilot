@@ -1,5 +1,5 @@
 {
-  "val_acc_best": 0.5063291139240507,
+  "val_acc_best": 0.5136504362510554,
   "feature_cols": [
     "open",
     "high",

@@ -18,11 +18,6 @@ python paper_trade.py --threshold 0.65 --tp-pct 0.005 --sl-pct 0.0025 --fee-pct 
 from __future__ import annotations
 
 import argparse
-import glob
-import json
-import math
-import os
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -31,59 +26,8 @@ import torch
 import torch.nn.functional as F
 from utils import (
     read_csv_concat_sorted, resolve_price_col, build_windows,
-    load_model_bundle, fmt_money, DEFAULT_FEATURE_COLS
+    load_model_bundle, fmt_money
 )
-
-try:
-    import joblib
-except Exception:
-    joblib = None
-
-try:
-    from models import LSTMClassifier
-except Exception as e:
-    raise SystemExit(
-        "Could not import LSTMClassifier from models.py. Ensure models.py is on PYTHONPATH.\n"
-        f"Underlying error: {e}"
-    )
-
-PRICE_CANDIDATES = ["close", "adj_close", "adj close", "close_price", "price", "last", "mid", "c"]
-
-DEFAULT_COLS_6 = ["timestamp", "open", "high", "low", "close", "volume"]
-DEFAULT_COLS_7 = ["timestamp", "open", "high", "low", "close", "volume", "trades"]
-
-def _columns_look_headerless(cols: List[str]) -> bool:
-    lowers = [str(c).strip().lower() for c in cols]
-    if any(k in lowers for k in ["open","high","low","close","volume","timestamp","time","c","o","h","l","v"]):
-        return False
-    numeric_like = 0
-    for c in cols:
-        s = str(c).strip().replace(".", "", 1).replace("-", "", 1)
-        if s.isdigit():
-            numeric_like += 1
-    return numeric_like >= max(3, len(cols)//2)
-
-def _apply_default_headers(df: pd.DataFrame) -> pd.DataFrame:
-    n = df.shape[1]
-    if n == 6:
-        df.columns = DEFAULT_COLS_6
-    elif n == 7:
-        df.columns = DEFAULT_COLS_7
-    else:
-        df.columns = [f"col{i}" for i in range(n)]
-    return df
-
-def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
-    if _columns_look_headerless(list(df.columns)):
-        df = _apply_default_headers(df)
-    return df
-
-def load_meta(model_dir: str) -> Dict:
-    meta_path = Path(model_dir) / "model_meta.json"
-    if not meta_path.exists():
-        raise FileNotFoundError(f"model_meta.json not found in {model_dir}")
-    with open(meta_path, "r") as f:
-        return json.load(f)
 
 def main():
     ap = argparse.ArgumentParser(description="Paper (simulated) trading with TP/SL and threshold.")
@@ -99,7 +43,7 @@ def main():
 
     # Load model + meta
     model, scaler, meta = load_model_bundle(args.model_dir)
-    feature_cols = list(meta.get("feature_cols", []))
+    feature_cols = list(meta["feature_cols"])  # strict: must exist
     window_size = int(meta.get("window_size", 150))
     buy_threshold = float(meta.get("buy_threshold", 0.60)) if args.threshold is None else float(args.threshold)
     fee_pct = float(meta.get("tx_cost", 0.0008)) if args.fee_pct is None else float(args.fee_pct)

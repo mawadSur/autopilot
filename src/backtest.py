@@ -17,7 +17,6 @@ import os
 import math as _math
 from typing import Dict, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -25,88 +24,12 @@ import torch.nn.functional as F
 
 from utils import (
     read_csv_concat_sorted, resolve_price_col, build_windows,
-    fmt_money, fmt_pct, DEFAULT_FEATURE_COLS
+    fmt_money, fmt_pct, compute_features, load_model_bundle
 )
 
-from train_model import LSTMClassifier  # matches the trained architecture
+# Features are now centralized in utils.compute_features
 
-# =========================
-# Feature engineering (same as train_model.py)
-# =========================
-ROLL_WINDOW = 20
-ATR_ALPHA = 1 / 14
-RSI_ALPHA = 1 / 14
-
-def compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    for c in ["open", "high", "low", "close"]:
-        if c not in df.columns:
-            raise ValueError(f"Missing required column '{c}'")
-    df = df.copy()
-    df["body"] = df["close"] - df["open"]
-    rng = (df["high"] - df["low"])
-    df["range"] = rng.replace(0, 1e-12)
-    df["upper_wick"] = (df["high"] - df[["close", "open"]].max(axis=1))
-    df["lower_wick"] = (df[["close", "open"]].min(axis=1) - df["low"])
-    df["return"] = df["close"].pct_change().fillna(0.0)
-    sma = df["close"].rolling(ROLL_WINDOW).mean()
-    df["sma_ratio"] = (df["close"] / (sma + 1e-12)).fillna(1.0)
-    df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
-    delta = df["close"].diff()
-    up = delta.clip(lower=0); down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=RSI_ALPHA, adjust=False).mean()
-    roll_down = down.ewm(alpha=RSI_ALPHA, adjust=False).mean()
-    rs = roll_up / (roll_down + 1e-12)
-    df["rsi_14"] = (100 - (100 / (1 + rs))).fillna(50.0)
-    if "volume" in df.columns:
-        df["vol_change"] = df["volume"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
-    else:
-        df["vol_change"] = 0.0
-    tr = pd.concat([
-        (df["high"] - df["low"]),
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs(),
-    ], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(alpha=ATR_ALPHA, adjust=False).mean().fillna(tr.mean())
-    ema_12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema_26 = df["close"].ewm(span=26, adjust=False).mean()
-    macd = ema_12 - ema_26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    df["macd"] = (macd - signal).fillna(0.0)
-    hourly = df["close"].ewm(span=60, adjust=False).mean()
-    df["price_vs_hourly_trend"] = (df["close"] / (hourly + 1e-12)).fillna(1.0)
-    std_20 = df["close"].rolling(ROLL_WINDOW).std()
-    upper = sma + 2 * std_20
-    lower = sma - 2 * std_20
-    df["bb_width"] = ((upper - lower) / (sma + 1e-12)).fillna(0.0)
-    return df
-
-# =========================
-# Model/scaler loader
-# =========================
-def load_model_bundle(model_dir: str):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    meta_path = os.path.join(model_dir, "model_meta.json")
-    if not os.path.exists(meta_path):
-        raise FileNotFoundError(f"Missing {meta_path}")
-    with open(meta_path, "r") as f:
-        meta = json.load(f)
-    model = LSTMClassifier(
-        input_size=meta["input_size"],
-        hidden_size=meta["hidden_size"],
-        num_layers=meta["num_layers"],
-        dropout=meta["dropout"],
-        bidirectional=meta["bidirectional"],
-    ).to(device)
-    ckpt_path = os.path.join(model_dir, meta.get("model_state_path", "model.pt"))
-    state = torch.load(ckpt_path, map_location=device)
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
-    model.load_state_dict(state, strict=True)
-    scaler = None
-    scaler_path = os.path.join(model_dir, meta.get("scaler_path", "scaler.joblib"))
-    if os.path.exists(scaler_path):
-        scaler = joblib.load(scaler_path)
-    return model, scaler, meta
+    
 
 # =========================
 # Pretty formatting
@@ -241,7 +164,9 @@ def main():
 
     # Load model + meta
     model, scaler, meta = load_model_bundle(args.model_dir)
-    feature_cols = list(meta.get("feature_cols", DEFAULT_FEATURE_COLS))
+    if "feature_cols" not in meta:
+        raise KeyError("Missing 'feature_cols' in model_meta.json; no fallback is allowed.")
+    feature_cols = list(meta["feature_cols"])  
     window_size = int(meta.get("window_size", 150))
     buy_threshold = float(meta.get("buy_threshold", 0.60)) if args.threshold is None else float(args.threshold)
     fee_pct = float(meta.get("tx_cost", 0.0008)) if args.fee_pct is None else float(args.fee_pct)
