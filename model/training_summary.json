@@ -1,7 +1,4 @@
 {
-<<<<<<< HEAD
-  "val_acc_best": 0.5136504362510554,
-=======
   "walk_forward_folds": 24,
   "folds": [
     {
@@ -522,7 +519,6 @@
     }
   ],
   "val_acc_aggregate": 0.7949330783938814,
->>>>>>> b6dfefe (Updated scripts versions and .env)
   "feature_cols": [
     "open",
     "high",
@@ -535,27 +531,6 @@
     "return",
     "sma_ratio",
     "ema_20",
-<<<<<<< HEAD
-    "macd",
-    "rsi_14",
-    "vol_change",
-    "atr",
-    "price_vs_hourly_trend",
-    "bb_width"
-  ],
-  "num_params": 15039234,
-  "config": {
-    "data_path": "eth_1m_data",
-    "output_dir": "./model",
-    "meta_path": "model/model_meta.json",
-    "window_size": 192,
-    "hidden_size": 512,
-    "num_layers": 3,
-    "dropout": 0.2,
-    "bidirectional": true,
-    "epochs": 30,
-    "batch_size": 256,
-=======
     "rsi_14",
     "atr",
     "macd",
@@ -579,19 +554,15 @@
     "bidirectional": true,
     "epochs": 40,
     "batch_size": 512,
->>>>>>> b6dfefe (Updated scripts versions and .env)
     "learning_rate": 0.003,
     "weight_decay": 0.0001,
     "val_frac": 0.15,
     "accumulate": 2,
     "seed": 1337,
     "price_col": "close",
-<<<<<<< HEAD
-=======
     "tp_pct": 0.01,
     "sl_pct": 0.005,
     "time_limit": 30,
->>>>>>> b6dfefe (Updated scripts versions and .env)
     "amp": true,
     "workers": 0,
     "chunksize": 500000
