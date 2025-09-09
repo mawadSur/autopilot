@@ -1,35 +1,87 @@
-# ------------------------------
-# Step 1 & 2: Imports and Setup
-# ------------------------------
+#!/usr/bin/env python3
+"""
+Deploy a trained PyTorch model (inference.py) to a SageMaker Serverless endpoint.
+
+Reads configuration from .env:
+  - MODEL_S3_PATH: s3://.../model.tar.gz
+  - SAGEMAKER_ROLE_ARN, AWS_REGION
+  - ENDPOINT_NAME (optional)
+  - FRAMEWORK_VERSION, PY_VERSION (optional)
+  - SERVERLESS_MEMORY_MB, SERVERLESS_MAX_CONCURRENCY (optional)
+"""
+
+import os
+import boto3
 import sagemaker
-from sagemaker import get_execution_role
-from sagemaker.model import Model
+from pathlib import Path
+from dotenv import load_dotenv
+from sagemaker.pytorch import PyTorchModel
 from sagemaker.serverless import ServerlessInferenceConfig
 
-# Setup SageMaker session and role
-session = sagemaker.Session()
-role = get_execution_role()
 
-# ------------------------------
-# Step 3: Define Your Model
-# ------------------------------
-model = Model(
-    model_data='s3://sagemaker-us-east-1-469090608362/eth-price-prediction-data-train-2025-08-17-20-16-27-317/output/model.tar.gz',
-    image_uri='469090608362.dkr.ecr.us-east-1.amazonaws.com/sklearn-inference:0.24-1-cpu-py3',
-   role=role
-)
+def env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    try:
+        return int(v) if v is not None else default
+    except Exception:
+        return default
 
-# ------------------------------
-# ✅ Step 4: Deploy to Serverless
-# ------------------------------
-serverless_config = ServerlessInferenceConfig(
-    memory_size_in_mb=2048,   # 1024–6144 MB
-    max_concurrency=10        # Requests handled concurrently
-)
 
-predictor = model.deploy(
-    serverless_inference_config=serverless_config,
-    endpoint_name='my-serverless-endpoint'
-)
+def main():
+    load_dotenv()
 
-predictor.delete_endpoint()
+    region = os.getenv("AWS_REGION", "us-east-1")
+    role = os.getenv("SAGEMAKER_ROLE_ARN")
+    model_s3 = os.getenv("MODEL_S3_PATH")
+    endpoint_name = os.getenv("ENDPOINT_NAME", "pytorch-serverless-endpoint")
+
+    if not role:
+        raise RuntimeError("SAGEMAKER_ROLE_ARN not set in .env")
+    if not model_s3:
+        raise RuntimeError("MODEL_S3_PATH not set in .env (s3://.../model.tar.gz)")
+
+    fw = os.getenv("FRAMEWORK_VERSION", "2.3")
+    py = os.getenv("PY_VERSION", "py311")
+
+    mem_mb = env_int("SERVERLESS_MEMORY_MB", 2048)
+    max_conc = env_int("SERVERLESS_MAX_CONCURRENCY", 10)
+
+    boto_sess = boto3.Session(region_name=region)
+    sm_sess = sagemaker.Session(boto_session=boto_sess)
+
+    script_dir = Path(__file__).resolve().parent
+
+    print("\n=== Serverless Deployment Config ===")
+    print(f"Region:            {region}")
+    print(f"Role:              {role}")
+    print(f"Model S3:          {model_s3}")
+    print(f"Endpoint Name:     {endpoint_name}")
+    print(f"Framework/Python:  {fw} / {py}")
+    print(f"Serverless:        {mem_mb} MB, max_concurrency={max_conc}")
+
+    model = PyTorchModel(
+        model_data=model_s3,
+        role=role,
+        entry_point="inference.py",
+        source_dir=str(script_dir),
+        framework_version=fw,
+        py_version=py,
+        sagemaker_session=sm_sess,
+    )
+
+    serverless_config = ServerlessInferenceConfig(
+        memory_size_in_mb=mem_mb,
+        max_concurrency=max_conc,
+    )
+
+    print("\nDeploying serverless endpoint...")
+    predictor = model.deploy(
+        serverless_inference_config=serverless_config,
+        endpoint_name=endpoint_name,
+    )
+    print(f"Endpoint deployed: {predictor.endpoint_name}")
+
+
+if __name__ == "__main__":
+    main()
+

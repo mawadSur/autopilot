@@ -204,7 +204,16 @@ def main():
         print(f"Endpoint Initial Count:  {args.endpoint_initial_count}")
         print(f"Serving Entry Point:     {args.deploy_entry_point}")
 
-        model_data = est.latest_training_job.model_artifacts
+        # Get S3 URI of the trained model artifact. Newer SDKs expose
+        # estimator.model_data; older patterns used latest_training_job.model_artifacts
+        model_data = getattr(est, "model_data", None)
+        if not model_data:
+            # Fallback to explicit DescribeTrainingJob using the job_name we just ran
+            sm_client = boto3.client("sagemaker", region_name=args.region)
+            desc = sm_client.describe_training_job(TrainingJobName=job_name)
+            model_data = desc.get("ModelArtifacts", {}).get("S3ModelArtifacts")
+            if not model_data:
+                raise RuntimeError("Could not determine model artifacts S3 URI from training job.")
         sm_model = PyTorchModel(
             model_data=model_data,
             role=args.role_arn,

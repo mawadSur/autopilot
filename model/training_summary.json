@@ -1,5 +1,528 @@
 {
+<<<<<<< HEAD
   "val_acc_best": 0.5136504362510554,
+=======
+  "walk_forward_folds": 24,
+  "folds": [
+    {
+      "fold": 1,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv"
+      ],
+      "val_acc": 0.8680688336520076
+    },
+    {
+      "fold": 2,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv"
+      ],
+      "val_acc": 0.9502868068833652
+    },
+    {
+      "fold": 3,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv"
+      ],
+      "val_acc": 0.8355640535372849
+    },
+    {
+      "fold": 4,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv"
+      ],
+      "val_acc": 0.9120458891013384
+    },
+    {
+      "fold": 5,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv"
+      ],
+      "val_acc": 0.9904397705544933
+    },
+    {
+      "fold": 6,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv"
+      ],
+      "val_acc": 0.9349904397705545
+    },
+    {
+      "fold": 7,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv"
+      ],
+      "val_acc": 0.7304015296367112
+    },
+    {
+      "fold": 8,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv"
+      ],
+      "val_acc": 0.7170172084130019
+    },
+    {
+      "fold": 9,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv"
+      ],
+      "val_acc": 0.497131931166348
+    },
+    {
+      "fold": 10,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv"
+      ],
+      "val_acc": 0.9961759082217974
+    },
+    {
+      "fold": 11,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv"
+      ],
+      "val_acc": 0.9502868068833652
+    },
+    {
+      "fold": 12,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2024-08.csv"
+      ],
+      "val_acc": 0.7380497131931166
+    },
+    {
+      "fold": 13,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-08.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2024-09.csv"
+      ],
+      "val_acc": 0.7762906309751434
+    },
+    {
+      "fold": 14,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-09.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2024-10.csv"
+      ],
+      "val_acc": 0.7074569789674953
+    },
+    {
+      "fold": 15,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-10.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2024-11.csv"
+      ],
+      "val_acc": 0.6787762906309751
+    },
+    {
+      "fold": 16,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-11.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2024-12.csv"
+      ],
+      "val_acc": 0.9866156787762906
+    },
+    {
+      "fold": 17,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-12.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2025-01.csv"
+      ],
+      "val_acc": 0.8986615678776291
+    },
+    {
+      "fold": 18,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-01.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2025-02.csv"
+      ],
+      "val_acc": 0.7284894837476099
+    },
+    {
+      "fold": 19,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-02.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2025-03.csv"
+      ],
+      "val_acc": 0.6615678776290631
+    },
+    {
+      "fold": 20,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-03.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2025-04.csv"
+      ],
+      "val_acc": 0.6137667304015296
+    },
+    {
+      "fold": 21,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-04.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2025-05.csv"
+      ],
+      "val_acc": 0.6864244741873805
+    },
+    {
+      "fold": 22,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-05.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2025-06.csv"
+      ],
+      "val_acc": 0.8718929254302104
+    },
+    {
+      "fold": 23,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-06.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2025-07.csv"
+      ],
+      "val_acc": 0.7896749521988528
+    },
+    {
+      "fold": 24,
+      "train_files": [
+        "/opt/ml/input/data/train/eth_1m_2023-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2023-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-07.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-08.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-09.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-10.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-11.csv",
+        "/opt/ml/input/data/train/eth_1m_2024-12.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-01.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-02.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-03.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-04.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-05.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-06.csv",
+        "/opt/ml/input/data/train/eth_1m_2025-07.csv"
+      ],
+      "val_files": [
+        "/opt/ml/input/data/train/eth_1m_2025-08.csv"
+      ],
+      "val_acc": 0.5583173996175909
+    }
+  ],
+  "val_acc_aggregate": 0.7949330783938814,
+>>>>>>> b6dfefe (Updated scripts versions and .env)
   "feature_cols": [
     "open",
     "high",
@@ -12,6 +535,7 @@
     "return",
     "sma_ratio",
     "ema_20",
+<<<<<<< HEAD
     "macd",
     "rsi_14",
     "vol_change",
@@ -31,12 +555,43 @@
     "bidirectional": true,
     "epochs": 30,
     "batch_size": 256,
+=======
+    "rsi_14",
+    "atr",
+    "macd",
+    "bb_width",
+    "vol_20",
+    "vol_50",
+    "vol_100",
+    "vwap_ratio",
+    "obv",
+    "roc_14"
+  ],
+  "num_params": 33790467,
+  "config": {
+    "data_path": "/opt/ml/input/data/train",
+    "output_dir": "/opt/ml/model",
+    "meta_path": "model_meta.json",
+    "window_size": 192,
+    "hidden_size": 768,
+    "num_layers": 3,
+    "dropout": 0.1,
+    "bidirectional": true,
+    "epochs": 40,
+    "batch_size": 512,
+>>>>>>> b6dfefe (Updated scripts versions and .env)
     "learning_rate": 0.003,
     "weight_decay": 0.0001,
     "val_frac": 0.15,
     "accumulate": 2,
     "seed": 1337,
     "price_col": "close",
+<<<<<<< HEAD
+=======
+    "tp_pct": 0.01,
+    "sl_pct": 0.005,
+    "time_limit": 30,
+>>>>>>> b6dfefe (Updated scripts versions and .env)
     "amp": true,
     "workers": 0,
     "chunksize": 500000

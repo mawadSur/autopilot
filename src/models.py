@@ -29,10 +29,35 @@ except Exception:  # pragma: no cover
 # Model definition
 # ----------------------------
 
+class AdditiveAttention(nn.Module):
+    """
+    Bahdanau-style additive attention over an input sequence.
+
+    Given H of shape [B, T, E], computes attention weights:
+        e_t = v^T tanh(W_h h_t)
+        a_t = softmax(e_t)
+    and returns the context vector c = sum_t a_t * h_t with shape [B, E].
+    """
+
+    def __init__(self, input_dim: int, attn_dim: int = 128):
+        super().__init__()
+        self.input_dim = input_dim
+        self.attn_dim = attn_dim
+        self.W_h = nn.Linear(input_dim, attn_dim, bias=True)
+        self.v = nn.Linear(attn_dim, 1, bias=False)
+
+    def forward(self, H: torch.Tensor):
+        # H: [B, T, E]
+        scores = self.v(torch.tanh(self.W_h(H)))  # [B, T, 1]
+        weights = torch.softmax(scores.squeeze(-1), dim=-1)  # [B, T]
+        context = torch.bmm(weights.unsqueeze(1), H).squeeze(1)  # [B, E]
+        return context, weights
+
+
 class LSTMClassifier(nn.Module):
     """
-    Generic LSTM classifier that outputs logits for N classes.
-    Expects input of shape: [batch, seq_len, input_size] (batch_first=True).
+    LSTM classifier with additive attention over the output sequence.
+    Outputs logits for N classes. Input shape: [B, T, F].
     """
 
     def __init__(
@@ -64,9 +89,12 @@ class LSTMClassifier(nn.Module):
         )
 
         direction_factor = 2 if bidirectional else 1
+        embed_dim = hidden_size * direction_factor
+        self.attn = AdditiveAttention(input_dim=embed_dim, attn_dim=hidden_size)
+
         self.head = nn.Sequential(
-            nn.LayerNorm(hidden_size * direction_factor),
-            nn.Linear(hidden_size * direction_factor, hidden_size),
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, hidden_size),
             nn.ReLU(),
             nn.Dropout(p=dropout),
             nn.Linear(hidden_size, num_classes),
@@ -74,10 +102,9 @@ class LSTMClassifier(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, F]
-        # We take the last hidden state for classification (common approach)
-        output, (hn, cn) = self.lstm(x)  # output: [B, T, H*D]
-        last = output[:, -1, :]          # [B, H*D]
-        logits = self.head(last)         # [B, C]
+        output, _ = self.lstm(x)         # [B, T, H*D]
+        context, _ = self.attn(output)   # [B, H*D]
+        logits = self.head(context)      # [B, C]
         return logits
 
 

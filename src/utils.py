@@ -16,11 +16,13 @@ This keeps the codebase consistent and avoids duplication errors.
 from __future__ import annotations
 
 import glob
+import logging
 import json
 import math
 import os
 from pathlib import Path
 from typing import Dict, Generator, List, Optional
+from collections import deque
 
 import numpy as np
 import pandas as pd
@@ -356,7 +358,19 @@ def load_model_bundle(model_dir: str):
     if not weights_path.exists():
         raise FileNotFoundError(f"Weights not found: {weights_path}")
     state = torch.load(weights_path, map_location="cpu")
-    model.load_state_dict(state)
+    # Non-strict loading to remain compatible with architectural tweaks (e.g., attention)
+    _incompat = model.load_state_dict(state, strict=False)
+    try:
+        missing = list(getattr(_incompat, "missing_keys", []) or [])
+        unexpected = list(getattr(_incompat, "unexpected_keys", []) or [])
+    except Exception:
+        missing, unexpected = [], []
+    if missing or unexpected:
+        logging.warning(
+            "load_state_dict reported mismatch. missing_keys=%s unexpected_keys=%s",
+            missing,
+            unexpected,
+        )
 
     scaler = None
     spath = meta.get("scaler_path", "scaler.joblib")
@@ -381,6 +395,124 @@ def binary_label_next_bar_up(closes: np.ndarray) -> np.ndarray:
     return y
 
 
+# ---------------------------
+# Live Signal Generator (SageMaker endpoint)
+# ---------------------------
+
+class SignalGenerator:
+    """Streaming feature buffer and SageMaker inference helper.
+
+    - Maintains a deque of the last `window_size` engineered feature rows.
+    - Accepts raw kline dicts and computes features using train_model._compute_features.
+    - When the buffer is full, invokes a SageMaker endpoint and returns a signal.
+
+    Returns dicts shaped like:
+      {"confidence": float, "probability": float, "signal": int, "threshold": float}
+    where signal = 1 when confidence >= threshold else 0.
+    """
+
+    def __init__(self, endpoint_name: str, window_size: int = 150):
+        if not endpoint_name:
+            raise ValueError("endpoint_name is required")
+        self.endpoint_name = endpoint_name
+        self.window_size = int(window_size)
+
+        # Raw history used for feature computation context (prefill from trade.py)
+        self.history = deque(maxlen=self.window_size)
+        self.history_size = self.window_size
+
+        # Engineered features buffer (the model window)
+        self._feat_buf = deque(maxlen=self.window_size)
+
+        # Determined lazily on first call based on available engineered columns
+        self._feature_cols: Optional[List[str]] = None
+
+        # Confidence threshold fallback (endpoint may return its own)
+        self.threshold = float(os.getenv("BUY_THRESHOLD", "0.60"))
+
+    def _ensure_feature_cols(self, engineered_df: pd.DataFrame) -> List[str]:
+        """Pick an ordered feature list aligned with training.
+
+        Prefers train_model.FEATURES; falls back to DEFAULT_FEATURE_COLS.
+        """
+        if self._feature_cols is not None:
+            return self._feature_cols
+
+        try:
+            from train_model import FEATURES as TRAIN_FEATURES  # type: ignore
+        except Exception:
+            TRAIN_FEATURES = []
+
+        available = set(engineered_df.columns.tolist())
+        cols = [c for c in TRAIN_FEATURES if c in available]
+        if len(cols) < 4:
+            cols = [c for c in DEFAULT_FEATURE_COLS if c in available]
+        if not cols:
+            # As a last resort, take numeric columns (best effort)
+            cols = engineered_df.select_dtypes(include=[np.number]).columns.tolist()
+        self._feature_cols = cols
+        return self._feature_cols
+
+    def get_signal(self, kline_data: Dict) -> Dict[str, float]:
+        """Ingest one kline dict, update buffer, and infer.
+
+        kline_data keys typically: {date, open, high, low, close, volume}
+        """
+        # Append raw bar to history for context
+        self.history.append(kline_data)
+
+        # Build a small DataFrame from recent bars and engineer features
+        df_raw = pd.DataFrame(list(self.history))
+        try:
+            # Lazy import to keep utils.py lightweight
+            from train_model import _compute_features as _fe
+        except Exception as e:
+            raise RuntimeError(f"Failed to import feature engineering: {e}")
+
+        df_feat = _fe(df_raw.copy())
+        feat_cols = self._ensure_feature_cols(df_feat)
+
+        # Extract the newest engineered row; coerce to float32 for model
+        latest_row = df_feat.iloc[-1:][feat_cols].astype(np.float32, copy=False)
+        # Store as 1D np.ndarray
+        self._feat_buf.append(latest_row.to_numpy(dtype=np.float32, copy=False).ravel())
+
+        # Not enough rows yet to form a window
+        if len(self._feat_buf) < self.window_size:
+            return {"probability": 0.0, "confidence": 0.0, "signal": 0, "threshold": self.threshold}
+
+        # Form [T, F] matrix for exactly one window (T=window_size)
+        X = np.stack(list(self._feat_buf), axis=0)  # [T, F]
+
+        # Send as CSV so server can reorder/select features based on its meta
+        df_send = pd.DataFrame(X, columns=feat_cols)
+        csv_payload = df_send.to_csv(index=False)
+
+        # Lazy imports
+        import json as _json  # noqa: F401
+        try:
+            import boto3  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"boto3 is required for SageMaker invocation: {e}")
+
+        rt = boto3.client("sagemaker-runtime")
+        resp = rt.invoke_endpoint(EndpointName=self.endpoint_name, ContentType="text/csv", Body=csv_payload)
+        body = resp["Body"].read().decode("utf-8")
+
+        try:
+            out = _json.loads(body)
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse endpoint response: {e}; body={body[:200]}...")
+
+        probs = out.get("probs") or []
+        threshold = float(out.get("threshold", self.threshold))
+        prob = float(probs[-1]) if probs else 0.0
+        signal = 1 if prob >= threshold else 0
+
+        # Keep both keys for compatibility with callers
+        return {"probability": prob, "confidence": prob, "signal": signal, "threshold": threshold}
+
+
 __all__ = [
     # defaults
     "PRICE_CANDIDATES",
@@ -395,7 +527,7 @@ __all__ = [
     # formatting
     "fmt_money", "fmt_pct",
     # meta/model
-    "load_meta", "load_model_bundle",
+    "load_meta", "load_model_bundle", "SignalGenerator",
     # labels
     "binary_label_next_bar_up",
 ]

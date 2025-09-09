@@ -60,7 +60,8 @@ def model_fn(model_dir: str):
 
     weights_path = os.path.join(model_dir, meta.get("model_state_path", "model.pt"))
     state = torch.load(weights_path, map_location="cpu")
-    model.load_state_dict(state)
+    # Allow non-strict loading to tolerate attention or head changes
+    model.load_state_dict(state, strict=False)
     model.eval()
 
     scaler = None

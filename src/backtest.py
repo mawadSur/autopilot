@@ -172,6 +172,8 @@ def main():
     fee_pct = float(meta.get("tx_cost", 0.0008)) if args.fee_pct is None else float(args.fee_pct)
     tp_pct = 0.005 if args.tp_pct is None else float(args.tp_pct)
     sl_pct = 0.0025 if args.sl_pct is None else float(args.sl_pct)
+    # Allow configurable class index for 'buy' via model_meta.json
+    buy_class_index = (meta.get("class_map", {}) or {}).get("buy", 1)
 
     # Load raw data and compute the SAME features as training
     df = read_csv_concat_sorted(args.data_dir)
@@ -214,9 +216,14 @@ def main():
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-
-    # Predict probabilities (auto-handles OOM)
-    probs = predict_probs(model, X, int(args.batch_size), device)
+    probs = np.zeros(len(X), dtype=np.float32)
+    with torch.no_grad():
+        BS = int(args.batch_size)
+        for i in range(0, len(X), BS):
+            xb = torch.from_numpy(X[i:i + BS]).to(device)
+            logits = model(xb)  # [B, C]
+            p = F.softmax(logits, dim=-1)[:, buy_class_index].cpu().numpy()
+            probs[i:i + BS] = p
 
     if args.mode == "simple":
         print(json.dumps({
