@@ -17,3 +17,4 @@ tf-venv*
 eth_1m_data
 eth_1s_data
 src/.env
+.venv\*
