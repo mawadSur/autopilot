@@ -47,8 +47,8 @@ def main():
     window_size = int(meta.get("window_size", 150))
     buy_threshold = float(meta.get("buy_threshold", 0.60)) if args.threshold is None else float(args.threshold)
     fee_pct = float(meta.get("tx_cost", 0.0008)) if args.fee_pct is None else float(args.fee_pct)
-    tp_pct = 0.005 if args.tp_pct is None else float(args.tp_pct)
-    sl_pct = 0.0025 if args.sl_pct is None else float(args.sl_pct)
+    tp_pct = float(meta.get("tp_pct", 0.005)) if args.tp_pct is None else float(args.tp_pct)
+    sl_pct = float(meta.get("sl_pct", 0.0025)) if args.sl_pct is None else float(args.sl_pct)
 
     # Load data
     df = read_csv_concat_sorted(args.data_dir)

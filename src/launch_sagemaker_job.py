@@ -94,19 +94,21 @@ def build_parser():
 
     # Trainer flags (SUPPORTED ONLY; optimistic defaults)
     p.add_argument("--window-size", type=int, default=192)
-    p.add_argument("--hidden-size", type=int, default=768)
+    p.add_argument("--hidden-size", type=int, default=512)
     p.add_argument("--num-layers", type=int, default=3)
-    p.add_argument("--dropout", type=float, default=0.10)
+    p.add_argument("--dropout", type=float, default=0.2)
     p.add_argument("--bidirectional", type=bool, default=True)
     p.add_argument("--disable-scaling", type=bool, default=False)
     p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--learning-rate", type=float, default=3e-3)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--val-frac", type=float, default=0.15)
     p.add_argument("--accumulate", type=int, default=2)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--price-col", default="close")
+    p.add_argument("--model-type", default="transformer")
+    p.add_argument("--task", choices=["classification", "regression"], default="regression")
 
     # Deployment controls (defaults from .env)
     p.add_argument("--deploy", action="store_true", default=True)
@@ -169,6 +171,8 @@ def main():
         "accumulate": args.accumulate,
         "seed": args.seed,
         "price-col": args.price_col,
+        "model-type": args.model_type,
+        "task": args.task,
     }
     if args.disable_scaling:
         hyperparameters["disable-scaling"] = True
@@ -236,3 +240,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

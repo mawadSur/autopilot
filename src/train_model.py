@@ -16,7 +16,7 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Iterable, List, Optional, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple, Union
 from collections import deque
 
 import joblib
@@ -27,7 +27,11 @@ import torch.nn as nn
 from torch.utils.data import IterableDataset, DataLoader
 
 from utils import compute_features
-from models import build_model_from_meta
+from models import (
+    ModelMeta,
+    TransformerClassifier,
+    build_model_from_meta as build_model_from_meta_core,
+)
 
 
 # ----------------------------
@@ -75,6 +79,29 @@ ALL_FEATURES = [
     # New
     "adx",
 ]
+
+
+
+def _ensure_meta(meta: Union[ModelMeta, Dict[str, Any]]) -> ModelMeta:
+    if isinstance(meta, ModelMeta):
+        return meta
+    return ModelMeta.from_dict(meta)
+
+
+def build_model_from_meta(meta: Union[ModelMeta, Dict[str, Any]]) -> nn.Module:
+    meta_obj = _ensure_meta(meta)
+    model_type = str(getattr(meta_obj, "model_type", "lstm_classifier")).lower()
+    if model_type in {"transformer", "transformer_classifier"}:
+        num_heads = getattr(meta_obj, "num_heads", 4) or 4
+        return TransformerClassifier(
+            input_size=meta_obj.input_size,
+            hidden_size=meta_obj.hidden_size,
+            num_layers=meta_obj.num_layers,
+            num_heads=int(num_heads),
+            dropout=meta_obj.dropout,
+            num_classes=meta_obj.num_classes,
+        )
+    return build_model_from_meta_core(meta_obj)
 
 
 # ----------------------------
@@ -231,7 +258,7 @@ class StreamWindowDataset(IterableDataset):
 class StreamWindowDatasetReg(IterableDataset):
     """Streaming windows for regression.
 
-    Label is the future price at i + horizon_bars.
+    Label is the percentage return over the prediction horizon.
     """
     def __init__(
         self,
@@ -268,8 +295,12 @@ class StreamWindowDatasetReg(IterableDataset):
                 if j >= n:
                     continue
                 Xw = np.stack(list(buf), axis=0)
-                y = float(prices[j])
-                yield torch.from_numpy(Xw).float(), torch.tensor(y, dtype=torch.float32)
+                base_price = float(prices[i])
+                future_price = float(prices[j])
+                if abs(base_price) < 1e-8:
+                    continue
+                ret = (future_price / base_price) - 1.0
+                yield torch.from_numpy(Xw).float(), torch.tensor(ret, dtype=torch.float32)
 
 
 # ----------------------------
@@ -301,6 +332,8 @@ class TrainConfig:
     chunksize: int
     task: str
     horizon: int
+    model_type: Optional[str] = None
+    max_folds: Optional[int] = None
     # Loss/Calibration
     use_class_weights: bool = True
     use_focal_loss: bool = False
@@ -334,6 +367,12 @@ def train(cfg: TrainConfig):
         except Exception:
             meta_existing = {}
 
+    model_type_override = None
+    if getattr(cfg, "model_type", None):
+        model_type_override = str(cfg.model_type).strip().lower()
+    meta_model_type = str(meta_existing.get("model_type", "")).strip().lower() or None
+    selected_model_type = model_type_override or meta_model_type or "transformer"
+
     # Determine feature set
     desired_features = list(meta_existing.get("feature_cols", ALL_FEATURES))
     peek = next(_stream_rows(files, chunksize=min(cfg.chunksize, 200_000), overlap=cfg.window_size + 5))
@@ -352,6 +391,10 @@ def train(cfg: TrainConfig):
             folds.append((files[:k], [files[k]]))
     else:
         folds.append((files, files))
+
+    if cfg.max_folds is not None:
+        max_folds = max(1, int(cfg.max_folds))
+        folds = folds[:max_folds]
 
     from sklearn.preprocessing import StandardScaler
 
@@ -411,14 +454,20 @@ def train(cfg: TrainConfig):
         )
 
         # Build model from meta helper
-        model_meta_dict = {
+        model_meta_dict = dict(meta_existing)
+        model_meta_dict.update({
             "input_size": len(feature_cols),
             "hidden_size": cfg.hidden_size,
             "num_layers": cfg.num_layers,
             "dropout": cfg.dropout,
             "bidirectional": cfg.bidirectional,
             "num_classes": (1 if getattr(cfg, 'task', 'classification') == 'regression' else 3),
-        }
+            "model_type": selected_model_type,
+        })
+        if selected_model_type in {"transformer", "transformer_classifier"}:
+            model_meta_dict.setdefault("num_heads", meta_existing.get("num_heads", 4))
+        else:
+            model_meta_dict.pop("num_heads", None)
         model = build_model_from_meta(model_meta_dict).to(device)
 
         # Class weights (classification only)
@@ -457,6 +506,8 @@ def train(cfg: TrainConfig):
 
         best_val = -1.0
         best_state = None
+        best_mae = float("inf")
+        best_directional = 0.0
 
         for epoch in range(1, cfg.epochs + 1):
             model.train()
@@ -494,6 +545,7 @@ def train(cfg: TrainConfig):
             model.eval()
             if getattr(cfg, 'task', 'classification') == 'regression':
                 abs_err_sum = 0.0
+                directional_matches = 0
                 total = 0
                 with torch.no_grad():
                     for xb, yb in val_loader:
@@ -502,13 +554,17 @@ def train(cfg: TrainConfig):
                         with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
                             pred = model(xb).squeeze(-1)
                         abs_err_sum += torch.abs(pred - yb).sum().item()
+                        directional_matches += (torch.sign(pred) == torch.sign(yb)).sum().item()
                         total += yb.numel()
                 val_mae = abs_err_sum / max(1, total)
+                directional_acc = directional_matches / max(1, total)
                 score = -val_mae
-                if score > best_val:
+                if score > best_val or best_state is None:
                     best_val = score
                     best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-                print(f"Fold {fold_idx}/{len(folds)} Epoch {epoch}/{cfg.epochs} - train_loss={running/max(1, step):.4f} val_mae={val_mae:.6f}")
+                    best_mae = val_mae
+                    best_directional = directional_acc
+                print(f"Fold {fold_idx}/{len(folds)} Epoch {epoch}/{cfg.epochs} - train_loss={running/max(1, step):.4f} val_mae={val_mae:.6f} dir_acc={directional_acc:.4f}")
             else:
                 correct = total = 0
                 with torch.no_grad():
@@ -530,7 +586,16 @@ def train(cfg: TrainConfig):
         last_fold_best_state = best_state
         last_fold_last_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
         last_fold_scaler = scaler
-        fold_logs.append({"fold": fold_idx, "val_acc": float(best_val)})
+        if getattr(cfg, 'task', 'classification') == 'regression':
+            best_mae_value = best_mae if np.isfinite(best_mae) else 0.0
+            fold_logs.append({
+                "fold": fold_idx,
+                "val_acc": float(best_val),
+                "val_mae": float(best_mae_value),
+                "directional_acc": float(best_directional),
+            })
+        else:
+            fold_logs.append({"fold": fold_idx, "val_acc": float(best_val)})
 
         # Temperature calibration on this fold's validation set (optional)
         if cfg.calibrate_temp and getattr(cfg, 'task', 'classification') != 'regression':
@@ -586,8 +651,9 @@ def train(cfg: TrainConfig):
     agg_val = float(np.mean([f["val_acc"] for f in fold_logs])) if fold_logs else 0.0
 
     meta = dict(meta_existing)
+    model_type = selected_model_type or "transformer"
     meta.update({
-        "model_type": "lstm_classifier",
+        "model_type": model_type,
         "framework": "pytorch",
         "feature_scaling": True,
         "scaler_type": "standard",
@@ -610,6 +676,10 @@ def train(cfg: TrainConfig):
         "notes": "Triple-barrier classification with walk-forward validation.",
         "temperature": float(temperature_final),
     })
+    if model_type.lower() in {"transformer", "transformer_classifier"}:
+        meta["num_heads"] = int(meta.get("num_heads", meta_existing.get("num_heads", 4)))
+    else:
+        meta.pop("num_heads", None)
     meta_path.write_text(json.dumps(meta, indent=2))
 
     (outdir / "training_summary.json").write_text(json.dumps({
@@ -622,6 +692,8 @@ def train(cfg: TrainConfig):
     }, indent=2))
 
     print(f"Saved: {model_path}, {last_path}, scaler={'True' if last_fold_scaler is not None else 'False'}, meta={meta_path}")
+
+    return agg_val
 
 
 # ----------------------------
@@ -644,11 +716,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-layers", type=int, default=3)
     p.add_argument("--dropout", type=float, default=0.2)
     p.add_argument("--bidirectional", type=str2bool, default=True)
+    p.add_argument("--model-type", choices=["lstm_classifier", "lstm_attention", "transformer"], default="transformer")
 
     # Training
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--learning-rate", type=float, default=3e-3)
+    p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--val-frac", type=float, default=0.15)
     p.add_argument("--accumulate", type=int, default=2)
@@ -662,7 +735,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sl-pct", type=float, default=0.005, help="Stop-loss percent e.g., 0.005 for 0.5%")
     p.add_argument("--time-limit", type=int, default=30, help="Number of bars to look ahead")
     # Task toggle & regression horizon
-    p.add_argument("--task", choices=["classification","regression"], default="classification")
+    p.add_argument("--task", choices=["classification","regression"], default="regression")
     p.add_argument("--horizon", type=int, default=3, help="Bars ahead to predict for regression (3=3 minutes)")
     # Loss / calibration
     p.add_argument("--use-class-weights", type=str2bool, default=True)
@@ -706,6 +779,7 @@ def main():
         chunksize=args.chunksize,
         task=args.task,
         horizon=args.horizon,
+        model_type=args.model_type,
         use_class_weights=args.use_class_weights,
         use_focal_loss=args.use_focal_loss,
         focal_gamma=args.focal_gamma,
@@ -716,3 +790,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -11,8 +11,9 @@ your training/backtest/inference use cases.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional, Union, List
+from typing import Any, Dict, Optional, Union, List, Tuple
 
 
 import torch
@@ -54,58 +55,263 @@ class AdditiveAttention(nn.Module):
         return context, weights
 
 
-class LSTMClassifier(nn.Module):
-    """
-    LSTM classifier with additive attention over the output sequence.
-    Outputs logits for N classes. Input shape: [B, T, F].
-    """
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding with dropout."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 10000):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model, dtype=torch.float32)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.size(1)
+        pe_slice = self.pe[:, :seq_len]
+        x = x + pe_slice.to(x.dtype)
+        return self.dropout(x)
+
+
+class TransformerClassifier(nn.Module):
+    """Transformer encoder classifier that consumes [B, T, F] windows."""
 
     def __init__(
         self,
         input_size: int,
-        hidden_size: int = 128,
-        num_layers: int = 2,
-        dropout: float = 0.1,
-        bidirectional: bool = False,
-        num_classes: int = 3,
-    ):
+        hidden_size: int,
+        num_layers: int,
+        num_heads: int,
+        dropout: float,
+        num_classes: int,
+        *,
+        feedforward_dim: Optional[int] = None,
+        activation: str = "gelu",
+        max_len: int = 10000,
+    ) -> None:
         super().__init__()
         self.save_hyperparameters = {
             "input_size": input_size,
             "hidden_size": hidden_size,
             "num_layers": num_layers,
+            "num_heads": num_heads,
             "dropout": dropout,
-            "bidirectional": bidirectional,
             "num_classes": num_classes,
+            "feedforward_dim": feedforward_dim,
+            "activation": activation,
+            "max_len": max_len,
         }
 
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=bidirectional,
+        self.input_proj = nn.Linear(input_size, hidden_size)
+        self.pos_encoder = PositionalEncoding(hidden_size, dropout=dropout, max_len=max_len)
+        ff_dim = feedforward_dim if feedforward_dim is not None else hidden_size * 4
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            activation=activation,
             batch_first=True,
         )
-
-        direction_factor = 2 if bidirectional else 1
-        embed_dim = hidden_size * direction_factor
-        self.attn = AdditiveAttention(input_dim=embed_dim, attn_dim=hidden_size)
-
-        self.head = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_size, num_classes),
-        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.head = nn.Linear(hidden_size, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, F]
+        x = self.input_proj(x)
+        x = self.pos_encoder(x)
+        x = self.encoder(x)
+        last_step = x[:, -1, :]
+        last_step = self.norm(last_step)
+        return self.head(last_step)
+
+
+class Attention(nn.Module):
+
+    """Simple additive attention over temporal features."""
+
+
+
+    def __init__(self, input_dim: int, attn_dim: Optional[int] = None):
+
+        super().__init__()
+
+        attn_dim = attn_dim or input_dim
+
+        self.energy = nn.Linear(input_dim, attn_dim, bias=True)
+
+        self.score = nn.Linear(attn_dim, 1, bias=False)
+
+
+
+    def forward(self, H: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        """Return context vector and attention weights for inputs shaped [B, T, E]."""
+
+        energy = torch.tanh(self.energy(H))
+
+        scores = self.score(energy).squeeze(-1)  # [B, T]
+
+        weights = torch.softmax(scores, dim=-1)
+
+        context = torch.bmm(weights.unsqueeze(1), H).squeeze(1)  # [B, E]
+
+        return context, weights
+
+
+
+
+
+class LSTMAttentionClassifier(nn.Module):
+
+    """LSTM classifier that applies additive attention over sequence outputs."""
+
+
+
+    def __init__(
+
+        self,
+
+        input_size: int,
+
+        hidden_size: int = 128,
+
+        num_layers: int = 2,
+
+        dropout: float = 0.1,
+
+        bidirectional: bool = False,
+
+        num_classes: int = 3,
+
+    ):
+
+        super().__init__()
+
+        self.save_hyperparameters = {
+
+            "input_size": input_size,
+
+            "hidden_size": hidden_size,
+
+            "num_layers": num_layers,
+
+            "dropout": dropout,
+
+            "bidirectional": bidirectional,
+
+            "num_classes": num_classes,
+
+        }
+
+
+
+        self.lstm = nn.LSTM(
+
+            input_size=input_size,
+
+            hidden_size=hidden_size,
+
+            num_layers=num_layers,
+
+            dropout=dropout if num_layers > 1 else 0.0,
+
+            bidirectional=bidirectional,
+
+            batch_first=True,
+
+        )
+
+
+
+        direction_factor = 2 if bidirectional else 1
+
+        embed_dim = hidden_size * direction_factor
+
+        self.attn = Attention(input_dim=embed_dim, attn_dim=hidden_size)
+
+
+
+        self.head = nn.Sequential(
+
+            nn.LayerNorm(embed_dim),
+
+            nn.Linear(embed_dim, hidden_size),
+
+            nn.ReLU(),
+
+            nn.Dropout(p=dropout),
+
+            nn.Linear(hidden_size, num_classes),
+
+        )
+
+        self._attn_weights: Optional[torch.Tensor] = None
+
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        # x: [B, T, F]
+
         output, _ = self.lstm(x)         # [B, T, H*D]
-        context, _ = self.attn(output)   # [B, H*D]
+
+        context, weights = self.attn(output)  # [B, H*D], [B, T]
+
+        self._attn_weights = weights
+
         logits = self.head(context)      # [B, C]
+
         return logits
+
+
+
+
+
+class LSTMClassifier(LSTMAttentionClassifier):
+
+    """Backward-compatible alias for the attention-based LSTM classifier."""
+
+
+
+    def __init__(
+
+        self,
+
+        input_size: int,
+
+        hidden_size: int = 128,
+
+        num_layers: int = 2,
+
+        dropout: float = 0.1,
+
+        bidirectional: bool = False,
+
+        num_classes: int = 3,
+
+    ):
+
+        super().__init__(
+
+            input_size=input_size,
+
+            hidden_size=hidden_size,
+
+            num_layers=num_layers,
+
+            dropout=dropout,
+
+            bidirectional=bidirectional,
+
+            num_classes=num_classes,
+
+        )
+
 
 
 # ----------------------------
@@ -118,6 +324,7 @@ class ModelMeta:
     input_size: int
     hidden_size: int = 128
     num_layers: int = 2
+    num_heads: int = 4
     dropout: float = 0.1
     bidirectional: bool = False
     num_classes: int = 3
@@ -145,6 +352,7 @@ class ModelMeta:
             input_size=int(d.get("input_size") or d.get("n_features") or d["features"]),
             hidden_size=int(d.get("hidden_size", 128)),
             num_layers=int(d.get("num_layers", 2)),
+            num_heads=int(d.get("num_heads", d.get("transformer_heads", 4))),
             dropout=float(d.get("dropout", 0.1)),
             bidirectional=bool(d.get("bidirectional", False)),
             num_classes=int(d.get("num_classes", d.get("classes", 3))),
@@ -164,14 +372,37 @@ class ModelMeta:
         return asdict(self)
 
 
-def build_model_from_meta(meta: Union[ModelMeta, Dict[str, Any]]) -> LSTMClassifier:
+def build_model_from_meta(meta: Union[ModelMeta, Dict[str, Any]]) -> nn.Module:
     """
-    Build an LSTMClassifier instance from metadata dict or ModelMeta object.
+    Build a model instance from metadata dict or ModelMeta object.
+
+    Supports LSTM and transformer classifiers.
     """
     if not isinstance(meta, ModelMeta):
         meta = ModelMeta.from_dict(meta)
 
-    model = LSTMClassifier(
+    model_type = str(getattr(meta, "model_type", "lstm_classifier")).lower()
+    if model_type in {"transformer", "transformer_classifier"}:
+        num_heads = getattr(meta, "num_heads", 4) or 4
+        return TransformerClassifier(
+            input_size=meta.input_size,
+            hidden_size=meta.hidden_size,
+            num_layers=meta.num_layers,
+            num_heads=int(num_heads),
+            dropout=meta.dropout,
+            num_classes=meta.num_classes,
+        )
+    if model_type in {"lstm_attention", "lstm_attention_classifier"}:
+        return LSTMAttentionClassifier(
+            input_size=meta.input_size,
+            hidden_size=meta.hidden_size,
+            num_layers=meta.num_layers,
+            dropout=meta.dropout,
+            bidirectional=meta.bidirectional,
+            num_classes=meta.num_classes,
+        )
+
+    return LSTMClassifier(
         input_size=meta.input_size,
         hidden_size=meta.hidden_size,
         num_layers=meta.num_layers,
@@ -179,7 +410,6 @@ def build_model_from_meta(meta: Union[ModelMeta, Dict[str, Any]]) -> LSTMClassif
         bidirectional=meta.bidirectional,
         num_classes=meta.num_classes,
     )
-    return model
 
 
 # ----------------------------
