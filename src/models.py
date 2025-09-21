@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, List
 
 
 import torch
@@ -131,6 +131,13 @@ class ModelMeta:
     framework: str = "pytorch"
     model_type: str = "lstm_classifier"
 
+    # Data/Features (optional but commonly present in meta JSONs)
+    feature_cols: List[str] = None  # type: ignore[assignment]
+    price_col: str = "close"
+    window_size: int = 150
+    buy_threshold: float = 0.60
+    tx_cost: float = 0.0008
+
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "ModelMeta":
         # Accept flexible keys and sensible fallbacks
@@ -146,6 +153,11 @@ class ModelMeta:
             feature_scaling=bool(d.get("feature_scaling", d.get("scale_features", True))),
             framework=str(d.get("framework", "pytorch")),
             model_type=str(d.get("model_type", "lstm_classifier")),
+            feature_cols=list(d.get("feature_cols", []) or []),
+            price_col=str(d.get("price_col", "close")),
+            window_size=int(d.get("window_size", 150)),
+            buy_threshold=float(d.get("buy_threshold", 0.60)),
+            tx_cost=float(d.get("tx_cost", 0.0008)),
         )
 
     def to_dict(self) -> Dict[str, Any]:

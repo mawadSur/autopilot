@@ -23,6 +23,18 @@ import os
 from pathlib import Path
 from typing import Dict, Generator, List, Optional
 from collections import deque
+ 
+# Import robust model helpers (aliased to avoid clashing with utils.load_meta)
+try:
+    from models import (
+        build_model_from_meta as _build_model_from_meta,
+        load_meta as _load_meta_model,
+        load_model_state as _load_model_state,
+        load_scaler as _load_scaler,
+        resolve_path as _resolve_path,
+    )
+except Exception:
+    _build_model_from_meta = _load_meta_model = _load_model_state = _load_scaler = _resolve_path = None
 
 import numpy as np
 import pandas as pd
@@ -254,6 +266,88 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     lower = sma - 2 * std_20
     df["bb_width"] = ((upper - lower) / (sma + 1e-12)).fillna(0.0)
 
+    # Extra volatility features
+    for w in (20, 50, 100):
+        roll_std = df["close"].rolling(w).std()
+        roll_mean = df["close"].rolling(w).mean()
+        df[f"vol_{w}"] = (roll_std / (roll_mean + 1e-12)).fillna(0.0)
+
+    # Garman-Klass volatility (20)
+    high_low_ratio = (df["high"] / (df["low"] + 1e-12)).clip(lower=1e-12)
+    close_open_ratio = (df["close"] / (df["open"] + 1e-12)).clip(lower=1e-12)
+    log_hl = np.log(high_low_ratio)
+    log_co = np.log(close_open_ratio)
+    gk_var = (0.5 * log_hl.pow(2)) - ((2 * np.log(2) - 1) * log_co.pow(2))
+    gk_roll = gk_var.clip(lower=0.0).rolling(ROLL_WINDOW, min_periods=1).mean()
+    df["gk_vol_20"] = np.sqrt(gk_roll.clip(lower=0.0)).fillna(0.0)
+
+    # Ensure 'volume' exists for VWAP/OBV
+    if "volume" not in df.columns:
+        df["volume"] = 1.0
+    vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+
+    # Chaikin Money Flow (20)
+    high_low_range = (df["high"] - df["low"]).replace(0, np.nan)
+    money_flow_multiplier = (((df["close"] - df["low"]) - (df["high"] - df["close"])) / (high_low_range + 1e-12)).fillna(0.0)
+    money_flow_volume = money_flow_multiplier * vol
+    volume_roll_sum = vol.rolling(ROLL_WINDOW, min_periods=1).sum()
+    money_flow_roll_sum = money_flow_volume.rolling(ROLL_WINDOW, min_periods=1).sum()
+    df["cmf_20"] = (money_flow_roll_sum / (volume_roll_sum + 1e-12)).fillna(0.0)
+
+    # Rate of change for volume (14)
+    df["rocv_14"] = vol.pct_change(periods=14).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    # VWAP ratio; prefer daily by timestamp; fallback to 1440-roll
+    ts_col = None
+    for cand in ("timestamp", "time", "date"):
+        if cand in df.columns:
+            ts_col = cand
+            break
+    vwap = None
+    if ts_col is not None:
+        try:
+            ts = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
+            if ts.notna().any():
+                day = ts.dt.floor("D")
+                pv_sum = (df["close"] * vol).groupby(day).transform("sum")
+                v_sum = vol.groupby(day).transform("sum")
+                vwap = pv_sum / (v_sum + 1e-12)
+        except Exception:
+            vwap = None
+    if vwap is None:
+        win = 1440
+        pv_roll = (df["close"] * vol).rolling(win, min_periods=1).sum()
+        v_roll = vol.rolling(win, min_periods=1).sum()
+        vwap = pv_roll / (v_roll + 1e-12)
+    df["vwap_ratio"] = (df["close"] / (vwap + 1e-12)).fillna(1.0)
+
+    # OBV and ROC
+    price_diff = df["close"].diff()
+    dir_sign = (price_diff > 0).astype(int) - (price_diff < 0).astype(int)
+    df["obv"] = (dir_sign * vol).cumsum().astype(float)
+    df["roc_14"] = df["close"].pct_change(periods=14).fillna(0.0)
+
+    # ADX via pandas_ta (optional)
+    try:
+        import pandas_ta as ta  # noqa: F401
+        df.ta.adx(length=14, append=True)
+        if "ADX_14" in df.columns:
+            df.rename(columns={"ADX_14": "adx"}, inplace=True)
+        elif "ADX_14_14" in df.columns:
+            df.rename(columns={"ADX_14_14": "adx"}, inplace=True)
+        df["adx"] = pd.to_numeric(df.get("adx", 25.0), errors="coerce").fillna(25.0)
+    except Exception:
+        # Print once to avoid log spam in streaming contexts
+        global _ADX_WARN_PRINTED
+        try:
+            _ADX_WARN_PRINTED
+        except NameError:
+            _ADX_WARN_PRINTED = False
+        if not _ADX_WARN_PRINTED:
+            print("Warning: pandas_ta not found, skipping ADX feature.")
+            _ADX_WARN_PRINTED = True
+        df["adx"] = 25.0
+
     return df
 
 
@@ -323,63 +417,41 @@ def load_meta(model_dir_or_path: str) -> Dict:
 
 def load_model_bundle(model_dir: str):
     """
+    Loads a complete model bundle (model, scaler, meta) using helpers from models.py.
     Returns (model.eval(), scaler_or_None, meta_dict).
-    Requires a models.py with LSTMClassifier in the Python path.
     """
+    model_dir_path = Path(model_dir)
+    meta_path = model_dir_path / "model_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"model_meta.json not found in {model_dir}")
+
+    meta = _load_meta_model(str(meta_path))
+    # Build model architecture from metadata
+    model = _build_model_from_meta(meta)
+    # Load the trained weights into the model (with graceful fallback)
+    weights_path = _resolve_path(model_dir, getattr(meta, 'model_state_path', 'model.pt'))
     try:
-        from models import LSTMClassifier  # late import
-    except Exception as e:
-        raise SystemExit(
-            "Could not import LSTMClassifier from models.py. Ensure models.py is on PYTHONPATH.\n"
-            f"Underlying error: {e}"
-        )
-
-    meta = load_meta(model_dir)
-    if "feature_cols" not in meta:
-        raise KeyError("Missing 'feature_cols' in model meta; no fallback is allowed.")
-    feature_cols = list(meta["feature_cols"])  # must be present
-    hidden_size = int(meta.get("hidden_size", 512))
-    num_layers = int(meta.get("num_layers", 3))
-    dropout = float(meta.get("dropout", 0.3))
-    bidirectional = bool(meta.get("bidirectional", True))
-    num_classes = int(meta.get("num_classes", 2))
-
-    # window_size is not needed to construct the model; features length is
-    model = LSTMClassifier(
-        input_size=len(feature_cols),
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        dropout=dropout,
-        bidirectional=bidirectional,
-        num_classes=num_classes,
-    )
-
-    weights_path = Path(model_dir) / meta.get("model_state_path", "model.pt")
-    if not weights_path.exists():
-        raise FileNotFoundError(f"Weights not found: {weights_path}")
-    state = torch.load(weights_path, map_location="cpu")
-    # Non-strict loading to remain compatible with architectural tweaks (e.g., attention)
-    _incompat = model.load_state_dict(state, strict=False)
-    try:
-        missing = list(getattr(_incompat, "missing_keys", []) or [])
-        unexpected = list(getattr(_incompat, "unexpected_keys", []) or [])
-    except Exception:
-        missing, unexpected = [], []
-    if missing or unexpected:
-        logging.warning(
-            "load_state_dict reported mismatch. missing_keys=%s unexpected_keys=%s",
-            missing,
-            unexpected,
-        )
-
+        _load_model_state(model, weights_path)
+    except RuntimeError as e:
+        # Dimension mismatch is the common case; try fallback checkpoint if provided
+        fallback_name = getattr(meta, 'last_model_state_path', None) or 'model_last.pt'
+        fallback_path = _resolve_path(model_dir, fallback_name)
+        try:
+            _load_model_state(model, fallback_path)
+            logging.warning(
+                "Primary weights '%s' incompatible with model (likely meta mismatch). "
+                "Loaded fallback '%s' instead.",
+                weights_path,
+                fallback_path,
+            )
+        except Exception:
+            raise
+    # Load the scaler if one is specified
     scaler = None
-    spath = meta.get("scaler_path", "scaler.joblib")
-    if spath and joblib is not None:
-        sp = Path(model_dir) / spath
-        if sp.exists():
-            scaler = joblib.load(sp)
-
-    return model.eval(), scaler, meta
+    if getattr(meta, 'feature_scaling', True) and getattr(meta, 'scaler_path', None):
+        scaler_path = _resolve_path(model_dir, meta.scaler_path)
+        scaler = _load_scaler(scaler_path)
+    return model.eval(), scaler, meta.to_dict()
 
 
 # ---------------------------
@@ -463,13 +535,8 @@ class SignalGenerator:
 
         # Build a small DataFrame from recent bars and engineer features
         df_raw = pd.DataFrame(list(self.history))
-        try:
-            # Lazy import to keep utils.py lightweight
-            from train_model import _compute_features as _fe
-        except Exception as e:
-            raise RuntimeError(f"Failed to import feature engineering: {e}")
-
-        df_feat = _fe(df_raw.copy())
+        # Use the centralized feature engineering
+        df_feat = compute_features(df_raw.copy())
         feat_cols = self._ensure_feature_cols(df_feat)
 
         # Extract the newest engineered row; coerce to float32 for model

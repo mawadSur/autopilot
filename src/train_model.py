@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """
-Memory-safe LSTM trainer with streaming windows.
+Memory-safe LSTM trainer with streaming windows and triple-barrier labels.
 
-Key changes:
-- Uses model_meta.json (if present) to lock feature_cols, window_size, and core dims.
-- Computes ALL features in meta by name (including vol_change, price_vs_hourly_trend).
-- Saves best and last checkpoints along with scaler and updated meta.
-
-Usage examples
---------------
-python train_model.py --data-path eth_1m_data --output-dir model
-python train_model.py --data-path eth_1m_data --output-dir model --batch-size 512 --epochs 40 --accumulate 2 --amp 1
-python train_model.py --data-path eth_1m_2024-03.csv --output-dir model --window-size 192
+Key points
+- Uses centralized feature engineering from utils.compute_features (includes ADX).
+- Reads existing model_meta.json (if present) to lock features/window/hidden sizes.
+- Saves best and last checkpoints, scaler, and an updated model_meta.json.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -21,15 +17,17 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Deque, Iterable, List, Optional, Tuple
+from collections import deque
 
 import joblib
 import numpy as np
 import pandas as pd
 import torch
-from collections import deque
-from torch import nn
+import torch.nn as nn
 from torch.utils.data import IterableDataset, DataLoader
+
 from utils import compute_features
+from models import build_model_from_meta
 
 
 # ----------------------------
@@ -41,8 +39,10 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+
 def str2bool(v):
     return str(v).lower() in ("1", "true", "t", "yes", "y")
+
 
 def get_device():
     if torch.cuda.is_available():
@@ -72,140 +72,22 @@ ALL_FEATURES = [
     "vwap_ratio",
     "obv",
     "roc_14",
+    # New
+    "adx",
 ]
 
 
-def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    # OHLC sanity
-    for c in ["open", "high", "low", "close"]:
-        if c not in df.columns:
-            raise ValueError(f"Missing required column '{c}'")
-=======
-def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    # Ensure basic columns exist
-    for c in ["open", "high", "low", "close"]:
-        if c not in df.columns:
-            raise ValueError(f"Missing required column '{c}'")
->>>>>>> 8d962b1 (Updated launch_sagemaker_job and train_model)
-
-    # Candlestick geometry
-    df["body"] = df["close"] - df["open"]
-    rng = (df["high"] - df["low"])
-    df["range"] = rng.replace(0, 1e-12)
-    df["upper_wick"] = (df["high"] - df[["close", "open"]].max(axis=1))
-    df["lower_wick"] = (df[["close", "open"]].min(axis=1) - df["low"])
-    df["return"] = df["close"].pct_change().fillna(0.0)
-
-    # SMA ratio (20)
-    sma = df["close"].rolling(ROLL_WINDOW).mean()
-    df["sma_ratio"] = (df["close"] / (sma + 1e-12)).fillna(1.0)
-
-    # EMA(20)
-    df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
-
-    # RSI(14) with EMA smoothing
-    delta = df["close"].diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=RSI_ALPHA, adjust=False).mean()
-    roll_down = down.ewm(alpha=RSI_ALPHA, adjust=False).mean()
-    rs = roll_up / (roll_down + 1e-12)
-    df["rsi_14"] = (100 - (100 / (1 + rs))).fillna(50.0)
-
-    # Volume percent change
-    if "volume" in df.columns:
-        df["vol_change"] = df["volume"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
-    else:
-        df["vol_change"] = 0.0
-
-    # ATR(14) (EMA of True Range)
-    tr = pd.concat([
-        (df["high"] - df["low"]),
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs(),
-    ], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(alpha=ATR_ALPHA, adjust=False).mean().fillna(tr.mean())
-
-    # MACD(12,26) - signal(9)
-    ema_12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema_26 = df["close"].ewm(span=26, adjust=False).mean()
-    macd = ema_12 - ema_26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    df["macd"] = (macd - signal).fillna(0.0)
-
-<<<<<<< HEAD
-    # Bollinger Band width (20, 2σ)
-    std_20 = df["close"].rolling(ROLL_WINDOW).std()
-    upper = sma + 2 * std_20
-    lower = sma - 2 * std_20
-    df["bb_width"] = ((upper - lower) / (sma + 1e-12)).fillna(0.0)
-
-    # Volatility features: rolling std normalized by rolling mean
-    for w in (20, 50, 100):
-        roll_std = df["close"].rolling(w).std()
-        roll_mean = df["close"].rolling(w).mean()
-        df[f"vol_{w}"] = (roll_std / (roll_mean + 1e-12)).fillna(0.0)
-
-    # Ensure 'volume' column exists for VWAP/OBV calculations
-    if "volume" not in df.columns:
-        df["volume"] = 1.0
-    vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
-
-    # VWAP ratio: daily VWAP if date/time available, else rolling approx (1440 bars)
-    ts_col = None
-    for cand in ("timestamp", "time", "date"):
-        if cand in df.columns:
-            ts_col = cand
-            break
-    vwap = None
-    if ts_col is not None:
-        try:
-            ts = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
-            if ts.notna().any():
-                day = ts.dt.floor("D")
-                pv_sum = (df["close"] * vol).groupby(day).transform("sum")
-                v_sum = vol.groupby(day).transform("sum")
-                vwap = pv_sum / (v_sum + 1e-12)
-        except Exception:
-            vwap = None
-    if vwap is None:
-        # Fallback: approximate daily with 1440-bar rolling VWAP
-        win = 1440
-        pv_roll = (df["close"] * vol).rolling(win, min_periods=1).sum()
-        v_roll = vol.rolling(win, min_periods=1).sum()
-        vwap = pv_roll / (v_roll + 1e-12)
-    df["vwap_ratio"] = (df["close"] / (vwap + 1e-12)).fillna(1.0)
-
-    # On-Balance Volume (OBV)
-    price_diff = df["close"].diff()
-    dir_sign = (price_diff > 0).astype(int) - (price_diff < 0).astype(int)
-    df["obv"] = (dir_sign * vol).cumsum().astype(float)
-
-    # Rate of Change (ROC 14) as fractional change
-    df["roc_14"] = df["close"].pct_change(periods=14).fillna(0.0)
-
-    return df
-=======
-    # Hourly trend ratio (1m data → 60)
-    hourly = df["close"].ewm(span=60, adjust=False).mean()
-    df["price_vs_hourly_trend"] = (df["close"] / (hourly + 1e-12)).fillna(1.0)
-
-    # Bollinger Band width (20, 2σ)
-    std_20 = df["close"].rolling(ROLL_WINDOW).std()
-    upper = sma + 2 * std_20
-    lower = sma - 2 * std_20
-    df["bb_width"] = ((upper - lower) / (sma + 1e-12)).fillna(0.0)
-
-    return df
->>>>>>> 8d962b1 (Updated launch_sagemaker_job and train_model)
-
+# ----------------------------
+# CSV / streaming helpers
+# ----------------------------
 def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     cols = [str(c).lower() for c in df.columns]
-    has_any = any(c in cols for c in ["open","high","low","close","volume","timestamp","time"])
+    has_any = any(c in cols for c in ["open", "high", "low", "close", "volume", "timestamp", "time"]) 
     if not has_any and df.shape[1] >= 6:
         df = df.copy()
-        df.columns = ["timestamp","open","high","low","close","volume"][:df.shape[1]]
+        df.columns = ["timestamp", "open", "high", "low", "close", "volume"][:df.shape[1]]
     return df
+
 
 def _list_csvs(path: str) -> List[Path]:
     p = Path(path)
@@ -217,6 +99,7 @@ def _list_csvs(path: str) -> List[Path]:
     if p.suffix.lower() != ".csv":
         raise ValueError(f"Expected a .csv file or directory, got: {path}")
     return [p]
+
 
 def _stream_rows(files: List[Path], chunksize: int = 500_000, overlap: int = 256) -> Iterable[pd.DataFrame]:
     tail: Optional[pd.DataFrame] = None
@@ -233,6 +116,10 @@ def _stream_rows(files: List[Path], chunksize: int = 500_000, overlap: int = 256
                 tail = chunk
     # no final yield
 
+
+# ----------------------------
+# Triple barrier labels
+# ----------------------------
 def apply_triple_barrier_labels(
     df: pd.DataFrame,
     price_col: str,
@@ -240,14 +127,11 @@ def apply_triple_barrier_labels(
     sl_pct: float,
     time_limit: int,
 ) -> np.ndarray:
-    """
-    Triple-barrier labels per row using future highs/lows up to `time_limit` bars.
+    """Triple-barrier labels per row using future highs/lows up to time_limit bars.
 
     - If future high first crosses price[i] * (1 + tp_pct) → +1 (win)
     - If future low first crosses price[i] * (1 - sl_pct) → -1 (loss)
     - If neither within time_limit → 0 (timeout)
-
-    Returns an np.ndarray of shape [len(df)] with values in {-1, 0, 1}.
     """
     if price_col not in df.columns:
         raise ValueError(f"Missing price column '{price_col}' in DataFrame")
@@ -264,7 +148,6 @@ def apply_triple_barrier_labels(
     if n == 0:
         return labels
 
-    # Ensure sane params
     time_limit = max(1, int(time_limit))
     tp_mult = 1.0 + float(tp_pct)
     sl_mult = 1.0 - float(sl_pct)
@@ -277,13 +160,11 @@ def apply_triple_barrier_labels(
         tp_price = entry * tp_mult
         sl_price = entry * sl_mult
 
-        out = 0  # default timeout
-        # Scan forward up to time_limit bars (or to end of df)
+        out = 0
         max_j = min(time_limit, n - i - 1)
         for j in range(1, max_j + 1):
             hi = highs[i + j]
             lo = lows[i + j]
-            # If both thresholds are crossed on the same bar, treat as TP first.
             if hi >= tp_price:
                 out = 1
                 break
@@ -294,62 +175,106 @@ def apply_triple_barrier_labels(
 
     return labels
 
-<<<<<<< HEAD
 
+# ----------------------------
+# Streaming window dataset
+# ----------------------------
 class StreamWindowDataset(IterableDataset):
-    """
-    Yields (window, label) pairs lazily from a stream of feature frames.
+    """Yields (window, label) pairs lazily from a stream of feature frames.
+
     We keep a deque of the last `window_size` feature rows to form the next sample.
     """
-    def __init__(self,
-                 files: List[Path],
-                 feature_cols: List[str],
-                 price_col: str,
-                 window_size: int,
-                 tp_pct: float,
-                 sl_pct: float,
-                 time_limit: int,
-                 chunksize: int = 500_000,
-                 overlap: int = 256):
+
+    def __init__(
+        self,
+        files: List[Path],
+        feature_cols: List[str],
+        price_col: str,
+        window_size: int,
+        tp_pct: float,
+        sl_pct: float,
+        time_limit: int,
+        chunksize: int = 500_000,
+        overlap: int = 256,
+    ):
         super().__init__()
         self.files = files
         self.feature_cols = feature_cols
         self.price_col = price_col
-        self.window = window_size
+        self.window = int(window_size)
         self.tp_pct = float(tp_pct)
         self.sl_pct = float(sl_pct)
         self.time_limit = int(time_limit)
-        self.chunksize = chunksize
-        # Ensure enough history for features (window_size) and future for labels (time_limit)
-        self.overlap = max(overlap, window_size + self.time_limit + 1)
+        self.chunksize = int(chunksize)
+        self.overlap = max(int(overlap), self.window + self.time_limit + 1)
 
     def __iter__(self):
         buf: Deque[np.ndarray] = deque(maxlen=self.window)
         for df in _stream_rows(self.files, chunksize=self.chunksize, overlap=self.overlap):
-            # Select features and label
             feat_df = df[self.feature_cols].astype(np.float32, copy=False)
-            labels_raw = apply_triple_barrier_labels(
-                df, self.price_col, self.tp_pct, self.sl_pct, self.time_limit
-            )
-            # Map {-1,0,1} → {0,1,2} for CE loss
-            labels = (labels_raw + 1).astype(np.int64, copy=False)
+            labels_raw = apply_triple_barrier_labels(df, self.price_col, self.tp_pct, self.sl_pct, self.time_limit)
+            labels = (labels_raw + 1).astype(np.int64, copy=False)  # {-1,0,1} → {0,1,2}
 
             feats = feat_df.to_numpy(dtype=np.float32, copy=False)
-            prices = df[self.price_col].to_numpy(dtype=np.float32, copy=False)
-
             n = len(df)
             for i in range(n):
-                # push current feature row
-                buf_feats.append(feats[i])
-                if len(buf_feats) < self.window:
+                buf.append(feats[i])
+                if len(buf) < self.window:
                     continue
-                # Only yield if we still have at least `time_limit` future bars available
-                # within this df chunk to determine labels reliably.
                 if i >= n - self.time_limit:
                     continue
+                Xw = np.stack(list(buf), axis=0)  # [T, F]
                 y = int(labels[i])
                 yield torch.from_numpy(Xw).float(), torch.tensor(y, dtype=torch.long)
 
+
+class StreamWindowDatasetReg(IterableDataset):
+    """Streaming windows for regression.
+
+    Label is the future price at i + horizon_bars.
+    """
+    def __init__(
+        self,
+        files: List[Path],
+        feature_cols: List[str],
+        price_col: str,
+        window_size: int,
+        horizon_bars: int = 3,
+        chunksize: int = 500_000,
+        overlap: int = 256,
+    ):
+        super().__init__()
+        self.files = files
+        self.feature_cols = feature_cols
+        self.price_col = price_col
+        self.window = int(window_size)
+        self.horizon = int(max(1, horizon_bars))
+        self.chunksize = int(chunksize)
+        self.overlap = max(int(overlap), self.window + self.horizon + 1)
+
+    def __iter__(self):
+        buf: Deque[np.ndarray] = deque(maxlen=self.window)
+        for df in _stream_rows(self.files, chunksize=self.chunksize, overlap=self.overlap):
+            feat_df = df[self.feature_cols].astype(np.float32, copy=False)
+            feats = feat_df.to_numpy(dtype=np.float32, copy=False)
+            prices = df[self.price_col].to_numpy(dtype=np.float32, copy=False)
+            n = len(df)
+            buf.clear()
+            for i in range(n):
+                buf.append(feats[i])
+                if len(buf) < self.window:
+                    continue
+                j = i + self.horizon
+                if j >= n:
+                    continue
+                Xw = np.stack(list(buf), axis=0)
+                y = float(prices[j])
+                yield torch.from_numpy(Xw).float(), torch.tensor(y, dtype=torch.float32)
+
+
+# ----------------------------
+# Config
+# ----------------------------
 @dataclass
 class TrainConfig:
     data_path: str
@@ -374,55 +299,24 @@ class TrainConfig:
     amp: bool
     workers: int
     chunksize: int
+    task: str
+    horizon: int
+    # Loss/Calibration
+    use_class_weights: bool = True
+    use_focal_loss: bool = False
+    focal_gamma: float = 2.0
+    calibrate_temp: bool = True
 
-class LSTMClassifier(nn.Module):
-=======
-class LSTMClassifier(nn.Module):
->>>>>>> 8d962b1 (Updated launch_sagemaker_job and train_model)
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int,
-                 dropout: float, bidirectional: bool):
-        super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=bidirectional,
-            batch_first=True,
-        )
-        d = 2 if bidirectional else 1
-<<<<<<< HEAD
-        self.head = nn.Sequential(
-            nn.LayerNorm(hidden_size * d),
-            nn.Linear(hidden_size * d, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_size // 2, 3),  # 3 classes: {-1,0,1} → {0,1,2}
-        )
-=======
-        self.head = nn.Sequential(
-            nn.LayerNorm(hidden_size * d),
-            nn.Linear(hidden_size * d, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_size // 2, 2),
-            nn.Linear(hidden_size // 2, 2),
-        )
->>>>>>> 8d962b1 (Updated launch_sagemaker_job and train_model)
 
-    def forward(self, x):
-        _, (h_n, _) = self.lstm(x)
-        if self.lstm.bidirectional:
-            h = torch.cat([h_n[-2], h_n[-1]], dim=-1)
-        else:
-            h = h_n[-1]
-        return self.head(h)
-
+# ----------------------------
+# Training
+# ----------------------------
 def _split_stream(files: List[Path], val_frac: float) -> Tuple[List[Path], List[Path]]:
     if len(files) == 1:
         return files, files
     k = max(1, int(round(len(files) * (1.0 - val_frac))))
     return files[:k], files[k:]
+
 
 def train(cfg: TrainConfig):
     set_seed(cfg.seed)
@@ -431,7 +325,7 @@ def train(cfg: TrainConfig):
 
     files = _list_csvs(cfg.data_path)
 
-    # --- Load meta if present to lock features/window/model dims ---
+    # Load meta to lock features/window/model dims (if present)
     meta_existing = {}
     meta_path = Path(cfg.meta_path)
     if meta_path.exists():
@@ -441,33 +335,32 @@ def train(cfg: TrainConfig):
             meta_existing = {}
 
     # Determine feature set
-    desired_features = meta_existing.get("feature_cols", ALL_FEATURES)
-    # Stream a peek to ensure features exist and build scaler
+    desired_features = list(meta_existing.get("feature_cols", ALL_FEATURES))
     peek = next(_stream_rows(files, chunksize=min(cfg.chunksize, 200_000), overlap=cfg.window_size + 5))
     available = set(peek.columns.tolist())
     feature_cols = [c for c in desired_features if c in available]
+    # Ensure ADX is part of training features if available
+    if "adx" in available and "adx" not in feature_cols:
+        feature_cols.append("adx")
     if len(feature_cols) < 4:
         raise ValueError(f"Too few features after engineering. Wanted={desired_features}, available={sorted(available)}")
 
     # Walk-forward folds: train on months 1..k, validate on month k+1
-    n_files = len(files)
     folds: List[Tuple[List[Path], List[Path]]] = []
-    if n_files >= 2:
-        for k in range(1, n_files):
+    if len(files) >= 2:
+        for k in range(1, len(files)):
             folds.append((files[:k], [files[k]]))
     else:
-        # Fallback: single-file split treated as one fold
         folds.append((files, files))
 
     from sklearn.preprocessing import StandardScaler
 
-    agg_acc = 0.0
-    fold_logs = []
-
+    fold_logs: List[dict] = []
     last_fold_best_state = None
     last_fold_last_state = None
     last_fold_scaler = None
 
+    temperature_final: float = 1.0
     for fold_idx, (train_files, val_files) in enumerate(folds, start=1):
         # Fit scaler on training sample (small peek) for this fold
         train_peek = next(_stream_rows(train_files, chunksize=min(cfg.chunksize, 200_000), overlap=cfg.window_size + 5))
@@ -476,66 +369,91 @@ def train(cfg: TrainConfig):
         scaler.fit(sample)
 
         def collate_batch(batch):
-            xb, yb = zip(*batch)
-            xb = torch.stack(list(xb), dim=0)  # [B,T,F]
-            yb = torch.stack(list(yb), dim=0)
-            # scale features per window with fitted scaler (vectorized)
+            xb, yb = zip(*batch)  # xb: [B,T,F]
+            xb = torch.stack(list(xb), dim=0)
             B, T, F = xb.shape
-            xflat = xb.reshape(B*T, F).numpy()
+            xflat = xb.reshape(B * T, F).numpy()
             xflat = scaler.transform(xflat).astype(np.float32, copy=False)
             xb2 = torch.from_numpy(xflat).view(B, T, F)
+            # yb may be float (regression) or long (classification)
+            if isinstance(yb[0], torch.Tensor):
+                yb = torch.stack(list(yb), dim=0)
+            else:
+                yb = torch.tensor(yb)
             return xb2, yb
 
-        # Build loaders for this fold
-        train_ds = StreamWindowDataset(
-            train_files,
-            feature_cols,
-            cfg.price_col,
-            cfg.window_size,
-            cfg.tp_pct,
-            cfg.sl_pct,
-            cfg.time_limit,
-            chunksize=cfg.chunksize,
-        )
-        val_ds = StreamWindowDataset(
-            val_files,
-            feature_cols,
-            cfg.price_col,
-            cfg.window_size,
-            cfg.tp_pct,
-            cfg.sl_pct,
-            cfg.time_limit,
-            chunksize=cfg.chunksize,
-        )
+        if getattr(cfg, 'task', 'classification') == 'regression':
+            train_ds = StreamWindowDatasetReg(
+                train_files, feature_cols, cfg.price_col, cfg.window_size,
+                horizon_bars=getattr(cfg, 'horizon', 3), chunksize=cfg.chunksize,
+            )
+            val_ds = StreamWindowDatasetReg(
+                val_files, feature_cols, cfg.price_col, cfg.window_size,
+                horizon_bars=getattr(cfg, 'horizon', 3), chunksize=cfg.chunksize,
+            )
+        else:
+            train_ds = StreamWindowDataset(
+                train_files, feature_cols, cfg.price_col, cfg.window_size,
+                cfg.tp_pct, cfg.sl_pct, cfg.time_limit, chunksize=cfg.chunksize,
+            )
+            val_ds = StreamWindowDataset(
+                val_files, feature_cols, cfg.price_col, cfg.window_size,
+                cfg.tp_pct, cfg.sl_pct, cfg.time_limit, chunksize=cfg.chunksize,
+            )
 
         train_loader = DataLoader(
-            train_ds,
-            batch_size=cfg.batch_size,
-            num_workers=cfg.workers,
-            pin_memory=(device.type == "cuda"),
-            collate_fn=collate_batch
+            train_ds, batch_size=cfg.batch_size, num_workers=cfg.workers,
+            pin_memory=(device.type == "cuda"), collate_fn=collate_batch,
         )
         val_loader = DataLoader(
-            val_ds,
-            batch_size=cfg.batch_size,
-            num_workers=max(0, cfg.workers // 2),
-            pin_memory=(device.type == "cuda"),
-            collate_fn=collate_batch
+            val_ds, batch_size=cfg.batch_size, num_workers=max(0, cfg.workers // 2),
+            pin_memory=(device.type == "cuda"), collate_fn=collate_batch,
         )
 
-        # Fresh model per fold
-        model = LSTMClassifier(
-            input_size=len(feature_cols),
-            hidden_size=cfg.hidden_size,
-            num_layers=cfg.num_layers,
-            dropout=cfg.dropout,
-            bidirectional=cfg.bidirectional,
-        ).to(device)
+        # Build model from meta helper
+        model_meta_dict = {
+            "input_size": len(feature_cols),
+            "hidden_size": cfg.hidden_size,
+            "num_layers": cfg.num_layers,
+            "dropout": cfg.dropout,
+            "bidirectional": cfg.bidirectional,
+            "num_classes": (1 if getattr(cfg, 'task', 'classification') == 'regression' else 3),
+        }
+        model = build_model_from_meta(model_meta_dict).to(device)
 
-        criterion = nn.CrossEntropyLoss()
+        # Class weights (classification only)
+        class_weights = None
+        if getattr(cfg, 'task', 'classification') != 'regression' and cfg.use_class_weights:
+            # We use config flag later when choosing criterion
+            labels_peek = apply_triple_barrier_labels(train_peek, cfg.price_col, cfg.tp_pct, cfg.sl_pct, cfg.time_limit)
+            labels_peek = (labels_peek + 1).clip(0, 2)
+            counts = np.bincount(labels_peek.astype(np.int64), minlength=3).astype(np.float32)
+            counts[counts == 0] = 1.0
+            inv = 1.0 / counts
+            cw = (inv / inv.sum()) * 3.0
+            class_weights = torch.tensor(cw, device=device, dtype=torch.float32)
+
+        # Loss: focal or cross entropy
+        class FocalLoss(nn.Module):
+            def __init__(self, gamma: float = 2.0, weight: Optional[torch.Tensor] = None):
+                super().__init__()
+                self.gamma = gamma
+                self.weight = weight
+            def forward(self, logits, target):
+                ce = nn.functional.cross_entropy(logits, target, reduction='none', weight=self.weight)
+                pt = torch.exp(-ce)
+                loss = ((1 - pt) ** self.gamma) * ce
+                return loss.mean()
+
+        if getattr(cfg, 'task', 'classification') == 'regression':
+            criterion = nn.SmoothL1Loss()
+        else:
+            if cfg.use_focal_loss:
+                criterion = FocalLoss(gamma=float(cfg.focal_gamma), weight=class_weights)
+            else:
+                criterion = nn.CrossEntropyLoss(weight=class_weights)
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-
-        scaler_obj = torch.cuda.amp.GradScaler(enabled=(cfg.amp and device.type == "cuda"))
+        scaler_obj = torch.amp.GradScaler(device_type=device.type, enabled=(cfg.amp and device.type == "cuda"))
 
         best_val = -1.0
         best_state = None
@@ -572,86 +490,125 @@ def train(cfg: TrainConfig):
                 running += loss.item()
                 step += 1
 
-            # Validation (streamed) for this fold
+            # Validation
             model.eval()
-            correct = 0
-            total = 0
+            if getattr(cfg, 'task', 'classification') == 'regression':
+                abs_err_sum = 0.0
+                total = 0
+                with torch.no_grad():
+                    for xb, yb in val_loader:
+                        xb = xb.to(device, non_blocking=True)
+                        yb = yb.to(device, non_blocking=True).float()
+                        with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
+                            pred = model(xb).squeeze(-1)
+                        abs_err_sum += torch.abs(pred - yb).sum().item()
+                        total += yb.numel()
+                val_mae = abs_err_sum / max(1, total)
+                score = -val_mae
+                if score > best_val:
+                    best_val = score
+                    best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                print(f"Fold {fold_idx}/{len(folds)} Epoch {epoch}/{cfg.epochs} - train_loss={running/max(1, step):.4f} val_mae={val_mae:.6f}")
+            else:
+                correct = total = 0
+                with torch.no_grad():
+                    for xb, yb in val_loader:
+                        xb = xb.to(device, non_blocking=True)
+                        yb = yb.to(device, non_blocking=True)
+                        with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
+                            logits = model(xb)
+                        pred = logits.argmax(dim=-1)
+                        correct += (pred == yb).sum().item()
+                        total += yb.numel()
+                val_acc = correct / max(1, total)
+                if val_acc > best_val:
+                    best_val = val_acc
+                    best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                print(f"Fold {fold_idx}/{len(folds)} Epoch {epoch}/{cfg.epochs} - train_loss={running/max(1, step):.4f} val_acc={val_acc:.4f}")
+
+        # Track last fold artifacts
+        last_fold_best_state = best_state
+        last_fold_last_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        last_fold_scaler = scaler
+        fold_logs.append({"fold": fold_idx, "val_acc": float(best_val)})
+
+        # Temperature calibration on this fold's validation set (optional)
+        if cfg.calibrate_temp and getattr(cfg, 'task', 'classification') != 'regression':
+            print("[calibrate] Fitting temperature on validation set ...")
+            model_cal = build_model_from_meta(model_meta_dict).to(device)
+            if best_state is not None:
+                model_cal.load_state_dict(best_state)
+            model_cal.eval()
+            all_logits = []
+            all_labels = []
             with torch.no_grad():
                 for xb, yb in val_loader:
                     xb = xb.to(device, non_blocking=True)
                     yb = yb.to(device, non_blocking=True)
-                    with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
-                        logits = model(xb)
-                    pred = logits.argmax(dim=-1)
-                    correct += (pred == yb).sum().item()
-                    total += yb.numel()
-            val_acc = correct / max(1, total)
+                    logits = model_cal(xb)
+                    all_logits.append(logits.detach().cpu())
+                    all_labels.append(yb.detach().cpu())
+            if all_logits:
+                logits_cat = torch.cat(all_logits, dim=0)
+                labels_cat = torch.cat(all_labels, dim=0)
+                T = torch.ones(1, requires_grad=True)
+                opt = torch.optim.LBFGS([T], lr=0.1, max_iter=50)
+                def _closure():
+                    opt.zero_grad()
+                    loss = nn.functional.cross_entropy(logits_cat / T.clamp(min=1e-3), labels_cat)
+                    loss.backward()
+                    return loss
+                for _ in range(10):
+                    opt.step(_closure)
+                temperature_final = float(T.detach().clamp(min=1e-3).item())
+                print(f"[calibrate] Temperature = {temperature_final:.4f}")
 
-            if val_acc > best_val:
-                best_val = val_acc
-                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-
-            print(
-                f"Fold {fold_idx}/{len(folds)} Epoch {epoch}/{cfg.epochs} - "
-                f"train_loss={running/max(1, step):.4f} val_acc={val_acc:.4f}"
-            )
-
-        # Track aggregate and fold logs
-        agg_acc += max(best_val, 0.0)
-        fold_logs.append({
-            "fold": fold_idx,
-            "train_files": [str(p) for p in train_files],
-            "val_files": [str(p) for p in val_files],
-            "val_acc": best_val,
-        })
-        last_fold_best_state = best_state
-        last_fold_last_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-        last_fold_scaler = scaler
-
-    agg_val = agg_acc / max(1, len(folds))
-
-    # Save artifacts from final fold
+    # Save artifacts
     outdir = Path(cfg.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
-
     model_path = outdir / "model.pt"
-    last_path  = outdir / "model_last.pt"
+    last_path = outdir / "model_last.pt"
     meta_path = outdir / "model_meta.json"
     scaler_path = outdir / "scaler.joblib"
 
+    if last_fold_last_state is None:
+        raise RuntimeError("Training did not produce any model state.")
     torch.save(last_fold_last_state, last_path)
     torch.save(last_fold_best_state if last_fold_best_state is not None else last_fold_last_state, model_path)
-
     if last_fold_scaler is not None:
         joblib.dump(last_fold_scaler, scaler_path)
 
-    # Write meta that exactly matches the checkpoint
-    meta = dict(meta_existing)  # start from any existing settings
+    # Ensure ADX present in meta feature list
+    feature_cols_meta = list(feature_cols)
+    if "adx" not in feature_cols_meta:
+        feature_cols_meta.append("adx")
+
+    agg_val = float(np.mean([f["val_acc"] for f in fold_logs])) if fold_logs else 0.0
+
+    meta = dict(meta_existing)
     meta.update({
         "model_type": "lstm_classifier",
         "framework": "pytorch",
         "feature_scaling": True,
         "scaler_type": "standard",
-        "feature_cols": feature_cols,
-        "label_def": "triple_barrier",
+        "feature_cols": feature_cols_meta,
+        "label_def": "triple_barrier_{-1,0,1}",
         "num_classes": 3,
         "price_col": cfg.price_col,
+        "window_size": cfg.window_size,
         "tp_pct": cfg.tp_pct,
         "sl_pct": cfg.sl_pct,
         "time_limit": cfg.time_limit,
-        "window_size": cfg.window_size,
-        "input_size": len(feature_cols),
-        "hidden_size": hidden_size,
-        "num_layers": num_layers,
-        "dropout": dropout,
-        "bidirectional": bidirectional,
-        "buy_threshold": meta.get("buy_threshold", 0.60),
-        "sell_threshold": meta.get("sell_threshold", 0.60),
-        "tx_cost": meta.get("tx_cost", 0.0008),
+        "input_size": len(feature_cols),  # model input matches training features
+        "hidden_size": cfg.hidden_size,
+        "num_layers": cfg.num_layers,
+        "dropout": cfg.dropout,
+        "bidirectional": cfg.bidirectional,
         "model_state_path": "model.pt",
         "last_model_state_path": "model_last.pt",
         "scaler_path": "scaler.joblib",
         "notes": "Triple-barrier classification with walk-forward validation.",
+        "temperature": float(temperature_final),
     })
     meta_path.write_text(json.dumps(meta, indent=2))
 
@@ -659,199 +616,27 @@ def train(cfg: TrainConfig):
         "walk_forward_folds": len(folds),
         "folds": fold_logs,
         "val_acc_aggregate": agg_val,
-        "feature_cols": feature_cols,
+        "feature_cols": feature_cols_meta,
         "num_params": sum(p.numel() for p in model.parameters()),
         "config": vars(cfg) | {"meta_path": str(meta_path)},
     }, indent=2))
 
-    print(
-        f"Saved: {model_path}, {last_path}, scaler=True, meta={meta_path}. "
-        f"Walk-forward folds={len(folds)} agg_val_acc={agg_val:.4f}"
-    )
-=======
-def train(cfg: TrainConfig):
-    set_seed(cfg.seed)
-    torch.set_num_threads(max(1, os.cpu_count() // 2))
-    device = get_device()
+    print(f"Saved: {model_path}, {last_path}, scaler={'True' if last_fold_scaler is not None else 'False'}, meta={meta_path}")
 
-    files = _list_csvs(cfg.data_path)
 
-    # --- Load meta if present to lock features/window/model dims ---
-    meta_existing = {}
-    meta_path = Path(cfg.meta_path)
-    if meta_path.exists():
-        try:
-            meta_existing = json.loads(meta_path.read_text())
-        except Exception:
-            meta_existing = {}
-
-    # Determine feature set
-    desired_features = meta_existing.get("feature_cols", ALL_FEATURES)
-    # Stream a peek to ensure features exist and build scaler
-    peek = next(_stream_rows(files, chunksize=min(cfg.chunksize, 200_000), overlap=cfg.window_size + 5))
-    available = set(peek.columns.tolist())
-    feature_cols = [c for c in desired_features if c in available]
-    if len(feature_cols) < 4:
-        raise ValueError(f"Too few features after engineering. Wanted={desired_features}, available={sorted(available)}")
-
-    # Resolve training hyperparams from meta (fallback to CLI)
-    window_size = int(meta_existing.get("window_size", cfg.window_size))
-    hidden_size = int(meta_existing.get("hidden_size", cfg.hidden_size))
-    num_layers  = int(meta_existing.get("num_layers",  cfg.num_layers))
-    dropout     = float(meta_existing.get("dropout",   cfg.dropout))
-    bidirectional = bool(meta_existing.get("bidirectional", cfg.bidirectional))
-
-    # Scaler fit on sample
-    from sklearn.preprocessing import StandardScaler
-    sample = peek[feature_cols].astype(np.float32, copy=False).to_numpy()[:200_000]
-    scaler = StandardScaler()
-    scaler.fit(sample)
-
-    def collate_batch(batch):
-        xb, yb = zip(*batch)
-        xb = torch.stack(list(xb), dim=0)  # [B,T,F]
-        yb = torch.stack(list(yb), dim=0)
-        B, T, F = xb.shape
-        xflat = xb.reshape(B*T, F).numpy()
-        xflat = scaler.transform(xflat).astype(np.float32, copy=False)
-        xb = torch.from_numpy(xflat).view(B, T, F)
-        return xb, yb
-
-    train_files, val_files = _split_stream(files, cfg.val_frac if len(files) > 1 else 0.1)
-    train_ds = StreamWindowDataset(train_files, feature_cols, cfg.price_col, window_size, chunksize=cfg.chunksize)
-    val_ds   = StreamWindowDataset(val_files,   feature_cols, cfg.price_col, window_size, chunksize=cfg.chunksize)
-
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, num_workers=cfg.workers,
-                              pin_memory=(device.type == "cuda"), collate_fn=collate_batch)
-    val_loader   = DataLoader(val_ds, batch_size=cfg.batch_size, num_workers=max(0, cfg.workers // 2),
-                              pin_memory=(device.type == "cuda"), collate_fn=collate_batch)
-
-    model = LSTMClassifier(
-        input_size=len(feature_cols),
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        dropout=dropout,
-        bidirectional=bidirectional,
-    ).to(device)
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    scaler_obj = torch.cuda.amp.GradScaler(enabled=(cfg.amp and device.type == "cuda"))
-
-    best_val = -1.0
-    best_state = None
-
-    for epoch in range(1, cfg.epochs + 1):
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-        running = 0.0
-        step = 0
-
-        for xb, yb in train_loader:
-            xb = xb.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
-                logits = model(xb)
-                loss = criterion(logits, yb)
-
-            if scaler_obj.is_enabled():
-                scaler_obj.scale(loss / cfg.accumulate).backward()
-            else:
-                (loss / cfg.accumulate).backward()
-
-            if (step + 1) % cfg.accumulate == 0:
-                if scaler_obj.is_enabled():
-                    scaler_obj.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler_obj.step(optimizer)
-                    scaler_obj.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
-            running += loss.item()
-            step += 1
-
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb = xb.to(device, non_blocking=True)
-                yb = yb.to(device, non_blocking=True)
-                with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
-                    logits = model(xb)
-                pred = logits.argmax(dim=-1)
-                correct += (pred == yb).sum().item()
-                total += yb.numel()
-
-        val_acc = correct / max(1, total)
-        if val_acc > best_val:
-            best_val = val_acc
-            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-
-        print(f"Epoch {epoch}/{cfg.epochs} - train_loss={running/max(1, step):.4f} val_acc={val_acc:.4f}")
-
-    outdir = Path(cfg.output_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    model_path = outdir / "model.pt"
-    last_path  = outdir / "model_last.pt"
-    meta_path = outdir / "model_meta.json"
-    scaler_path = outdir / "scaler.joblib"
-
-    torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, last_path)
-    torch.save(best_state if best_state is not None else {k: v.detach().cpu() for k, v in model.state_dict().items()}, model_path)
-    joblib.dump(scaler, scaler_path)
-
-    # Write meta that exactly matches the checkpoint
-    meta = dict(meta_existing)  # start from any existing settings
-    meta.update({
-        "model_type": "lstm_classifier",
-        "framework": "pytorch",
-        "feature_scaling": True,
-        "scaler_type": "standard",
-        "feature_cols": feature_cols,
-        "label_def": "next_bar_up",
-        "num_classes": 2,
-        "price_col": cfg.price_col,
-        "window_size": window_size,
-        "input_size": len(feature_cols),
-        "hidden_size": hidden_size,
-        "num_layers": num_layers,
-        "dropout": dropout,
-        "bidirectional": bidirectional,
-        "buy_threshold": meta.get("buy_threshold", 0.60),
-        "sell_threshold": meta.get("sell_threshold", 0.60),
-        "tx_cost": meta.get("tx_cost", 0.0008),
-        "model_state_path": "model.pt",
-        "last_model_state_path": "model_last.pt",
-        "scaler_path": "scaler.joblib",
-        "notes": "Binary classification (1=buy, 0=no-trade). Streaming trainer with meta-locked features.",
-    })
-    meta_path.write_text(json.dumps(meta, indent=2))
-
-    (outdir / "training_summary.json").write_text(json.dumps({
-        "val_acc_best": best_val,
-        "feature_cols": feature_cols,
-        "num_params": sum(p.numel() for p in model.parameters()),
-        "config": vars(cfg) | {"meta_path": str(meta_path)},
-        "config": vars(cfg) | {"meta_path": str(meta_path)},
-    }, indent=2))
-
-    print(f"Saved: {model_path}, {last_path}, scaler=True, meta={meta_path}")
->>>>>>> 8d962b1 (Updated launch_sagemaker_job and train_model)
-
+# ----------------------------
+# CLI
+# ----------------------------
 def env_default(key: str, fallback: str) -> str:
     v = os.environ.get(key)
     return v if v else fallback
 
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Memory-safe streaming trainer for LSTM classifier (meta-aware).")
-    p.add_argument("--data-path", type=str, default=env_default("SM_CHANNEL_TRAIN", "eth_1m_data"))  # renamed
+    p.add_argument("--data-path", type=str, default=env_default("SM_CHANNEL_TRAIN", "eth_1m_data"))
     p.add_argument("--output-dir", type=str, default=env_default("SM_MODEL_DIR", "./model"))
-    p.add_argument("--meta-path", type=str, default="model/model_meta.json")  # default to inside output dir
+    p.add_argument("--meta-path", type=str, default="model/model_meta.json")
 
     # Model / data (these are fallback defaults; meta can override)
     p.add_argument("--window-size", type=int, default=192)
@@ -872,20 +657,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--chunksize", type=int, default=500_000)
     p.add_argument("--price-col", type=str, default="close")
-    # Triple barrier params
+    # Triple barrier params (classification)
     p.add_argument("--tp-pct", type=float, default=0.01, help="Take-profit percent e.g., 0.01 for 1%")
     p.add_argument("--sl-pct", type=float, default=0.005, help="Stop-loss percent e.g., 0.005 for 0.5%")
     p.add_argument("--time-limit", type=int, default=30, help="Number of bars to look ahead")
+    # Task toggle & regression horizon
+    p.add_argument("--task", choices=["classification","regression"], default="classification")
+    p.add_argument("--horizon", type=int, default=3, help="Bars ahead to predict for regression (3=3 minutes)")
+    # Loss / calibration
+    p.add_argument("--use-class-weights", type=str2bool, default=True)
+    p.add_argument("--use-focal-loss", type=str2bool, default=False)
+    p.add_argument("--focal-gamma", type=float, default=2.0)
+    p.add_argument("--calibrate-temp", type=str2bool, default=True)
     return p
+
 
 def main():
     args = build_parser().parse_args()
+
     # If meta-path is inside output dir, ensure parent exists
     mp = Path(args.meta_path)
     if not mp.is_absolute():
         mp = Path(args.output_dir) / mp
+    mp.parent.mkdir(parents=True, exist_ok=True)
+
     cfg = TrainConfig(
-        data_path=args.data_path,     # <-- uses data_path now
+        data_path=args.data_path,
         output_dir=args.output_dir,
         meta_path=str(mp),
         window_size=args.window_size,
@@ -907,37 +704,15 @@ def main():
         amp=args.amp,
         workers=args.workers,
         chunksize=args.chunksize,
+        task=args.task,
+        horizon=args.horizon,
+        use_class_weights=args.use_class_weights,
+        use_focal_loss=args.use_focal_loss,
+        focal_gamma=args.focal_gamma,
+        calibrate_temp=args.calibrate_temp,
     )
-=======
-    # If meta-path is inside output dir, ensure parent exists
-    mp = Path(args.meta_path)
-    if not mp.is_absolute():
-        mp = Path(args.output_dir) / mp
-    cfg = TrainConfig(
-        data_path=args.data_path,     # <-- uses data_path now
-        output_dir=args.output_dir,
-        meta_path=str(mp),
-        window_size=args.window_size,
-        hidden_size=args.hidden_size,
-        num_layers=args.num_layers,
-        dropout=args.dropout,
-        bidirectional=args.bidirectional,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        val_frac=args.val_frac,
-        accumulate=args.accumulate,
-        seed=args.seed,
-        price_col=args.price_col,
-        amp=args.amp,
-        workers=args.workers,
-        chunksize=args.chunksize,
-    )
->>>>>>> 8d962b1 (Updated launch_sagemaker_job and train_model)
     train(cfg)
 
-if __name__ == "__main__":
-<<<<<<< HEAD
-    main()
 
+if __name__ == "__main__":
+    main()
