@@ -502,7 +502,7 @@ def train(cfg: TrainConfig):
             else:
                 criterion = nn.CrossEntropyLoss(weight=class_weights)
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-        scaler_obj = torch.amp.GradScaler(device_type=device.type, enabled=(cfg.amp and device.type == "cuda"))
+        scaler_obj = torch.amp.GradScaler(enabled=(cfg.amp and device.type == "cuda"))
 
         best_val = -1.0
         best_state = None
@@ -520,6 +520,8 @@ def train(cfg: TrainConfig):
                 yb = yb.to(device, non_blocking=True)
                 with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
                     logits = model(xb)
+                    if getattr(cfg, 'task', 'classification') == 'regression':
+                        logits = logits.squeeze(-1)
                     loss = criterion(logits, yb)
 
                 if scaler_obj.is_enabled():
