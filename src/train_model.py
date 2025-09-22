@@ -654,14 +654,19 @@ def train(cfg: TrainConfig):
 
     meta = dict(meta_existing)
     model_type = selected_model_type or "transformer"
+    task = getattr(cfg, 'task', 'classification')
+    num_classes = 1 if task == 'regression' else 3
+    label_def = 'return_regression' if task == 'regression' else 'triple_barrier_{-1,0,1}'
+    notes = meta.get("notes") or ("Return regression with walk-forward validation." if task == 'regression' else "Triple-barrier classification with walk-forward validation.")
     meta.update({
         "model_type": model_type,
         "framework": "pytorch",
         "feature_scaling": True,
         "scaler_type": "standard",
         "feature_cols": feature_cols_meta,
-        "label_def": "triple_barrier_{-1,0,1}",
-        "num_classes": 3,
+        "label_def": label_def,
+        "num_classes": num_classes,
+        "task": task,
         "price_col": cfg.price_col,
         "window_size": cfg.window_size,
         "tp_pct": cfg.tp_pct,
@@ -675,7 +680,7 @@ def train(cfg: TrainConfig):
         "model_state_path": "model.pt",
         "last_model_state_path": "model_last.pt",
         "scaler_path": "scaler.joblib",
-        "notes": "Triple-barrier classification with walk-forward validation.",
+        "notes": notes,
         "temperature": float(temperature_final),
     })
     if model_type.lower() in {"transformer", "transformer_classifier"}:

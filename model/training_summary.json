@@ -3,102 +3,150 @@
   "folds": [
     {
       "fold": 1,
-      "val_acc": 0.8680688336520076
+      "val_acc": -0.03334040099924261,
+      "val_mae": 0.03334040099924261,
+      "directional_acc": 0.5418181818181819
     },
     {
       "fold": 2,
-      "val_acc": 0.9502868068833652
+      "val_acc": -0.0012133039398626849,
+      "val_mae": 0.0012133039398626849,
+      "directional_acc": 0.4381818181818182
     },
     {
       "fold": 3,
-      "val_acc": 0.8355640535372849
+      "val_acc": -0.005973095514557578,
+      "val_mae": 0.005973095514557578,
+      "directional_acc": 0.5036363636363637
     },
     {
       "fold": 4,
-      "val_acc": 0.9120458891013384
+      "val_acc": -0.007420830889181657,
+      "val_mae": 0.007420830889181657,
+      "directional_acc": 0.5036363636363637
     },
     {
       "fold": 5,
-      "val_acc": 0.9904397705544933
+      "val_acc": -0.002202805903824893,
+      "val_mae": 0.002202805903824893,
+      "directional_acc": 0.5618181818181818
     },
     {
       "fold": 6,
-      "val_acc": 0.9349904397705545
+      "val_acc": -0.000762115947224877,
+      "val_mae": 0.000762115947224877,
+      "directional_acc": 0.5309090909090909
     },
     {
       "fold": 7,
-      "val_acc": 0.7304015296367112
+      "val_acc": -0.001737555671821941,
+      "val_mae": 0.001737555671821941,
+      "directional_acc": 0.52
     },
     {
       "fold": 8,
-      "val_acc": 0.7170172084130019
+      "val_acc": -0.008968703855167735,
+      "val_mae": 0.008968703855167735,
+      "directional_acc": 0.5327272727272727
     },
     {
       "fold": 9,
-      "val_acc": 0.497131931166348
+      "val_acc": -0.0022975356741385027,
+      "val_mae": 0.0022975356741385027,
+      "directional_acc": 0.509090909090909
     },
     {
       "fold": 10,
-      "val_acc": 0.9961759082217974
+      "val_acc": -0.0013649417595429853,
+      "val_mae": 0.0013649417595429853,
+      "directional_acc": 0.49272727272727274
     },
     {
       "fold": 11,
-      "val_acc": 0.9502868068833652
+      "val_acc": -0.000614441071044315,
+      "val_mae": 0.000614441071044315,
+      "directional_acc": 0.5036363636363637
     },
     {
       "fold": 12,
-      "val_acc": 0.7380497131931166
+      "val_acc": -0.0009106528894467788,
+      "val_mae": 0.0009106528894467788,
+      "directional_acc": 0.5272727272727272
     },
     {
       "fold": 13,
-      "val_acc": 0.7762906309751434
+      "val_acc": -0.0010943120379339564,
+      "val_mae": 0.0010943120379339564,
+      "directional_acc": 0.49818181818181817
     },
     {
       "fold": 14,
-      "val_acc": 0.7074569789674953
+      "val_acc": -0.0010920464450662787,
+      "val_mae": 0.0010920464450662787,
+      "directional_acc": 0.5618181818181818
     },
     {
       "fold": 15,
-      "val_acc": 0.6787762906309751
+      "val_acc": -0.003731270432472229,
+      "val_mae": 0.003731270432472229,
+      "directional_acc": 0.4763636363636364
     },
     {
       "fold": 16,
-      "val_acc": 0.9866156787762906
+      "val_acc": -0.0007269498773596504,
+      "val_mae": 0.0007269498773596504,
+      "directional_acc": 0.54
     },
     {
       "fold": 17,
-      "val_acc": 0.8986615678776291
+      "val_acc": -0.0007556774805892597,
+      "val_mae": 0.0007556774805892597,
+      "directional_acc": 0.48
     },
     {
       "fold": 18,
-      "val_acc": 0.7284894837476099
+      "val_acc": -0.0010565223612568596,
+      "val_mae": 0.0010565223612568596,
+      "directional_acc": 0.5072727272727273
     },
     {
       "fold": 19,
-      "val_acc": 0.6615678776290631
+      "val_acc": -0.001838575222275474,
+      "val_mae": 0.001838575222275474,
+      "directional_acc": 0.5254545454545455
     },
     {
       "fold": 20,
-      "val_acc": 0.609942638623327
+      "val_acc": -0.0013091606714508751,
+      "val_mae": 0.0013091606714508751,
+      "directional_acc": 0.4818181818181818
     },
     {
       "fold": 21,
-      "val_acc": 0.6864244741873805
+      "val_acc": -0.0013029487227851693,
+      "val_mae": 0.0013029487227851693,
+      "directional_acc": 0.4381818181818182
     },
     {
       "fold": 22,
-      "val_acc": 0.8718929254302104
+      "val_acc": -0.0008861181207678535,
+      "val_mae": 0.0008861181207678535,
+      "directional_acc": 0.4818181818181818
     },
     {
       "fold": 23,
-      "val_acc": 0.7896749521988528
+      "val_acc": -0.0008132051066918807,
+      "val_mae": 0.0008132051066918807,
+      "directional_acc": 0.5018181818181818
     },
     {
       "fold": 24,
-      "val_acc": 0.5583173996175909
+      "val_acc": -0.0014624208889224312,
+      "val_mae": 0.0014624208889224312,
+      "directional_acc": 0.49272727272727274
     }
   ],
-  "val_acc_aggregate": 0.7947737412364564,
+  "val_acc_aggregate": -0.00345314964510952,
   "feature_cols": [
     "open",
     "high",
@@ -125,19 +173,19 @@
     "roc_14",
     "adx"
   ],
-  "num_params": 35581443,
+  "num_params": 9471489,
   "config": {
     "data_path": "/opt/ml/input/data/train",
     "output_dir": "/opt/ml/model",
     "meta_path": "/opt/ml/model/model_meta.json",
     "window_size": 192,
-    "hidden_size": 768,
+    "hidden_size": 512,
     "num_layers": 3,
-    "dropout": 0.1,
+    "dropout": 0.2,
     "bidirectional": true,
     "epochs": 40,
-    "batch_size": 512,
-    "learning_rate": 0.003,
+    "batch_size": 256,
+    "learning_rate": 0.001,
     "weight_decay": 0.0001,
     "val_frac": 0.15,
     "accumulate": 2,
@@ -148,6 +196,14 @@
     "time_limit": 30,
     "amp": true,
     "workers": 0,
-    "chunksize": 500000
+    "chunksize": 500000,
+    "task": "regression",
+    "horizon": 3,
+    "model_type": "transformer",
+    "max_folds": null,
+    "use_class_weights": true,
+    "use_focal_loss": false,
+    "focal_gamma": 2.0,
+    "calibrate_temp": true
   }
 }

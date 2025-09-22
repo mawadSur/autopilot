@@ -328,6 +328,7 @@ class ModelMeta:
     dropout: float = 0.1
     bidirectional: bool = False
     num_classes: int = 3
+    task: str = "classification"
 
     # Artifacts (relative to model dir unless absolute)
     model_state_path: str = "model.pt"
@@ -356,6 +357,7 @@ class ModelMeta:
             dropout=float(d.get("dropout", 0.1)),
             bidirectional=bool(d.get("bidirectional", False)),
             num_classes=int(d.get("num_classes", d.get("classes", 3))),
+            task=str(d.get("task", "classification")),
             model_state_path=str(d.get("model_state_path", d.get("weights", "model.pt"))),
             scaler_path=d.get("scaler_path", d.get("scaler", "scaler.joblib")),
             feature_scaling=bool(d.get("feature_scaling", d.get("scale_features", True))),

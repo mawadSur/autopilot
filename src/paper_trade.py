@@ -32,7 +32,7 @@ from utils import (
 def main():
     ap = argparse.ArgumentParser(description="Paper (simulated) trading with TP/SL and threshold.")
     ap.add_argument("--data-dir", type=str, default="eth_1m_data", help="Dir or single CSV")
-    ap.add_argument("--model-dir", type=str, default=".", help="Where model_meta.json & model.pt live")
+    ap.add_argument("--model-dir", type=str, default="model", help="Where model_meta.json & model.pt live")
     ap.add_argument("--capital", type=float, default=10_000.0)
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--tp-pct", type=float, default=None)
@@ -57,11 +57,18 @@ def main():
         raise SystemExit(f"Could not find a price column. Available: {list(df.columns)}")
 
     # Features
-    drop_cols = {price_col, "timestamp", "time"}
-    feat_cols = [c for c in feature_cols if c in df.columns and c not in drop_cols]
-    if not feat_cols:
-        raise SystemExit("No valid feature columns found for inference.")
-    X_flat = df[feat_cols].to_numpy(dtype=np.float32)
+    print("[INFO] Computing features...")
+    df = compute_features(df)
+    print(f"[INFO] Features computed. Total columns: {len(df.columns)}")
+
+    # Ensure all required feature columns from training are present
+    missing_cols = [c for c in feature_cols if c not in df.columns]
+    if missing_cols:
+        raise SystemExit(f"Data is missing required features after computation: {missing_cols}")
+
+    # Create feature matrix in the same order as training
+    X_flat = df[feature_cols].to_numpy(dtype=np.float32)
+    print(f"[INFO] Feature matrix created with shape: {X_flat.shape}")
 
     # Windows
     X = build_windows(X_flat, window_size)
@@ -172,3 +179,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

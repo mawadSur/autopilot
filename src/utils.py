@@ -200,33 +200,27 @@ ATR_ALPHA = 1 / 14
 RSI_ALPHA = 1 / 14
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute the full training feature set used by train_model.py.
-
-    Requires columns: open, high, low, close. Adds approximately 17 features:
-    body, range, upper_wick, lower_wick, return, sma_ratio, ema_20, macd,
-    rsi_14, vol_change, atr, price_vs_hourly_trend, bb_width, plus the base OHLC.
-    """
-    for c in ["open", "high", "low", "close"]:
-        if c not in df.columns:
-            raise ValueError(f"Missing required column '{c}'")
+    """Compute the full training feature set used by train_model.py."""
+    required = ["open", "high", "low", "close"]
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column '{col}'")
     df = df.copy()
 
     # Candlestick geometry
     df["body"] = df["close"] - df["open"]
-    rng = (df["high"] - df["low"])
+    rng = df["high"] - df["low"]
     df["range"] = rng.replace(0, 1e-12)
-    df["upper_wick"] = (df["high"] - df[["close", "open"]].max(axis=1))
-    df["lower_wick"] = (df[["close", "open"]].min(axis=1) - df["low"])
+    df["upper_wick"] = df["high"] - df[["close", "open"]].max(axis=1)
+    df["lower_wick"] = df[["close", "open"]].min(axis=1) - df["low"]
     df["return"] = df["close"].pct_change().fillna(0.0)
 
-    # SMA ratio (20)
+    # SMA ratio and EMA
     sma = df["close"].rolling(ROLL_WINDOW).mean()
     df["sma_ratio"] = (df["close"] / (sma + 1e-12)).fillna(1.0)
-
-    # EMA(20)
     df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
 
-    # RSI(14) with EMA smoothing
+    # RSI(14)
     delta = df["close"].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
@@ -235,56 +229,56 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     rs = roll_up / (roll_down + 1e-12)
     df["rsi_14"] = (100 - (100 / (1 + rs))).fillna(50.0)
 
-    # Volume percent change
+    # Volume change
     if "volume" in df.columns:
         df["vol_change"] = df["volume"].pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
     else:
         df["vol_change"] = 0.0
 
-    # ATR(14) (EMA of True Range)
+    # ATR(14)
     tr = pd.concat([
-        (df["high"] - df["low"]),
+        df["high"] - df["low"],
         (df["high"] - df["close"].shift()).abs(),
         (df["low"] - df["close"].shift()).abs(),
     ], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=ATR_ALPHA, adjust=False).mean().fillna(tr.mean())
 
-    # MACD(12,26) - signal(9)
+    # MACD
     ema_12 = df["close"].ewm(span=12, adjust=False).mean()
     ema_26 = df["close"].ewm(span=26, adjust=False).mean()
     macd = ema_12 - ema_26
     signal = macd.ewm(span=9, adjust=False).mean()
     df["macd"] = (macd - signal).fillna(0.0)
 
-    # Hourly trend ratio (assuming 1m bars → span 60)
+    # Hourly trend ratio
     hourly = df["close"].ewm(span=60, adjust=False).mean()
     df["price_vs_hourly_trend"] = (df["close"] / (hourly + 1e-12)).fillna(1.0)
 
-    # Bollinger Band width (20, 2σ)
+    # Bollinger band width
     std_20 = df["close"].rolling(ROLL_WINDOW).std()
     upper = sma + 2 * std_20
     lower = sma - 2 * std_20
     df["bb_width"] = ((upper - lower) / (sma + 1e-12)).fillna(0.0)
 
-    # Extra volatility features
+    # Rolling volatility ratios
     for w in (20, 50, 100):
         roll_std = df["close"].rolling(w).std()
         roll_mean = df["close"].rolling(w).mean()
         df[f"vol_{w}"] = (roll_std / (roll_mean + 1e-12)).fillna(0.0)
+
+    # Ensure usable volume series
+    if "volume" not in df.columns:
+        df["volume"] = 1.0
+    vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
 
     # Garman-Klass volatility (20)
     high_low_ratio = (df["high"] / (df["low"] + 1e-12)).clip(lower=1e-12)
     close_open_ratio = (df["close"] / (df["open"] + 1e-12)).clip(lower=1e-12)
     log_hl = np.log(high_low_ratio)
     log_co = np.log(close_open_ratio)
-    gk_var = (0.5 * log_hl.pow(2)) - ((2 * np.log(2) - 1) * log_co.pow(2))
+    gk_var = 0.5 * log_hl.pow(2) - (2 * np.log(2) - 1) * log_co.pow(2)
     gk_roll = gk_var.clip(lower=0.0).rolling(ROLL_WINDOW, min_periods=1).mean()
     df["gk_vol_20"] = np.sqrt(gk_roll.clip(lower=0.0)).fillna(0.0)
-
-    # Ensure 'volume' exists for VWAP/OBV
-    if "volume" not in df.columns:
-        df["volume"] = 1.0
-    vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
 
     # Chaikin Money Flow (20)
     high_low_range = (df["high"] - df["low"]).replace(0, np.nan)
@@ -297,12 +291,8 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     # Rate of change for volume (14)
     df["rocv_14"] = vol.pct_change(periods=14).replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-    # VWAP ratio; prefer daily by timestamp; fallback to 1440-roll
-    ts_col = None
-    for cand in ("timestamp", "time", "date"):
-        if cand in df.columns:
-            ts_col = cand
-            break
+    # VWAP ratio
+    ts_col = next((c for c in ("timestamp", "time", "date") if c in df.columns), None)
     vwap = None
     if ts_col is not None:
         try:
@@ -315,9 +305,8 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             vwap = None
     if vwap is None:
-        win = 1440
-        pv_roll = (df["close"] * vol).rolling(win, min_periods=1).sum()
-        v_roll = vol.rolling(win, min_periods=1).sum()
+        pv_roll = (df["close"] * vol).rolling(1440, min_periods=1).sum()
+        v_roll = vol.rolling(1440, min_periods=1).sum()
         vwap = pv_roll / (v_roll + 1e-12)
     df["vwap_ratio"] = (df["close"] / (vwap + 1e-12)).fillna(1.0)
 
@@ -337,7 +326,6 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
             df.rename(columns={"ADX_14_14": "adx"}, inplace=True)
         df["adx"] = pd.to_numeric(df.get("adx", 25.0), errors="coerce").fillna(25.0)
     except Exception:
-        # Print once to avoid log spam in streaming contexts
         global _ADX_WARN_PRINTED
         try:
             _ADX_WARN_PRINTED
@@ -349,6 +337,7 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
         df["adx"] = 25.0
 
     return df
+
 
 
 # ---------------------------

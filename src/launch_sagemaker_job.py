@@ -93,10 +93,10 @@ def build_parser():
     p.add_argument("--train-s3-uri", default=os.getenv("TRAIN_S3_URI"), required=False)
 
     # Trainer flags (SUPPORTED ONLY; optimistic defaults)
-    p.add_argument("--window-size", type=int, default=192)
+    p.add_argument("--window-size", type=int, default=240)
     p.add_argument("--hidden-size", type=int, default=512)
     p.add_argument("--num-layers", type=int, default=3)
-    p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument("--dropout", type=float, default=0.25)
     p.add_argument("--bidirectional", type=bool, default=True)
     p.add_argument("--disable-scaling", type=bool, default=False)
     p.add_argument("--epochs", type=int, default=40)
