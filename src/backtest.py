@@ -415,30 +415,29 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--mode", choices=["simple", "portfolio"], default="portfolio")
     p.add_argument("--data-dir", type=str, default="eth_1m_data", help="Dir or a single CSV")
     p.add_argument("--model-dir", type=str, default="model", help="Root where model_meta.json & model.pt live")
-    p.add_argument("--threshold", type=float, default=None, help="Buy threshold (default from model_meta.json)")
-    p.add_argument("--tp-pct", type=float, default=None, help="Take-profit as fraction (0.005 = 0.5%)")
-    p.add_argument("--sl-pct", type=float, default=None, help="Stop-loss as fraction (0.0025 = 0.25%)")
-    p.add_argument("--fee-pct", type=float, default=None, help="Per-side fee fraction (0.0008 = 0.08%)")
     p.add_argument("--capital", type=float, default=10_000.0, help="Starting capital for portfolio mode")
     p.add_argument("--batch-size", type=int, default=512, help="Prediction batch size (auto-shrinks if OOM)")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Force device (default auto)")
-    p.add_argument("--thr-long", type=float, default=0.75, help="Min probability for long signal")
-    p.add_argument("--thr-short", type=float, default=0.75, help="Min probability for short signal")
-    p.add_argument("--margin", type=float, default=0.25, help="Required margin vs next best class")
-    p.add_argument("--consensus", type=int, default=2, help="Require N consecutive identical non-hold signals")
-    p.add_argument("--cooldown", type=int, default=3, help="Bars to wait after an exit before re-entering")
-    p.add_argument("--force-regress", action="store_true", help="Force regression mode (predict future price)")
-    p.add_argument("--up-thr", type=float, default=0.03, help="Predicted return threshold for long (e.g., 0.03 = +3%)")
-    p.add_argument("--down-thr", type=float, default=0.00, help="Absolute predicted return threshold for short (e.g., 0.00 = any negative)")
-    p.add_argument("--horizon-mins", type=int, default=3, help="Prediction horizon in minutes for regression models")
-    p.add_argument("--use-atr-stops", action="store_true", default=True, help="Use ATR multipliers for TP/SL instead of fixed percents")
-    p.add_argument("--atr-tp-mult", type=float, default=1.8, help="ATR multiplier for take-profit")
-    p.add_argument("--atr-sl-mult", type=float, default=1.0, help="ATR multiplier for stop-loss")
     p.add_argument("--last-csvs", type=int, default=None, help="If data-dir is a directory, only use the most recent N CSV files")
-    p.add_argument("--days-back", type=int, default=None, help="Limit to the most recent N days (requires a timestamp column; else approximates by rows)")
-    p.add_argument("--slippage-pct", type=float, default=0.0, help="Per-side slippage fraction applied to entry and exit prices")
-    p.add_argument("--use-regime-filter", action="store_true", default=True, help="Only take longs if ema_50>=ema_200 and shorts if ema_50<=ema_200")
-    p.add_argument("--min-atr-pct", type=float, default=0.001, help="Require atr/close >= this fraction or hold (e.g., 0.001 for 0.1%)")
+    p.add_argument("--days-back", type=int, default=None, help="Limit to the most recent N days")
+    p.add_argument("--thr-long", type=float, default=0.75, help="Min probability for a long signal (high confidence)")
+    p.add_argument("--thr-short", type=float, default=0.75, help="Min probability for a short signal (high confidence)")
+    p.add_argument("--margin", type=float, default=0.25, help="Required margin vs next best class (ensures a clear signal)")
+    p.add_argument("--consensus", type=int, default=2, help="Require N consecutive identical signals (filters noise)")
+    p.add_argument("--cooldown", type=int, default=3, help="Bars to wait after an exit before re-entering")
+    p.add_argument("--use-atr-stops", action="store_true", default=True, help="Use ATR multipliers for TP/SL (dynamic stops)")
+    p.add_argument("--atr-tp-mult", type=float, default=1.8, help="ATR multiplier for take-profit (aim for larger wins)")
+    p.add_argument("--atr-sl-mult", type=float, default=1.0, help="ATR multiplier for stop-loss (tighter risk control)")
+    p.add_argument("--slippage-pct", type=float, default=0.0002, help="Per-side slippage fraction for realism (0.02%)")
+    p.add_argument("--fee-pct", type=float, default=None, help="Per-side fee fraction (default from meta)")
+    p.add_argument("--use-regime-filter", action="store_true", default=True, help="Only trade in direction of the long-term trend (EMA 50/200)")
+    p.add_argument("--min-atr-pct", type=float, default=0.001, help="Require min volatility (ATR > 0.1% of price) to trade")
+    p.add_argument("--force-regress", action="store_true", help="Force regression mode (predict future price)")
+    p.add_argument("--up-thr", type=float, default=0.002, help="Predicted return threshold for long (+0.2%)")
+    p.add_argument("--down-thr", type=float, default=0.002, help="Predicted return threshold for short (-0.2%)")
+    p.add_argument("--threshold", type=float, default=None, help="Legacy threshold (unused)")
+    p.add_argument("--tp-pct", type=float, default=None, help="Legacy TP (unused if ATR stops are on)")
+    p.add_argument("--sl-pct", type=float, default=None, help="Legacy SL (unused if ATR stops are on)")
     return p
 
 # =========================
@@ -621,6 +620,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
 
 
 

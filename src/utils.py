@@ -114,6 +114,32 @@ def _apply_default_headers(df: pd.DataFrame) -> pd.DataFrame:
         df.columns = DEFAULT_COLS_7
     else:
         df.columns = [f"col{i}" for i in range(n)]
+    # === NEW: Multi-Timeframe Feature Engineering ===
+    if "timestamp" in df.columns:
+        try:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+            df.set_index("timestamp", inplace=True)
+
+            ema_15m = df["close"].resample("15T").last().ewm(span=12, adjust=False).mean()
+            rsi_15m = df["close"].resample("15T").last().diff().ewm(alpha=1/14, adjust=False).mean()
+            ema_1h = df["close"].resample("1H").last().ewm(span=12, adjust=False).mean()
+            rsi_1h = df["close"].resample("1H").last().diff().ewm(alpha=1/14, adjust=False).mean()
+
+            df["ema_15m"] = ema_15m
+            df["rsi_15m"] = rsi_15m
+            df["ema_1h"] = ema_1h
+            df["rsi_1h"] = rsi_1h
+
+            df.fillna(method="ffill", inplace=True)
+            df.reset_index(inplace=True)
+
+            df["price_vs_ema15m"] = (df["close"] / (df["ema_15m"] + 1e-12)).fillna(1.0)
+            df["price_vs_ema1h"] = (df["close"] / (df["ema_1h"] + 1e-12)).fillna(1.0)
+        except Exception as e:
+            print(f"[WARN] Failed to compute multi-timeframe features: {e}")
+            if isinstance(df.index, pd.DatetimeIndex):
+                df.reset_index(inplace=True)
+
     return df
 
 

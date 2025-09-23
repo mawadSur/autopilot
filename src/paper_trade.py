@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from utils import (
     read_csv_concat_sorted, resolve_price_col, build_windows,
-    load_model_bundle, fmt_money
+    load_model_bundle, fmt_money, compute_features
 )
 
 def main():
