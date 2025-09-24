@@ -34,7 +34,9 @@ def main():
     ap.add_argument("--data-dir", type=str, default="eth_1m_data", help="Dir or single CSV")
     ap.add_argument("--model-dir", type=str, default="model", help="Where model_meta.json & model.pt live")
     ap.add_argument("--capital", type=float, default=10_000.0)
-    ap.add_argument("--threshold", type=float, default=None)
+    ap.add_argument("--threshold", type=float, default=None, help="Buy prob threshold (classification)")
+    ap.add_argument("--up-thr", type=float, default=0.002,
+                    help="Predicted return threshold for long entries in regression mode (+0.2%)")
     ap.add_argument("--tp-pct", type=float, default=None)
     ap.add_argument("--sl-pct", type=float, default=None)
     ap.add_argument("--fee-pct", type=float, default=None)
@@ -45,7 +47,8 @@ def main():
     model, scaler, meta = load_model_bundle(args.model_dir)
     feature_cols = list(meta["feature_cols"])  # strict: must exist
     window_size = int(meta.get("window_size", 150))
-    buy_threshold = float(meta.get("buy_threshold", 0.60)) if args.threshold is None else float(args.threshold)
+    # Prefer CLI override, otherwise meta, otherwise use a high-confidence fallback
+    buy_threshold = float(meta.get("buy_threshold", 0.75)) if args.threshold is None else float(args.threshold)
     fee_pct = float(meta.get("tx_cost", 0.0008)) if args.fee_pct is None else float(args.fee_pct)
     tp_pct = float(meta.get("tp_pct", 0.005)) if args.tp_pct is None else float(args.tp_pct)
     sl_pct = float(meta.get("sl_pct", 0.0025)) if args.sl_pct is None else float(args.sl_pct)
@@ -87,17 +90,33 @@ def main():
         n, t, f = X.shape
         X = scaler.transform(X.reshape(n*t, f)).reshape(n, t, f)
 
-    # Predict probabilities (class 1)
+    # Predict signals (classification prob or regression return)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
-    probs = np.zeros(len(X), dtype=np.float32)
+    num_classes = int(meta.get("num_classes", 3))
+    task = str(meta.get("task", "classification")).lower()
+    scores = np.zeros(len(X), dtype=np.float32)
+    long_flags = np.zeros(len(X), dtype=bool)
+    up_threshold = float(args.up_thr)
     with torch.no_grad():
         BS = int(args.batch_size)
-        for i in range(0, len(X), BS):
-            xb = torch.from_numpy(X[i:i+BS]).to(device)
+        for start in range(0, len(X), BS):
+            end = min(start + BS, len(X))
+            xb = torch.from_numpy(X[start:end]).to(device)
             logits = model(xb)
-            p = F.softmax(logits, dim=-1)[:, 1].cpu().numpy()
-            probs[i:i+BS] = p
+
+            if num_classes == 1 or task == "regression":
+                preds = logits.squeeze(-1).detach().cpu().numpy()
+                close_slice = closes[start:end]
+                returns = (preds / np.maximum(1e-12, close_slice)) - 1.0
+                scores[start:end] = returns.astype(np.float32, copy=False)
+                long_flags[start:end] = returns >= up_threshold
+            else:
+                probs_batch = F.softmax(logits, dim=-1).detach().cpu().numpy()
+                long_idx = 2 if probs_batch.shape[1] >= 3 else 1
+                long_probs = probs_batch[:, long_idx]
+                scores[start:end] = long_probs.astype(np.float32, copy=False)
+                long_flags[start:end] = long_probs >= buy_threshold
 
     # Paper trading loop (same logic as backtester)
     cash = float(args.capital)
@@ -113,14 +132,18 @@ def main():
         t = times.iloc[i] if hasattr(times, "iloc") else times[i]
 
         if not in_trade:
-            if probs[i-1] >= buy_threshold:
+            if long_flags[i-1]:
                 entry_price = o
                 tp_price = entry_price * (1.0 + tp_pct)
                 sl_price = entry_price * (1.0 - sl_pct)
                 cash *= (1.0 - fee_pct)  # entry fee
                 in_trade = True
                 trades.append({
-                    "time": t, "side": "BUY", "price": entry_price, "prob": float(probs[i-1])
+                    "time": t,
+                    "side": "BUY",
+                    "price": entry_price,
+                    "signal": float(scores[i-1]),
+                    "mode": task,
                 })
         else:
             exit_px = None
@@ -159,7 +182,15 @@ def main():
     print("\n=== PAPER TRADE BLOTTER ===")
     for tr in trades:
         if tr["side"] == "BUY":
-            print(f"{tr['time']}  BUY  @ {fmt_money(tr['price'])}  (prob={tr['prob']:.3f})")
+            sig = tr.get("signal")
+            mode = tr.get("mode", task)
+            if sig is None:
+                sig_txt = "n/a"
+            elif mode == "regression" or num_classes == 1:
+                sig_txt = f"{sig*100:.2f}%"
+            else:
+                sig_txt = f"{sig:.3f}"
+            print(f"{tr['time']}  BUY  @ {fmt_money(tr['price'])}  (signal={sig_txt})")
         else:
             res = tr.get("result", "")
             print(f"{tr['time']}  SELL @ {fmt_money(tr['price'])}  {res}")

@@ -721,7 +721,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--window-size", type=int, default=192)
     p.add_argument("--hidden-size", type=int, default=512)
     p.add_argument("--num-layers", type=int, default=3)
-    p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument("--bidirectional", type=str2bool, default=True)
     p.add_argument("--model-type", choices=["lstm_classifier", "lstm_attention", "transformer"], default="transformer")
 
@@ -738,15 +738,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chunksize", type=int, default=500_000)
     p.add_argument("--price-col", type=str, default="close")
     # Triple barrier params (classification)
-    p.add_argument("--tp-pct", type=float, default=0.01, help="Take-profit percent e.g., 0.01 for 1%")
-    p.add_argument("--sl-pct", type=float, default=0.005, help="Stop-loss percent e.g., 0.005 for 0.5%")
-    p.add_argument("--time-limit", type=int, default=30, help="Number of bars to look ahead")
+    p.add_argument("--tp-pct", type=float, default=0.007, help="Take-profit percent e.g., 0.7%")
+    p.add_argument("--sl-pct", type=float, default=0.003, help="Stop-loss percent e.g., 0.3%")
+    p.add_argument("--time-limit", type=int, default=15, help="Bars ahead to evaluate outcome")
     # Task toggle & regression horizon
-    p.add_argument("--task", choices=["classification","regression"], default="regression")
+    p.add_argument("--task", choices=["classification","regression"], default="classification")
     p.add_argument("--horizon", type=int, default=3, help="Bars ahead to predict for regression (3=3 minutes)")
     # Loss / calibration
     p.add_argument("--use-class-weights", type=str2bool, default=True)
-    p.add_argument("--use-focal-loss", type=str2bool, default=False)
+    p.add_argument("--use-focal-loss", type=str2bool, default=True)
     p.add_argument("--focal-gamma", type=float, default=2.0)
     p.add_argument("--calibrate-temp", type=str2bool, default=True)
     return p

@@ -41,7 +41,7 @@
   "hidden_size": 512,
   "num_layers": 3,
   "dropout": 0.25,
-  "bidirectional": true,
+  "bidirectional": false,
   "model_state_path": "model.pt",
   "last_model_state_path": "model_last.pt",
   "scaler_path": "scaler.joblib",

@@ -108,7 +108,7 @@ def build_parser():
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--price-col", default="close")
     p.add_argument("--model-type", default="transformer")
-    p.add_argument("--task", choices=["classification", "regression"], default="regression")
+    p.add_argument("--task", choices=["classification", "regression"], default="classification")
 
     # Deployment controls (defaults from .env)
     p.add_argument("--deploy", action="store_true", default=True)

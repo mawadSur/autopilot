@@ -498,7 +498,7 @@ class SignalGenerator:
     where signal = 1 when confidence >= threshold else 0.
     """
 
-    def __init__(self, endpoint_name: str, window_size: int = 150):
+    def __init__(self, endpoint_name: str, window_size: int = 192):
         if not endpoint_name:
             raise ValueError("endpoint_name is required")
         self.endpoint_name = endpoint_name
@@ -515,7 +515,7 @@ class SignalGenerator:
         self._feature_cols: Optional[List[str]] = None
 
         # Confidence threshold fallback (endpoint may return its own)
-        self.threshold = float(os.getenv("BUY_THRESHOLD", "0.60"))
+        self.threshold = float(os.getenv("BUY_THRESHOLD", "0.75"))
 
     def _ensure_feature_cols(self, engineered_df: pd.DataFrame) -> List[str]:
         """Pick an ordered feature list aligned with training.
