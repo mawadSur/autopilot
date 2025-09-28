@@ -60,7 +60,7 @@ def get_device():
 # Feature Names (superset)
 # ----------------------------
 ALL_FEATURES = [
-    "open", "high", "low", "close",
+    "close",
     "body", "range", "upper_wick", "lower_wick",
     "return",
     "sma_ratio",
@@ -72,12 +72,11 @@ ALL_FEATURES = [
     "price_vs_hourly_trend",
     "bb_width",
     # Added features
-    "vol_20", "vol_50", "vol_100",
     "vwap_ratio",
     "obv",
-    "roc_14",
     # New
     "adx",
+    "hall_ma",
 ]
 
 
@@ -120,6 +119,11 @@ def _list_csvs(path: str) -> List[Path]:
     p = Path(path)
     if p.is_dir():
         files = sorted(p.glob("*.csv"))
+        # to work on specific range. 
+        # files = sorted(
+        #     f for f in p.glob("*.csv")
+        #     if "ethusdt_1m_" in f.name and "2023-09" <= f.stem.split("_")[-1] <= "2024-12"
+        # )
         if not files:
             raise FileNotFoundError(f"No CSVs found in directory: {path}")
         return files
@@ -511,13 +515,15 @@ def train(cfg: TrainConfig):
 
         for epoch in range(1, cfg.epochs + 1):
             model.train()
-            optimizer.zero_grad(set_to_none=True)
+            # optimizer.zero_grad(set_to_none=True)
             running = 0.0
             step = 0
 
             for xb, yb in train_loader:
                 xb = xb.to(device, non_blocking=True)
                 yb = yb.to(device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
                     logits = model(xb)
                     if getattr(cfg, 'task', 'classification') == 'regression':
@@ -538,7 +544,7 @@ def train(cfg: TrainConfig):
                     else:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    
 
                 running += loss.item()
                 step += 1

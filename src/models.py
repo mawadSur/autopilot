@@ -432,7 +432,7 @@ def load_meta(meta_path: str) -> ModelMeta:
 
 
 def load_model_state(model: nn.Module, state_path: str, strict: bool = False) -> None:
-    state = torch.load(state_path, map_location="cpu")
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
     # Allow non-strict to tolerate minor key mismatches or buffer names
     model.load_state_dict(state, strict=strict)
 

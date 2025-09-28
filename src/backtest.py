@@ -507,7 +507,6 @@ def main():
     df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["ema_200"] = df["close"].ewm(span=200, adjust=False).mean()
     print(f"[features] Done. Columns: {len(df.columns)}; Rows: {len(df):,}")
-
     # Build feature matrix in the SAME order as meta (do NOT drop 'close')
     drop_cols = {"timestamp", "time"}  # only drop non-features
     feat_cols = [c for c in feature_cols if c in df.columns and c not in drop_cols]
@@ -534,7 +533,7 @@ def main():
     atr_arr = df["atr"].to_numpy(dtype=float)[window_size - 1:] if "atr" in df.columns else None
     ema50 = df["ema_50"].to_numpy(dtype=float)[window_size - 1:]
     ema200 = df["ema_200"].to_numpy(dtype=float)[window_size - 1:]
-
+    
     # Scale using same scaler (fit on all meta features)
     if scaler is not None:
         n, t, f = X.shape

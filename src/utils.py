@@ -23,6 +23,9 @@ import os
 from pathlib import Path
 from typing import Dict, Generator, List, Optional
 from collections import deque
+
+import matplotlib.pyplot as plt
+import seaborn as sns
  
 # Import robust model helpers (aliased to avoid clashing with utils.load_meta)
 try:
@@ -362,6 +365,42 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
             _ADX_WARN_PRINTED = True
         df["adx"] = 25.0
 
+    # # stochastic oscillators slow & fast
+    # def _sto(close, low, high, n,id): 
+    #     stok = ((close - low.rolling(n).min()) / (high.rolling(n).max() - low.rolling(n).min())) * 100
+    #     if(id is 0):
+    #         return stok
+    #     else:
+    #         return stok.rolling(3).mean()
+    
+    # df['%K10'] = _sto(df['close'], df['low'], df['high'],5,0)
+    # df['%K30'] = _sto(df['close'], df['low'], df['high'],10,0)
+    # df['%K200'] = _sto(df['close'], df['low'], df['high'], 20,0)
+    
+
+    def moving_average(a, n=3):
+        ret = np.cumsum(a.to_numpy())
+        ret[n:] = ret[n:] - ret[:-n]
+        return np.append(np.array([1]*n), ret[n - 1:] / n)[1:]
+
+    def calcHullMA_inference(series, N=16):
+        SMA1 = moving_average(series, N)
+        SMA2 = moving_average(series, int(N/2))
+        res = (2 * SMA2 - SMA1)
+        return np.mean(res[-int(np.sqrt(N)):])
+
+    # you can tweak the value of N according to your data but for now 16 is a standard value to be used.
+    df['hall_ma'] = df['close'] - calcHullMA_inference(df['close'], 16)
+    # understanding the multicollinearity effect. 
+    df_modified = df.drop("timestamp", axis=1)    
+    
+    corr_matrix = df_modified.corr(method='pearson')
+
+    plt.figure(figsize=(14, 10))
+    sns.heatmap(corr_matrix, annot=False, cmap="coolwarm", center=0)
+    plt.title("Feature Correlation Heatmap")
+    plt.show()
+    
     return df
 
 

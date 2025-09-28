@@ -6,6 +6,7 @@ pandas-ta
 pandas==2.1.0
 numpy==1.26.0
 matplotlib
+seaborn
 
 # AWS & API
 sagemaker
