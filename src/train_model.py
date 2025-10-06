@@ -461,13 +461,11 @@ def train(cfg: TrainConfig):
         def collate_batch(batch):
             xb, yb = zip(*batch)  # xb: [B,T,F]
             xb = torch.stack(list(xb), dim=0)
-            xb2 = xb.clone()
-            # xb2 += torch.randn_like(xb2) * 0.1  # slight noise
             if isinstance(yb[0], torch.Tensor):
                 yb = torch.stack(list(yb), dim=0)
             else:
                 yb = torch.tensor(yb)
-            return xb2, yb
+            return xb, yb
 
         if getattr(cfg, 'task', 'classification') == 'regression':
             train_ds = StreamWindowDatasetReg(
