@@ -51,7 +51,6 @@ except ModuleNotFoundError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "TA-Lib"])
     import talib as ta
 
-#import talib as ta
 # Optional scaler persistence
 try:
     import joblib
