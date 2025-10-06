@@ -129,8 +129,8 @@ def simulate_trades_with_tp_sl(opens, highs, lows, closes, classes, *, start_cap
                     tp_price = entry_price - atr_tp_mult * a  # target below
                     sl_price = entry_price + atr_sl_mult * a  # stop above
                 else:
-                    tp_price = entry_price * (1.0 - tp_pct)
-                    sl_price = entry_price * (1.0 + sl_pct)
+                    tp_price = entry_price * (1.0 - tp_pct) # target below
+                    sl_price = entry_price * (1.0 + sl_pct) # stop above
                 # Determine position size by risk percent or full equity
                 if dynamic_sizing:
                     dist = sl_price - entry_price
