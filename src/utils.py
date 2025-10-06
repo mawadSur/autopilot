@@ -280,38 +280,10 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df['Stoch_Oscillator'] = ta.STOCH(df['high'], df['low'], df['close'])[0]
 
     df['PSAR'] = ta.SAR(df['high'], df['low'], acceleration=0.02, maximum=0.2)
-    # More feature engineering...
-    timeframe_diff = df.index[-1] - df.index[-2]
-    timeframe = None
-
-    # Define timeframe based on time difference
-    if timeframe_diff == pd.Timedelta(minutes=1):
-        timeframe = '1m'
-    elif timeframe_diff == pd.Timedelta(minutes=3):
-        timeframe = '3m'
-    elif timeframe_diff == pd.Timedelta(minutes=5):
-        timeframe = '5m'
-    elif timeframe_diff == pd.Timedelta(minutes=15):
-        timeframe = '15m'
-    elif timeframe_diff == pd.Timedelta(minutes=30):
-        timeframe = '30m'
-    elif timeframe_diff == pd.Timedelta(minutes=45):
-        timeframe = '45m'
-    elif timeframe_diff == pd.Timedelta(hours=1):
-        timeframe = '1h'
-    elif timeframe_diff == pd.Timedelta(days=1):
-        timeframe = '1d'
-    elif timeframe_diff == pd.Timedelta(weeks=1):
-        timeframe = '1w'
-    else:
-        timeframe = 'Not sure'
-        
-    # print('timeframe is - ', timeframe)
 
     # Remove rows containing inf or nan values
     df.dropna(inplace=True)
     df.drop(columns=["timestamp"], inplace=True)
-    print(df.columns.to_list())
     
     
     return df
