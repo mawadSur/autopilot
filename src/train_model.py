@@ -22,10 +22,11 @@ from collections import deque
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.discriminant_analysis import StandardScaler
 import torch
 import torch.nn as nn
 from torch.utils.data import IterableDataset, DataLoader
-
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from utils import compute_features
 from models import (
     ModelMeta,
@@ -60,23 +61,30 @@ def get_device():
 # Feature Names (superset)
 # ----------------------------
 ALL_FEATURES = [
-    "close",
-    "body", "range", "upper_wick", "lower_wick",
-    "return",
-    "sma_ratio",
-    "ema_20",
-    "macd",
-    "rsi_14",
-    "vol_change",
-    "atr",
-    "price_vs_hourly_trend",
-    "bb_width",
-    # Added features
-    "vwap_ratio",
-    "obv",
-    # New
-    "adx",
-    "hall_ma",
+    'open', 'high', 'low', 'close', 'volume', 'ATR_6', 'EMA_6', 
+    'RSI_6', 'VWAP_6', 'ROC_6', 'KC_upper_6', 'KC_middle_6', 'Donchian_upper_6', 
+    'Donchian_lower_6', 'MACD_6', 'MACD_signal_6', 'BB_upper_6', 'BB_middle_6', 
+    'BB_lower_6', 'EWO_6', 'ATR_8', 'EMA_8', 'RSI_8', 'VWAP_8', 'ROC_8', 'KC_upper_8', 
+    'KC_middle_8', 'Donchian_upper_8', 'Donchian_lower_8', 'MACD_8', 'MACD_signal_8',
+    'BB_upper_8', 'BB_middle_8', 'BB_lower_8', 'EWO_8', 'ATR_10', 'EMA_10', 'RSI_10', 
+    'VWAP_10', 'ROC_10', 'KC_upper_10', 'KC_middle_10', 'Donchian_upper_10', 'Donchian_lower_10', 
+    'MACD_10', 'MACD_signal_10', 'BB_upper_10', 'BB_middle_10', 'BB_lower_10', 'EWO_10', 'ATR_12', 
+    'EMA_12', 'RSI_12', 'VWAP_12', 'ROC_12', 'KC_upper_12', 'KC_middle_12', 'Donchian_upper_12', 
+    'Donchian_lower_12', 'MACD_12', 'MACD_signal_12', 'BB_upper_12', 'BB_middle_12', 'BB_lower_12', 
+    'EWO_12', 'ATR_14', 'EMA_14', 'RSI_14', 'VWAP_14', 'ROC_14', 'KC_upper_14', 'KC_middle_14', 'Donchian_upper_14', 
+    'Donchian_lower_14', 'MACD_14', 'MACD_signal_14', 'BB_upper_14', 'BB_middle_14', 'BB_lower_14', 'EWO_14', 
+    'ATR_16', 'EMA_16', 'RSI_16', 'VWAP_16', 'ROC_16', 'KC_upper_16', 'KC_middle_16', 'Donchian_upper_16', 
+    'Donchian_lower_16', 'MACD_16', 'MACD_signal_16', 'BB_upper_16', 'BB_middle_16', 'BB_lower_16', 'EWO_16', 
+    'ATR_18', 'EMA_18', 'RSI_18', 'VWAP_18', 'ROC_18', 'KC_upper_18', 'KC_middle_18', 'Donchian_upper_18', 'Donchian_lower_18', 
+    'MACD_18', 'MACD_signal_18', 'BB_upper_18', 'BB_middle_18', 'BB_lower_18', 'EWO_18', 'ATR_22', 'EMA_22', 'RSI_22', 'VWAP_22', 
+    'ROC_22', 'KC_upper_22', 'KC_middle_22', 'Donchian_upper_22', 'Donchian_lower_22', 'MACD_22', 'MACD_signal_22', 'BB_upper_22', 
+    'BB_middle_22', 'BB_lower_22', 'EWO_22', 'ATR_26', 'EMA_26', 'RSI_26', 'VWAP_26', 'ROC_26', 'KC_upper_26', 'KC_middle_26', 
+    'Donchian_upper_26', 'Donchian_lower_26', 'MACD_26', 'MACD_signal_26', 'BB_upper_26', 'BB_middle_26', 'BB_lower_26', 'EWO_26', 
+    'ATR_33', 'EMA_33', 'RSI_33', 'VWAP_33', 'ROC_33', 'KC_upper_33', 'KC_middle_33', 'Donchian_upper_33', 'Donchian_lower_33', 'MACD_33', 
+    'MACD_signal_33', 'BB_upper_33', 'BB_middle_33', 'BB_lower_33', 'EWO_33', 'ATR_44', 'EMA_44', 'RSI_44', 'VWAP_44', 'ROC_44', 'KC_upper_44', 
+    'KC_middle_44', 'Donchian_upper_44', 'Donchian_lower_44', 'MACD_44', 'MACD_signal_44', 'BB_upper_44', 'BB_middle_44', 'BB_lower_44', 'EWO_44', 
+    'ATR_55', 'EMA_55', 'RSI_55', 'VWAP_55', 'ROC_55', 'KC_upper_55', 'KC_middle_55', 'Donchian_upper_55', 'Donchian_lower_55', 'MACD_55', 
+    'MACD_signal_55', 'BB_upper_55', 'BB_middle_55', 'BB_lower_55', 'EWO_55', 'return', 'Range', 'Volatility', 'OBV', 'ADL', 'Stoch_Oscillator', 'PSAR'
 ]
 
 
@@ -273,6 +281,7 @@ class StreamWindowDatasetReg(IterableDataset):
         horizon_bars: int = 3,
         chunksize: int = 500_000,
         overlap: int = 256,
+        scaler: Optional[StandardScaler] = None,
     ):
         super().__init__()
         self.files = files
@@ -282,6 +291,7 @@ class StreamWindowDatasetReg(IterableDataset):
         self.horizon = int(max(1, horizon_bars))
         self.chunksize = int(chunksize)
         self.overlap = max(int(overlap), self.window + self.horizon + 1)
+        self.scaler = scaler
 
     def __iter__(self):
         buf: Deque[np.ndarray] = deque(maxlen=self.window)
@@ -289,6 +299,7 @@ class StreamWindowDatasetReg(IterableDataset):
             feat_df = df[self.feature_cols].astype(np.float32, copy=False)
             feats = feat_df.to_numpy(dtype=np.float32, copy=False)
             prices = df[self.price_col].to_numpy(dtype=np.float32, copy=False)
+            feats = self.scaler.fit_transform(feats) if self.scaler else feats
             n = len(df)
             buf.clear()
             for i in range(n):
@@ -354,6 +365,43 @@ def _split_stream(files: List[Path], val_frac: float) -> Tuple[List[Path], List[
     k = max(1, int(round(len(files) * (1.0 - val_frac))))
     return files[:k], files[k:]
 
+def fit_scaler(train_files, feature_cols, chunksize=500_000, max_rows=2_000_000):
+    scaler = StandardScaler()
+    samples = []
+    total_rows = 0
+    valid_cols = feature_cols.copy()
+    for f in train_files:
+        for chunk in pd.read_csv(f, chunksize=chunksize):
+            chunk = _normalize_headers(chunk)
+            chunk = compute_features(chunk)
+            # Forward-fill NaNs for time-series data
+            chunk[feature_cols] = chunk[feature_cols].fillna(method='ffill').fillna(0)
+            # Check variances
+            variances = chunk[feature_cols].var()
+            valid_cols = [col for col in valid_cols if variances.get(col, 0) > 1e-3]  # Stricter threshold
+            if not valid_cols:
+                print(f"Warning: No valid features in chunk from {f}")
+                continue
+            sample = chunk[valid_cols].astype(np.float32, copy=False).to_numpy()
+            samples.append(sample)
+            total_rows += len(sample)
+            if total_rows >= max_rows:
+                break
+        if total_rows >= max_rows:
+            break
+    if not samples:
+        raise ValueError("No valid samples for scaler fitting")
+    all_samples = np.vstack(samples)[:max_rows]
+    scaler.fit(all_samples)
+    # Debug output
+    print(f"Total rows processed: {total_rows}")
+    print("Scaler means:", scaler.mean_)
+    print("Scaler stds:", scaler.scale_)
+    print("Valid features:", valid_cols)
+    print("Feature variances:", variances[valid_cols].to_dict() if variances is not None else {})
+
+    return scaler
+
 
 def train(cfg: TrainConfig):
     set_seed(cfg.seed)
@@ -406,23 +454,15 @@ def train(cfg: TrainConfig):
     last_fold_best_state = None
     last_fold_last_state = None
     last_fold_scaler = None
-
+    scaler = StandardScaler()
     temperature_final: float = 1.0
     for fold_idx, (train_files, val_files) in enumerate(folds, start=1):
-        # Fit scaler on training sample (small peek) for this fold
-        train_peek = next(_stream_rows(train_files, chunksize=min(cfg.chunksize, 200_000), overlap=cfg.window_size + 5))
-        scaler = StandardScaler()
-        sample = train_peek[feature_cols].astype(np.float32, copy=False).to_numpy()[:200_000]
-        scaler.fit(sample)
 
         def collate_batch(batch):
             xb, yb = zip(*batch)  # xb: [B,T,F]
             xb = torch.stack(list(xb), dim=0)
-            B, T, F = xb.shape
-            xflat = xb.reshape(B * T, F).numpy()
-            xflat = scaler.transform(xflat).astype(np.float32, copy=False)
-            xb2 = torch.from_numpy(xflat).view(B, T, F)
-            # yb may be float (regression) or long (classification)
+            xb2 = xb.clone()
+            # xb2 += torch.randn_like(xb2) * 0.1  # slight noise
             if isinstance(yb[0], torch.Tensor):
                 yb = torch.stack(list(yb), dim=0)
             else:
@@ -433,10 +473,12 @@ def train(cfg: TrainConfig):
             train_ds = StreamWindowDatasetReg(
                 train_files, feature_cols, cfg.price_col, cfg.window_size,
                 horizon_bars=getattr(cfg, 'horizon', 3), chunksize=cfg.chunksize,
+                scaler=scaler
             )
             val_ds = StreamWindowDatasetReg(
                 val_files, feature_cols, cfg.price_col, cfg.window_size,
                 horizon_bars=getattr(cfg, 'horizon', 3), chunksize=cfg.chunksize,
+                scaler=scaler
             )
         else:
             train_ds = StreamWindowDataset(
@@ -473,11 +515,11 @@ def train(cfg: TrainConfig):
         else:
             model_meta_dict.pop("num_heads", None)
         model = build_model_from_meta(model_meta_dict).to(device)
-
         # Class weights (classification only)
         class_weights = None
         if getattr(cfg, 'task', 'classification') != 'regression' and cfg.use_class_weights:
             # We use config flag later when choosing criterion
+            train_peek = next(_stream_rows(train_files, chunksize=min(cfg.chunksize, 200_000), overlap=cfg.window_size + 5))
             labels_peek = apply_triple_barrier_labels(train_peek, cfg.price_col, cfg.tp_pct, cfg.sl_pct, cfg.time_limit)
             labels_peek = (labels_peek + 1).clip(0, 2)
             counts = np.bincount(labels_peek.astype(np.int64), minlength=3).astype(np.float32)
@@ -506,30 +548,33 @@ def train(cfg: TrainConfig):
             else:
                 criterion = nn.CrossEntropyLoss(weight=class_weights)
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         scaler_obj = torch.amp.GradScaler(enabled=(cfg.amp and device.type == "cuda"))
 
         best_val = -1.0
         best_state = None
         best_mae = float("inf")
         best_directional = 0.0
+        early_stop_counter = 0
+        early_stop_patience = 15
 
         for epoch in range(1, cfg.epochs + 1):
             model.train()
-            # optimizer.zero_grad(set_to_none=True)
             running = 0.0
             step = 0
 
             for xb, yb in train_loader:
                 xb = xb.to(device, non_blocking=True)
                 yb = yb.to(device, non_blocking=True)
-
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, enabled=cfg.amp and device.type in ("cuda", "mps")):
                     logits = model(xb)
+            
                     if getattr(cfg, 'task', 'classification') == 'regression':
+                        # logits = logits.squeeze(-1) * 0.01  # scale down regression targets
                         logits = logits.squeeze(-1)
+             
                     loss = criterion(logits, yb)
-
                 if scaler_obj.is_enabled():
                     scaler_obj.scale(loss / cfg.accumulate).backward()
                 else:
@@ -566,13 +611,23 @@ def train(cfg: TrainConfig):
                         total += yb.numel()
                 val_mae = abs_err_sum / max(1, total)
                 directional_acc = directional_matches / max(1, total)
+                
+                # Scheduler step
+                scheduler.step(val_mae)
+            
                 score = -val_mae
                 if score > best_val or best_state is None:
                     best_val = score
                     best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
                     best_mae = val_mae
                     best_directional = directional_acc
-                print(f"Fold {fold_idx}/{len(folds)} Epoch {epoch}/{cfg.epochs} - train_loss={running/max(1, step):.4f} val_mae={val_mae:.6f} dir_acc={directional_acc:.4f}")
+                else:
+                    early_stop_counter += 1
+                    if early_stop_counter >= early_stop_patience:
+                        print(f"Early stopping at epoch {epoch}")
+                        break
+
+                print(f"Fold {fold_idx}/{len(folds)} Epoch {epoch}/{cfg.epochs} - train_loss={running/max(1, step):.4f} train_loss_ = {running:.4f} val_mae={val_mae:.6f} dir_acc={directional_acc:.4f}")
             else:
                 correct = total = 0
                 with torch.no_grad():
@@ -724,18 +779,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--meta-path", type=str, default="model/model_meta.json")
 
     # Model / data (these are fallback defaults; meta can override)
-    p.add_argument("--window-size", type=int, default=192)
-    p.add_argument("--hidden-size", type=int, default=512)
-    p.add_argument("--num-layers", type=int, default=3)
+    p.add_argument("--window-size", type=int, default=240)
+    p.add_argument("--hidden-size", type=int, default=128) # was 512
+    p.add_argument("--num-layers", type=int, default=2) # was 3
     p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument("--bidirectional", type=str2bool, default=True)
-    p.add_argument("--model-type", choices=["lstm_classifier", "lstm_attention", "transformer"], default="transformer")
+    p.add_argument("--model-type", choices=["lstm_classifier", "lstm_attention", "lstm_regressor", "transformer"], default="lstm_regressor")
 
     # Training
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--learning-rate", type=float, default=1e-3)
-    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--batch-size", type=int, default=32) # was 256
+    p.add_argument("--learning-rate", type=float, default=1e-4) # was 1e-3
+    p.add_argument("--weight-decay", type=float, default=1e-6)
     p.add_argument("--val-frac", type=float, default=0.15)
     p.add_argument("--accumulate", type=int, default=2)
     p.add_argument("--seed", type=int, default=1337)
@@ -744,11 +799,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chunksize", type=int, default=500_000)
     p.add_argument("--price-col", type=str, default="close")
     # Triple barrier params (classification)
-    p.add_argument("--tp-pct", type=float, default=0.007, help="Take-profit percent e.g., 0.7%")
-    p.add_argument("--sl-pct", type=float, default=0.003, help="Stop-loss percent e.g., 0.3%")
-    p.add_argument("--time-limit", type=int, default=15, help="Bars ahead to evaluate outcome")
+    p.add_argument("--tp-pct", type=float, default=0.01, help="Take-profit percent e.g., 0.7%")
+    p.add_argument("--sl-pct", type=float, default=0.005, help="Stop-loss percent e.g., 0.3%")
+    p.add_argument("--time-limit", type=int, default=30, help="Bars ahead to evaluate outcome")
     # Task toggle & regression horizon
-    p.add_argument("--task", choices=["classification","regression"], default="classification")
+    p.add_argument("--task", choices=["classification","regression"], default="regression")
     p.add_argument("--horizon", type=int, default=3, help="Bars ahead to predict for regression (3=3 minutes)")
     # Loss / calibration
     p.add_argument("--use-class-weights", type=str2bool, default=True)
@@ -799,7 +854,6 @@ def main():
         calibrate_temp=args.calibrate_temp,
     )
     train(cfg)
-
 
 if __name__ == "__main__":
     main()
