@@ -438,7 +438,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Backtester with TP/SL and probability threshold.")
     p.add_argument("--mode", choices=["simple", "portfolio"], default="portfolio")
     p.add_argument("--data-dir", type=str, default="eth_1m_data", help="Dir or a single CSV")
-    p.add_argument("--model-dir", type=str, default="model", help="Root where model_meta.json & model.pt live")
+    p.add_argument("--model-dir", type=str, default="model_1", help="Root where model_meta.json & model.pt live")
     p.add_argument("--capital", type=float, default=10_000.0, help="Starting capital for portfolio mode")
     p.add_argument("--batch-size", type=int, default=512, help="Prediction batch size (auto-shrinks if OOM)")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Force device (default auto)")
@@ -582,6 +582,10 @@ def main():
     if is_regression:
         ret = predict_regression(model, X, int(args.batch_size), device, progress=True)
         print("[predict] Done (regression).")
+        # you can do this to convert prediction back to price if needed:
+        # future_price = closes * (1.0 + ret)
+        # but we only need the returns for thresholding
+        
         up_thr = float(args.up_thr)
         down_thr = float(args.down_thr)
         signals = np.ones(len(ret), dtype=np.int64)
