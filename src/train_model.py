@@ -571,7 +571,6 @@ def train(cfg: TrainConfig):
                     logits = model(xb)
             
                     if getattr(cfg, 'task', 'classification') == 'regression':
-                        # logits = logits.squeeze(-1) * 0.01  # scale down regression targets
                         logits = logits.squeeze(-1)
              
                     loss = criterion(logits, yb)
@@ -780,16 +779,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Model / data (these are fallback defaults; meta can override)
     p.add_argument("--window-size", type=int, default=240)
-    p.add_argument("--hidden-size", type=int, default=128) # was 512
-    p.add_argument("--num-layers", type=int, default=2) # was 3
+    p.add_argument("--hidden-size", type=int, default=128) 
+    p.add_argument("--num-layers", type=int, default=2) 
     p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument("--bidirectional", type=str2bool, default=True)
     p.add_argument("--model-type", choices=["lstm_classifier", "lstm_attention", "lstm_regressor", "transformer"], default="lstm_regressor")
 
     # Training
     p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--batch-size", type=int, default=32) # was 256
-    p.add_argument("--learning-rate", type=float, default=1e-4) # was 1e-3
+    p.add_argument("--batch-size", type=int, default=32) 
+    p.add_argument("--learning-rate", type=float, default=1e-4) 
     p.add_argument("--weight-decay", type=float, default=1e-6)
     p.add_argument("--val-frac", type=float, default=0.15)
     p.add_argument("--accumulate", type=int, default=2)
