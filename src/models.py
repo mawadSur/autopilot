@@ -117,17 +117,29 @@ class TransformerClassifier(nn.Module):
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        
         self.norm = nn.LayerNorm(hidden_size)
-        self.head = nn.Linear(hidden_size, num_classes)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, 1)
+        )
+        #self.head = nn.Linear(hidden_size, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, F]
         x = self.input_proj(x)
         x = self.pos_encoder(x)
         x = self.encoder(x)
-        last_step = x[:, -1, :]
-        last_step = self.norm(last_step)
-        return self.head(last_step)
+        pooled = torch.mean(x, dim=1)  # [B, hidden_size]
+        pooled = self.norm(pooled)
+        return self.head(pooled)  # [B]
+
+        # last_step = x[:, -1, :]
+        # last_step = self.norm(last_step)
+        # return self.head(last_step)
 
 
 class Attention(nn.Module):
@@ -313,6 +325,100 @@ class LSTMClassifier(LSTMAttentionClassifier):
         )
 
 
+class LSTMAttentionRegressor(nn.Module):
+    """LSTM regressor with additive attention for time-series regression."""
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        dropout: float = 0.3,
+        bidirectional: bool = True,
+        num_classes: int = 1,  # Fixed to 1 for regression
+    ):
+        super().__init__()
+        self.save_hyperparameters = {
+            "input_size": input_size,
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout,
+            "bidirectional": bidirectional,
+            "num_classes": num_classes,
+        }
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
+            batch_first=True,
+        )
+        direction_factor = 2 if bidirectional else 1
+        embed_dim = hidden_size * direction_factor
+        self.attn = Attention(input_dim=embed_dim, attn_dim=hidden_size)
+        self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_size // 2, num_classes),
+        )
+        self._attn_weights: Optional[torch.Tensor] = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, F]
+        output, _ = self.lstm(x)  # [B, T, H*D]
+        context, weights = self.attn(output)  # [B, H*D], [B, T]
+        self._attn_weights = weights
+        output = self.head(context)  # [B, 1]
+        return output
+
+class LSTMRegressor(nn.Module):
+    """Simple LSTM regressor without attention for time-series regression."""
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        dropout: float = 0.3,
+        bidirectional: bool = True,
+        num_classes: int = 1,  # Fixed to 1 for regression
+    ):
+        super().__init__()
+        self.save_hyperparameters = {
+            "input_size": input_size,
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout,
+            "bidirectional": bidirectional,
+            "num_classes": num_classes,
+        }
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
+            batch_first=True,
+        )
+        direction_factor = 2 if bidirectional else 1
+        embed_dim = hidden_size * direction_factor
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Sequential(
+            nn.Linear(embed_dim, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_size // 2, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, F]
+        output, _ = self.lstm(x)  # [B, T, H*D]
+        pooled = torch.mean(output, dim=1)  # Mean pooling over timesteps [B, H*D]
+        pooled = self.norm(pooled)
+        output = self.head(pooled)  # [B, 1]
+        return output
+
 
 # ----------------------------
 # Metadata utilities
@@ -394,6 +500,16 @@ def build_model_from_meta(meta: Union[ModelMeta, Dict[str, Any]]) -> nn.Module:
             dropout=meta.dropout,
             num_classes=meta.num_classes,
         )
+    if model_type in {"lstm_regressor", "lstm_attention_regressor"}:
+        return LSTMAttentionRegressor(
+            input_size=meta.input_size,
+            hidden_size=meta.hidden_size,
+            num_layers=meta.num_layers,
+            dropout=meta.dropout,
+            bidirectional=meta.bidirectional,
+            num_classes=1,  # Fixed to 1 for regression
+        )
+    
     if model_type in {"lstm_attention", "lstm_attention_classifier"}:
         return LSTMAttentionClassifier(
             input_size=meta.input_size,
