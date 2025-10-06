@@ -63,12 +63,15 @@ def print_portfolio_report(report: Dict, currency: str = "$") -> None:
 # Trade simulation
 # =========================
 def simulate_trades_with_tp_sl(opens, highs, lows, closes, classes, *, start_capital,
-                               fee_pct=0.0008, tp_pct=0.005, sl_pct=0.0025,
+                               fee_pct=0.0008, tp_pct=0.005, sl_pct=0.005,
                                atr: Optional[np.ndarray] = None,
                                atr_tp_mult: Optional[float] = None,
                                atr_sl_mult: Optional[float] = None,
                                cooldown: int = 0,
-                               slippage_pct: float = 0.0) -> Tuple[Dict, pd.DataFrame]:
+                               slippage_pct: float = 0.0,
+                               dynamic_sizing: bool = False,
+                               max_risk_per_trade: float = 0.02,
+                               leverage: float = 1.0) -> Tuple[Dict, pd.DataFrame]:
     """Simulate trades for a 3-class model: 0=short, 1=hold, 2=long.
 
     - Enters at next bar's open based on prior bar's signal.
@@ -97,8 +100,8 @@ def simulate_trades_with_tp_sl(opens, highs, lows, closes, classes, *, start_cap
             if cdn > 0:
                 cdn -= 1
             elif sig_prev == 2:  # long
-                cash *= (1.0 - fee_pct)
                 entry_price = o * (1.0 + slippage_pct)
+                # Determine TP and SL prices first
                 if atr is not None and atr_tp_mult is not None and atr_sl_mult is not None:
                     a = float(max(1e-12, atr[i-1]))
                     tp_price = entry_price + atr_tp_mult * a
@@ -106,18 +109,38 @@ def simulate_trades_with_tp_sl(opens, highs, lows, closes, classes, *, start_cap
                 else:
                     tp_price = entry_price * (1.0 + tp_pct)
                     sl_price = entry_price * (1.0 - sl_pct)
+                # Determine position size by risk percent or full equity
+                if dynamic_sizing:
+                    dist = entry_price - sl_price
+                    risk_amount = cash * max_risk_per_trade
+                    position_size = risk_amount / max(dist, 1e-9)
+                    fee_amount = fee_pct * position_size * leverage
+                    cash -= fee_amount
+                else:
+                    position_size = cash * leverage
+                    cash -= fee_pct * position_size
                 pos = +1
                 trades += 1
             elif cdn == 0 and sig_prev == 0:  # short
-                cash *= (1.0 - fee_pct)
                 entry_price = o * (1.0 - slippage_pct)
+                # Determine TP and SL prices first
                 if atr is not None and atr_tp_mult is not None and atr_sl_mult is not None:
                     a = float(max(1e-12, atr[i-1]))
                     tp_price = entry_price - atr_tp_mult * a  # target below
                     sl_price = entry_price + atr_sl_mult * a  # stop above
                 else:
-                    tp_price = entry_price * (1.0 - tp_pct)  # target below
-                    sl_price = entry_price * (1.0 + sl_pct)  # stop above
+                    tp_price = entry_price * (1.0 - tp_pct)
+                    sl_price = entry_price * (1.0 + sl_pct)
+                # Determine position size by risk percent or full equity
+                if dynamic_sizing:
+                    dist = sl_price - entry_price
+                    risk_amount = cash * max_risk_per_trade
+                    position_size = risk_amount / max(dist, 1e-9)
+                    fee_amount = fee_pct * position_size * leverage
+                    cash -= fee_amount
+                else:
+                    position_size = cash * leverage
+                    cash -= fee_pct * position_size
                 pos = -1
                 trades += 1
             equity_curve[i] = cash
@@ -152,14 +175,15 @@ def simulate_trades_with_tp_sl(opens, highs, lows, closes, classes, *, start_cap
                 win = (exit_price <= entry_price)
 
         if exit_price is not None:
+            # Calculate P&L on sized position
             if pos == +1:
                 exit_exec = exit_price * (1.0 - slippage_pct)
-                ret = (exit_exec / entry_price) - 1.0
-            else:  # short
+                pnl = (exit_exec / entry_price - 1.0) * position_size
+            else:
                 exit_exec = exit_price * (1.0 + slippage_pct)
-                ret = (entry_price / exit_exec) - 1.0
-            cash *= (1.0 + ret)
-            cash *= (1.0 - fee_pct)
+                pnl = (entry_price / exit_exec - 1.0) * position_size
+            # deduct exit fee on leveraged position
+            cash += leverage * pnl - fee_pct * position_size * leverage
             pos = 0
             entry_price = tp_price = sl_price = None
             wins += int(bool(win))
@@ -178,14 +202,14 @@ def simulate_trades_with_tp_sl(opens, highs, lows, closes, classes, *, start_cap
     # Close any open position at last close
     if pos != 0 and entry_price is not None:
         c = float(closes[-1])
+        # Close final position similarly with leverage
         if pos == +1:
             exit_exec = c * (1.0 - slippage_pct)
-            ret = (exit_exec / entry_price) - 1.0
+            pnl = (exit_exec / entry_price - 1.0) * position_size
         else:
             exit_exec = c * (1.0 + slippage_pct)
-            ret = (entry_price / exit_exec) - 1.0
-        cash *= (1.0 + ret)
-        cash *= (1.0 - fee_pct)
+            pnl = (entry_price / exit_exec - 1.0) * position_size
+        cash += leverage * pnl - fee_pct * position_size * leverage
 
     peaks = np.maximum.accumulate(equity_curve)
     dd = (equity_curve - peaks) / peaks
@@ -420,24 +444,27 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Force device (default auto)")
     p.add_argument("--last-csvs", type=int, default=None, help="If data-dir is a directory, only use the most recent N CSV files")
     p.add_argument("--days-back", type=int, default=None, help="Limit to the most recent N days")
-    p.add_argument("--thr-long", type=float, default=0.75, help="Min probability for a long signal (high confidence)")
-    p.add_argument("--thr-short", type=float, default=0.75, help="Min probability for a short signal (high confidence)")
-    p.add_argument("--margin", type=float, default=0.25, help="Required margin vs next best class (ensures a clear signal)")
-    p.add_argument("--consensus", type=int, default=2, help="Require N consecutive identical signals (filters noise)")
-    p.add_argument("--cooldown", type=int, default=1, help="Bars to wait after an exit before re-entering (faster)")
-    p.add_argument("--use-atr-stops", action="store_true", default=True, help="Use ATR multipliers for TP/SL (dynamic stops)")
-    p.add_argument("--atr-tp-mult", type=float, default=2.0, help="ATR multiplier for take-profit (larger wins)")
+    p.add_argument("--thr-long", type=float, default=0.85, help="Min probability for a long signal (high confidence)")
+    p.add_argument("--thr-short", type=float, default=0.85, help="Min probability for a short signal (high confidence)")
+    p.add_argument("--margin", type=float, default=0.4, help="Required margin vs next best class (ensures a clear signal)")
+    p.add_argument("--consensus", type=int, default=3, help="Require N consecutive identical signals (filters noise)")
+    p.add_argument("--cooldown", type=int, default=0, help="Bars to wait after an exit before re-entering (faster)")
+    p.add_argument("--use-atr-stops", action="store_true", default=False, help="Use ATR multipliers for TP/SL (disabled by default)")
+    p.add_argument("--atr-tp-mult", type=float, default=5.0, help="ATR multiplier for take-profit (larger wins)")
     p.add_argument("--atr-sl-mult", type=float, default=1.0, help="ATR multiplier for stop-loss (tight risk)")
     p.add_argument("--slippage-pct", type=float, default=0.0002, help="Per-side slippage fraction for realism (0.02%)")
-    p.add_argument("--fee-pct", type=float, default=None, help="Per-side fee fraction (default from meta)")
+    p.add_argument("--fee-pct", type=float, default=None, help="Per-side fee fraction (0.0 for no fees)")
+    p.add_argument("--leverage", type=float, default=2.0, help="Leverage multiplier for P&L (amplify returns)")
     p.add_argument("--use-regime-filter", action="store_true", default=True, help="Only trade in direction of the long-term trend (EMA 50/200)")
     p.add_argument("--min-atr-pct", type=float, default=0.001, help="Require min volatility (ATR > 0.1% of price) to trade")
     p.add_argument("--force-regress", action="store_true", help="Force regression mode (predict future price)")
     p.add_argument("--up-thr", type=float, default=0.002, help="Predicted return threshold for long (+0.2%)")
     p.add_argument("--down-thr", type=float, default=0.002, help="Predicted return threshold for short (-0.2%)")
     p.add_argument("--threshold", type=float, default=None, help="Legacy threshold (unused)")
-    p.add_argument("--tp-pct", type=float, default=None, help="Legacy TP (unused if ATR stops are on)")
-    p.add_argument("--sl-pct", type=float, default=None, help="Legacy SL (unused if ATR stops are on)")
+    p.add_argument("--tp-pct", type=float, default=0.002, help="Take-profit percentage (0.2%)")
+    p.add_argument("--sl-pct", type=float, default=0.01, help="Stop-loss percentage (1.0%)")
+    p.add_argument("--dynamic-sizing", action="store_true", default=True, help="Enable position sizing by risk percent")
+    p.add_argument("--max-risk-per-trade", type=float, default=0.02, help="Max percent of equity to risk per trade (e.g. 0.02)")
     return p
 
 # =========================
@@ -457,8 +484,8 @@ def main():
     window_size = int(meta.get("window_size", 150))
     buy_threshold = float(meta.get("buy_threshold", 0.60)) if args.threshold is None else float(args.threshold)
     fee_pct = float(meta.get("tx_cost", 0.0008)) if args.fee_pct is None else float(args.fee_pct)
-    tp_pct = 0.005 if args.tp_pct is None else float(args.tp_pct)
-    sl_pct = 0.0025 if args.sl_pct is None else float(args.sl_pct)
+    tp_pct = 0.0025 if args.tp_pct is None else float(args.tp_pct)
+    sl_pct = 0.005 if args.sl_pct is None else float(args.sl_pct)
     # Allow configurable class index for 'buy' via model_meta.json
     buy_class_index = (meta.get("class_map", {}) or {}).get("buy", 1)
 
@@ -507,6 +534,7 @@ def main():
     df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["ema_200"] = df["close"].ewm(span=200, adjust=False).mean()
     print(f"[features] Done. Columns: {len(df.columns)}; Rows: {len(df):,}")
+
     # Build feature matrix in the SAME order as meta (do NOT drop 'close')
     drop_cols = {"timestamp", "time"}  # only drop non-features
     feat_cols = [c for c in feature_cols if c in df.columns and c not in drop_cols]
@@ -533,7 +561,7 @@ def main():
     atr_arr = df["atr"].to_numpy(dtype=float)[window_size - 1:] if "atr" in df.columns else None
     ema50 = df["ema_50"].to_numpy(dtype=float)[window_size - 1:]
     ema200 = df["ema_200"].to_numpy(dtype=float)[window_size - 1:]
-    
+
     # Scale using same scaler (fit on all meta features)
     if scaler is not None:
         n, t, f = X.shape
@@ -552,9 +580,8 @@ def main():
     task = str(meta.get("task", "")).lower() if isinstance(meta, dict) else ""
     is_regression = bool(args.force_regress or task == "regression" or int(meta.get("num_classes", 3)) == 1)
     if is_regression:
-        preds = predict_regression(model, X, int(args.batch_size), device, progress=True)
+        ret = predict_regression(model, X, int(args.batch_size), device, progress=True)
         print("[predict] Done (regression).")
-        ret = (preds / np.maximum(1e-12, closes)) - 1.0
         up_thr = float(args.up_thr)
         down_thr = float(args.down_thr)
         signals = np.ones(len(ret), dtype=np.int64)
@@ -612,14 +639,16 @@ def main():
         atr_tp_mult=(float(args.atr_tp_mult) if use_atr else None),
         atr_sl_mult=(float(args.atr_sl_mult) if use_atr else None),
         cooldown=int(args.cooldown),
-        slippage_pct=float(args.slippage_pct),
+    slippage_pct=float(args.slippage_pct),
+    dynamic_sizing=bool(args.dynamic_sizing),
+    max_risk_per_trade=float(args.max_risk_per_trade),
+    leverage=float(args.leverage),
     )
     print("[simulate] Done.")
     print_portfolio_report(report, currency="$")
 
 if __name__ == "__main__":
     main()
-
 
 
 
