@@ -124,7 +124,7 @@ class TransformerClassifier(nn.Module):
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 1)
+            nn.Linear(hidden_size // 2, num_classes)
         )
         #self.head = nn.Linear(hidden_size, num_classes)
 
@@ -507,7 +507,7 @@ def build_model_from_meta(meta: Union[ModelMeta, Dict[str, Any]]) -> nn.Module:
             num_layers=meta.num_layers,
             dropout=meta.dropout,
             bidirectional=meta.bidirectional,
-            num_classes=1,  # Fixed to 1 for regression
+            num_classes=meta.num_classes,
         )
     
     if model_type in {"lstm_attention", "lstm_attention_classifier"}:
