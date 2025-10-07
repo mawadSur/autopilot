@@ -129,8 +129,8 @@ def simulate_trades_with_tp_sl(opens, highs, lows, closes, classes, *, start_cap
                     tp_price = entry_price - atr_tp_mult * a  # target below
                     sl_price = entry_price + atr_sl_mult * a  # stop above
                 else:
-                    tp_price = entry_price * (1.0 - tp_pct) # target below
-                    sl_price = entry_price * (1.0 + sl_pct) # stop above
+                    tp_price = entry_price * (1.0 - tp_pct)
+                    sl_price = entry_price * (1.0 + sl_pct)
                 # Determine position size by risk percent or full equity
                 if dynamic_sizing:
                     dist = sl_price - entry_price
@@ -434,6 +434,8 @@ def predict_regression(model: torch.nn.Module, X: np.ndarray, batch_size: int, d
                 continue
             raise
     return preds
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Backtester with TP/SL and probability threshold.")
     p.add_argument("--mode", choices=["simple", "portfolio"], default="portfolio")
@@ -444,10 +446,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Force device (default auto)")
     p.add_argument("--last-csvs", type=int, default=None, help="If data-dir is a directory, only use the most recent N CSV files")
     p.add_argument("--days-back", type=int, default=None, help="Limit to the most recent N days")
-    p.add_argument("--thr-long", type=float, default=0.85, help="Min probability for a long signal (high confidence)")
-    p.add_argument("--thr-short", type=float, default=0.85, help="Min probability for a short signal (high confidence)")
-    p.add_argument("--margin", type=float, default=0.4, help="Required margin vs next best class (ensures a clear signal)")
-    p.add_argument("--consensus", type=int, default=3, help="Require N consecutive identical signals (filters noise)")
+    p.add_argument("--thr-long", type=float, default=0.75, help="Min probability for a long signal (high confidence)")
+    p.add_argument("--thr-short", type=float, default=0.75, help="Min probability for a short signal (high confidence)")
+    p.add_argument("--margin", type=float, default=0.20, help="Required margin vs next best class (ensures a clear signal)")
+    p.add_argument("--consensus", type=int, default=1, help="Require N consecutive identical signals (filters noise)")
     p.add_argument("--cooldown", type=int, default=0, help="Bars to wait after an exit before re-entering (faster)")
     p.add_argument("--use-atr-stops", action="store_true", default=False, help="Use ATR multipliers for TP/SL (disabled by default)")
     p.add_argument("--atr-tp-mult", type=float, default=5.0, help="ATR multiplier for take-profit (larger wins)")
@@ -455,16 +457,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--slippage-pct", type=float, default=0.0002, help="Per-side slippage fraction for realism (0.02%)")
     p.add_argument("--fee-pct", type=float, default=None, help="Per-side fee fraction (0.0 for no fees)")
     p.add_argument("--leverage", type=float, default=2.0, help="Leverage multiplier for P&L (amplify returns)")
-    p.add_argument("--use-regime-filter", action="store_true", default=True, help="Only trade in direction of the long-term trend (EMA 50/200)")
+    p.add_argument("--use-regime-filter", action="store_true", default=False, help="Only trade in direction of the long-term trend (EMA 50/200)")
     p.add_argument("--min-atr-pct", type=float, default=0.001, help="Require min volatility (ATR > 0.1% of price) to trade")
     p.add_argument("--force-regress", action="store_true", help="Force regression mode (predict future price)")
     p.add_argument("--up-thr", type=float, default=0.002, help="Predicted return threshold for long (+0.2%)")
     p.add_argument("--down-thr", type=float, default=0.002, help="Predicted return threshold for short (-0.2%)")
     p.add_argument("--threshold", type=float, default=None, help="Legacy threshold (unused)")
     p.add_argument("--tp-pct", type=float, default=0.002, help="Take-profit percentage (0.2%)")
-    p.add_argument("--sl-pct", type=float, default=0.01, help="Stop-loss percentage (1.0%)")
+    p.add_argument("--sl-pct", type=float, default=0.005, help="Stop-loss percentage (0.5%)")
     p.add_argument("--dynamic-sizing", action="store_true", default=True, help="Enable position sizing by risk percent")
-    p.add_argument("--max-risk-per-trade", type=float, default=0.02, help="Max percent of equity to risk per trade (e.g. 0.02)")
+    p.add_argument("--max-risk-per-trade", type=float, default=0.01, help="Max percent of equity to risk per trade (e.g. 0.01)")
     return p
 
 # =========================
@@ -585,7 +587,7 @@ def main():
         # you can do this to convert prediction back to price if needed:
         # future_price = closes * (1.0 + ret)
         # but we only need the returns for thresholding
-
+        
         up_thr = float(args.up_thr)
         down_thr = float(args.down_thr)
         signals = np.ones(len(ret), dtype=np.int64)
@@ -653,9 +655,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
