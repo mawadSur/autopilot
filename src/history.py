@@ -131,7 +131,7 @@ def fetch_month(
                 interval=interval,
                 start_str=to_ms(start),
                 end_str=to_ms(end),
-                limit=1000,  # Binance ignores limit for historical wrapper; keep it anyway
+                # limit=1000,  # To Limit the number of results returned in a single call (max 1000
             )
             return normalize_klines(klines)
         except BinanceAPIException as e:
