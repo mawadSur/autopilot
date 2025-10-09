@@ -731,7 +731,14 @@ def main():
     if not feat_cols:
         raise SystemExit("No valid feature columns found in data for inference.")
     print(f"[INFO] Using {len(feat_cols)} features from meta: {feat_cols}")
-    X_flat = df[feat_cols].to_numpy(dtype=np.float32)
+    # X_flat = df[feat_cols].to_numpy(dtype=np.float32)
+
+    # To Tackle OOM Error on 16 GB RAM Machines, Use Vectorized Scaling
+    if scaler is not None:
+        print("[scale] Vectorized scaling ...")
+        X_flat = df[feat_cols].to_numpy(dtype=np.float32)
+        X_flat -= scaler.mean_.astype("float32")
+        X_flat /= scaler.scale_.astype("float32")
    
     # Windows
     print("[windows] Building windows ...")
@@ -749,11 +756,12 @@ def main():
     ema50 = df["ema_50"].to_numpy(dtype=float)[window_size - 1:]
     ema200 = df["ema_200"].to_numpy(dtype=float)[window_size - 1:]
 
-    # Scale using same scaler (fit on all meta features)
-    if scaler is not None:
-        n, t, f = X.shape
-        print("[scale] Applying scaler to features ...")
-        X = scaler.transform(X.reshape(n * t, f)).reshape(n, t, f)
+    # Scale using same scaler (fit on all meta features) 
+    # getting OOM Errors on 16 GB RAM Machine on large dataset using this logic
+    # if scaler is not None:
+    #     n, t, f = X.shape
+    #     print("[scale] Applying scaler to features ...")
+    #     X = scaler.transform(X.reshape(n * t, f)).reshape(n, t, f)
 
     # Choose device
     if args.device == "cpu":
