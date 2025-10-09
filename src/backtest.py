@@ -227,6 +227,190 @@ def simulate_trades_with_tp_sl(opens, highs, lows, closes, classes, *, start_cap
                              "equity": equity_curve, "class": classes})
     return report, df_curve
 
+def simulate_trades_with_tp_sl_more_aggressive(opens, highs, lows, closes, classes, *, start_capital,
+                               fee_pct=0.0008, tp_pct=0.005, sl_pct=0.005,
+                               atr: Optional[np.ndarray] = None,
+                               atr_tp_mult: Optional[float] = None,
+                               atr_sl_mult: Optional[float] = None,
+                               cooldown: int = 0,
+                               slippage_pct: float = 0.0,
+                               dynamic_sizing: bool = False,
+                               max_risk_per_trade: float = 0.02,
+                               leverage: float = 1.0,
+                               # Aggressive trailing stop and breakeven logic
+                               trail_stop_long: float = 0.0002, # 0.02% trailing stop for long
+                               trail_stop_short: float = 0.0002, # 0.02% trailing stop for short
+                               breakeven_trigger_long: float = 1.0005,
+                               breakeven_trigger_short: float = 0.9995) -> Tuple[Dict, pd.DataFrame]:
+    
+    """Simulate trades for a 3-class model: 0=short, 1=hold, 2=long.
+
+    - Enters at next bar's open based on prior bar's signal.
+    - One position at a time. Tracks TP/SL intrabar; opposing signals exit at open.
+    - Equity is fully deployed on each trade; fees charged on entry and exit.
+    """
+    n = len(closes)
+    cash = float(start_capital)
+    equity_curve = np.empty(n, dtype=float)
+    equity_curve[0] = cash
+
+    pos = 0  # 0=flat, +1=long, -1=short
+    entry_price = None
+    tp_price = None
+    sl_price = None
+    cdn = 0  # cooldown counter
+
+    trades = wins = losses = 0
+
+    for i in range(1, n):
+        o, hi, lo, c = float(opens[i]), float(highs[i]), float(lows[i]), float(closes[i])
+        sig_prev = int(classes[i - 1])
+
+        if pos == 0:
+            if cdn > 0:
+                cdn -= 1
+            elif sig_prev == 2:
+                entry_price = o * (1.0 + slippage_pct)
+                if atr is not None and atr_tp_mult is not None and atr_sl_mult is not None:
+                    a = float(max(1e-12, atr[i-1]))
+                    tp_price = entry_price + atr_tp_mult * a
+                    sl_price = entry_price - atr_sl_mult * a
+                else:
+                    tp_price = entry_price * (1.0 + tp_pct)
+                    sl_price = entry_price * (1.0 - sl_pct)
+                if dynamic_sizing:
+                    dist = entry_price - sl_price
+                    risk_amount = cash * max_risk_per_trade
+                    position_size = risk_amount / max(dist, 1e-9)
+                    fee_amount = fee_pct * position_size * leverage
+                    cash -= fee_amount
+                else:
+                    position_size = cash * leverage
+                    cash -= fee_pct * position_size
+                pos = +1
+                trades += 1
+                trail_price = entry_price
+            elif cdn == 0 and sig_prev == 0:
+                entry_price = o * (1.0 - slippage_pct)
+                if atr is not None and atr_tp_mult is not None and atr_sl_mult is not None:
+                    a = float(max(1e-12, atr[i-1]))
+                    tp_price = entry_price - atr_tp_mult * a
+                    sl_price = entry_price + atr_sl_mult * a
+                else:
+                    tp_price = entry_price * (1.0 - tp_pct)
+                    sl_price = entry_price * (1.0 + sl_pct)
+                if dynamic_sizing:
+                    dist = sl_price - entry_price
+                    risk_amount = cash * max_risk_per_trade
+                    position_size = risk_amount / max(dist, 1e-9)
+                    fee_amount = fee_pct * position_size * leverage
+                    cash -= fee_amount
+                else:
+                    position_size = cash * leverage
+                    cash -= fee_pct * position_size
+                pos = -1
+                trades += 1
+                trail_price = entry_price
+            equity_curve[i] = cash
+            continue
+
+        exit_price = None
+        win = None
+
+        if pos == +1:
+            # Aggressive trailing stop for long
+            if hi > trail_price:
+                trail_price = hi
+            # Exit if price drops more than 0.02% from high since entry
+            if c < trail_price * (1 - trail_stop_long):
+                exit_price = c
+                win = (exit_price > entry_price)
+            # Breakeven: exit if price falls back to entry after being up at least 0.05%
+            elif trail_price > entry_price * breakeven_trigger_long and c <= entry_price:
+                exit_price = c
+                win = (exit_price > entry_price)
+            elif lo <= sl_price <= hi:
+                exit_price = sl_price
+                win = False
+            elif hi >= tp_price:
+                exit_price = tp_price
+                win = True
+            elif sig_prev == 0:
+                exit_price = o
+                win = (exit_price >= entry_price)
+        else:
+            # Aggressive trailing stop for short
+            if lo < trail_price:
+                trail_price = lo
+            # Exit if price rises more than 0.02% from low since entry
+            if c > trail_price * (1 + trail_stop_short):
+                exit_price = c
+                win = (exit_price < entry_price)
+            # Breakeven: exit if price rises back to entry after being down at least 0.05%
+            elif trail_price < entry_price * breakeven_trigger_short and c >= entry_price:
+                exit_price = c
+                win = (exit_price < entry_price)
+            elif hi >= sl_price:
+                exit_price = sl_price
+                win = False
+            elif lo <= tp_price:
+                exit_price = tp_price
+                win = True
+            elif sig_prev == 2:
+                exit_price = o
+                win = (exit_price <= entry_price)
+
+        if exit_price is not None:
+            if pos == +1:
+                exit_exec = exit_price * (1.0 - slippage_pct)
+                pnl = (exit_exec / entry_price - 1.0) * position_size
+            else:
+                exit_exec = exit_price * (1.0 + slippage_pct)
+                pnl = (entry_price / exit_exec - 1.0) * position_size
+            cash += leverage * pnl - fee_pct * position_size * leverage
+            pos = 0
+            entry_price = tp_price = sl_price = None
+            wins += int(bool(win))
+            losses += int(not bool(win))
+            equity_curve[i] = cash
+            cdn = max(cooldown, 0)
+            continue
+
+        # Still in trade → mark-to-market equity
+        if pos == +1:
+            mtm = (c / entry_price) - 1.0
+        else:
+            mtm = (entry_price / c) - 1.0
+        equity_curve[i] = cash * (1.0 + mtm)
+
+    # Close any open position at last close
+    if pos != 0 and entry_price is not None:
+        c = float(closes[-1])
+        # Close final position similarly with leverage
+        if pos == +1:
+            exit_exec = c * (1.0 - slippage_pct)
+            pnl = (exit_exec / entry_price - 1.0) * position_size
+        else:
+            exit_exec = c * (1.0 + slippage_pct)
+            pnl = (entry_price / exit_exec - 1.0) * position_size
+        cash += leverage * pnl - fee_pct * position_size * leverage
+
+    peaks = np.maximum.accumulate(equity_curve)
+    dd = (equity_curve - peaks) / peaks
+    report = {
+        "metrics": {"n": int(n)},
+        "portfolio": {
+            "start_capital": float(start_capital),
+            "end_equity": float(equity_curve[-1]),
+            "return": float(equity_curve[-1] / max(1e-12, start_capital) - 1.0),
+            "max_drawdown": float(abs(np.min(dd)) if len(dd) else 0.0),
+            "trades": int(trades), "wins": int(wins), "losses": int(losses),
+        },
+    }
+    df_curve = pd.DataFrame({"open": opens, "high": highs, "low": lows, "close": closes,
+                             "equity": equity_curve, "class": classes})
+    return report, df_curve
+
 
 def apply_gating(probs: np.ndarray, *, thr_long: float, thr_short: float, margin: float, consensus: int) -> np.ndarray:
     """Map class probabilities [N,3] into discrete signals with thresholds and consensus.
@@ -439,12 +623,12 @@ def predict_regression(model: torch.nn.Module, X: np.ndarray, batch_size: int, d
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Backtester with TP/SL and probability threshold.")
     p.add_argument("--mode", choices=["simple", "portfolio"], default="portfolio")
-    p.add_argument("--data-dir", type=str, default="eth_1m_data", help="Dir or a single CSV")
+    p.add_argument("--data-dir", type=str, default="eth_1m_data_wholemonth", help="Dir or a single CSV")
     p.add_argument("--model-dir", type=str, default="model", help="Root where model_meta.json & model.pt live")
     p.add_argument("--capital", type=float, default=10_000.0, help="Starting capital for portfolio mode")
     p.add_argument("--batch-size", type=int, default=512, help="Prediction batch size (auto-shrinks if OOM)")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Force device (default auto)")
-    p.add_argument("--last-csvs", type=int, default=None, help="If data-dir is a directory, only use the most recent N CSV files")
+    p.add_argument("--last-csvs", type=int, default=1, help="If data-dir is a directory, only use the most recent N CSV files")
     p.add_argument("--days-back", type=int, default=None, help="Limit to the most recent N days")
     p.add_argument("--thr-long", type=float, default=0.75, help="Min probability for a long signal (high confidence)")
     p.add_argument("--thr-short", type=float, default=0.75, help="Min probability for a short signal (high confidence)")
@@ -467,10 +651,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--sl-pct", type=float, default=0.005, help="Stop-loss percentage (0.5%)")
     p.add_argument("--dynamic-sizing", action="store_true", default=True, help="Enable position sizing by risk percent")
     p.add_argument("--max-risk-per-trade", type=float, default=0.01, help="Max percent of equity to risk per trade (e.g. 0.01)")
+    # p.add_argument("--switch-less-aggressive", action="store_true", default=True, help="Switch to less aggressive TP/SL logic")
     return p
 
 # =========================
-# Main
+# Main-
 # =========================
 def main():
     args = build_argparser().parse_args()
@@ -547,7 +732,7 @@ def main():
         raise SystemExit("No valid feature columns found in data for inference.")
     print(f"[INFO] Using {len(feat_cols)} features from meta: {feat_cols}")
     X_flat = df[feat_cols].to_numpy(dtype=np.float32)
-
+   
     # Windows
     print("[windows] Building windows ...")
     X = build_windows(X_flat, window_size)
@@ -587,7 +772,7 @@ def main():
         # you can do this to convert prediction back to price if needed:
         # future_price = closes * (1.0 + ret)
         # but we only need the returns for thresholding
-        
+
         up_thr = float(args.up_thr)
         down_thr = float(args.down_thr)
         signals = np.ones(len(ret), dtype=np.int64)
@@ -635,21 +820,39 @@ def main():
     # Portfolio simulation with TP/SL
     print("[simulate] Running portfolio simulation ...")
     use_atr = bool(args.use_atr_stops and atr_arr is not None)
-    report, curve = simulate_trades_with_tp_sl(
-        opens, highs, lows, closes, signals,
-        start_capital=float(args.capital),
-        fee_pct=fee_pct,
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
-        atr=(atr_arr if use_atr else None),
-        atr_tp_mult=(float(args.atr_tp_mult) if use_atr else None),
-        atr_sl_mult=(float(args.atr_sl_mult) if use_atr else None),
-        cooldown=int(args.cooldown),
-    slippage_pct=float(args.slippage_pct),
-    dynamic_sizing=bool(args.dynamic_sizing),
-    max_risk_per_trade=float(args.max_risk_per_trade),
-    leverage=float(args.leverage),
-    )
+    if args.switch_less_aggressive:
+        report, curve = simulate_trades_with_tp_sl(
+            opens, highs, lows, closes, signals,
+            start_capital=float(args.capital),
+            fee_pct=fee_pct,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+            atr=(atr_arr if use_atr else None),
+            atr_tp_mult=(float(args.atr_tp_mult) if use_atr else None),
+            atr_sl_mult=(float(args.atr_sl_mult) if use_atr else None),
+            cooldown=int(args.cooldown),
+        slippage_pct=float(args.slippage_pct),
+        dynamic_sizing=bool(args.dynamic_sizing),
+        max_risk_per_trade=float(args.max_risk_per_trade),
+        leverage=float(args.leverage),
+        )
+    else:
+        report, curve = simulate_trades_with_tp_sl_more_aggressive(
+            opens, highs, lows, closes, signals,
+            start_capital=float(args.capital),
+            fee_pct=fee_pct,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+            atr=(atr_arr if use_atr else None),
+            atr_tp_mult=(float(args.atr_tp_mult) if use_atr else None),
+            atr_sl_mult=(float(args.atr_sl_mult) if use_atr else None),
+            cooldown=int(args.cooldown),
+        slippage_pct=float(args.slippage_pct),
+        dynamic_sizing=bool(args.dynamic_sizing),
+        max_risk_per_trade=float(args.max_risk_per_trade),
+        leverage=float(args.leverage),
+        )
+
     print("[simulate] Done.")
     print_portfolio_report(report, currency="$")
 
