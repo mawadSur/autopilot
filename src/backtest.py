@@ -651,7 +651,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--sl-pct", type=float, default=0.005, help="Stop-loss percentage (0.5%)")
     p.add_argument("--dynamic-sizing", action="store_true", default=True, help="Enable position sizing by risk percent")
     p.add_argument("--max-risk-per-trade", type=float, default=0.01, help="Max percent of equity to risk per trade (e.g. 0.01)")
-    # p.add_argument("--switch-less-aggressive", action="store_true", default=True, help="Switch to less aggressive TP/SL logic")
+    p.add_argument("--switch-less-aggressive", action="store_true", default=True, help="Switch to less aggressive TP/SL logic")
     return p
 
 # =========================
