@@ -243,43 +243,20 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             raise ValueError(f"Missing required column '{col}'")
     
-    time_periods = [6, 8, 10, 12, 14, 16, 18, 22, 26, 33, 44, 55]
-    name_periods = [6, 8, 10, 12, 14, 16, 18, 22, 26, 33, 44, 55]
-
-    new_columns = []
-    for period in time_periods:
-        for nperiod in name_periods:
-            df[f'ATR_{period}'] = ta.ATR(df['high'], df['low'], df['close'], timeperiod=period)
-            df[f'EMA_{period}'] = ta.EMA(df['close'], timeperiod=period)
-            df[f'RSI_{period}'] = ta.RSI(df['close'], timeperiod=period)
-            df[f'VWAP_{period}'] = ta.SUM(df['volume'] * (df['high'] + df['low'] + df['close']) / 3, timeperiod=period) / ta.SUM(df['volume'], timeperiod=period)
-            df[f'ROC_{period}'] = ta.ROC(df['close'], timeperiod=period)
-            df[f'KC_upper_{period}'] = ta.EMA(df['high'], timeperiod=period)
-            df[f'KC_middle_{period}'] = ta.EMA(df['low'], timeperiod=period)
-            df[f'Donchian_upper_{period}'] = ta.MAX(df['high'], timeperiod=period)
-            df[f'Donchian_lower_{period}'] = ta.MIN(df['low'], timeperiod=period)
-            macd, macd_signal, _ = ta.MACD(df['close'], fastperiod=(period + 12), slowperiod=(period + 26), signalperiod=(period + 9))
-            df[f'MACD_{period}'] = macd
-            df[f'MACD_signal_{period}'] = macd_signal
-            bb_upper, bb_middle, bb_lower = ta.BBANDS(df['close'], timeperiod=period, nbdevup=2, nbdevdn=2)
-            df[f'BB_upper_{period}'] = bb_upper
-            df[f'BB_middle_{period}'] = bb_middle
-            df[f'BB_lower_{period}'] = bb_lower
-            df[f'EWO_{period}'] = ta.SMA(df['close'], timeperiod=(period+5)) - ta.SMA(df['close'], timeperiod=(period+35))
-
+   
     df["return"] = df["close"].pct_change().fillna(1.0)
     df["Range"] = (df["high"] / df["low"]) - 1
-    df["Volatility"] = df['return'].rolling(window=ROLL_WINDOW).std()
+    # df["Volatility"] = df['return'].rolling(window=ROLL_WINDOW).std()
 
-    # Volume-Based Indicators
-    df['OBV'] = ta.OBV(df['close'], df['volume'])
-    df['ADL'] = ta.AD(df['high'], df['low'], df['close'], df['volume'])
+    # # Volume-Based Indicators
+    # df['OBV'] = ta.OBV(df['close'], df['volume'])
+    # df['ADL'] = ta.AD(df['high'], df['low'], df['close'], df['volume'])
 
 
-    # Momentum-Based Indicators
-    df['Stoch_Oscillator'] = ta.STOCH(df['high'], df['low'], df['close'])[0]
+    # # Momentum-Based Indicators
+    # df['Stoch_Oscillator'] = ta.STOCH(df['high'], df['low'], df['close'])[0]
 
-    df['PSAR'] = ta.SAR(df['high'], df['low'], acceleration=0.02, maximum=0.2)
+    # df['PSAR'] = ta.SAR(df['high'], df['low'], acceleration=0.02, maximum=0.2)
 
     # Remove rows containing inf or nan values
     df.dropna(inplace=True)
