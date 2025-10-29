@@ -619,13 +619,10 @@ def main():
     # add your huggingface token here. 
     login(token="your_huggingface_token_here")
     args = build_argparser().parse_args()
-
-    # Load model + meta (still used for feature list & scaler even if using LLM)
     model, scaler, meta = None, None, {}
-    # if "feature_cols" not in meta:
-    #     raise KeyError("Missing 'feature_cols' in model_meta.json; no fallback is allowed.")
+   
     feature_cols = FEATURES  # preserve order from meta
-    #window_size = int(meta.get("window_size", 150))
+    #fixed window size for LLM
     window_size = 60
     fee_pct = float(meta.get("tx_cost", 0.0008)) if args.fee_pct is None else float(args.fee_pct)
     tp_pct = 0.0025 if args.tp_pct is None else float(args.tp_pct)
