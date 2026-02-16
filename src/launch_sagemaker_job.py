@@ -6,7 +6,7 @@ then optionally deploy the trained model to a real-time endpoint.
 Enhancements:
 - Loads defaults from .env (via python-dotenv)
 - Ensures local training data directory is uploaded to S3 if not present
-- Uses absolute source_dir for entry point so "No file named aws_train_model.py" error is avoided
+- Uses absolute source_dir for entry point so "No file named train_model.py" error is avoided
 
 Note:
 - The training entrypoint (train_model.py) now reads model_meta.json if present in the
@@ -25,6 +25,7 @@ from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from sagemaker.pytorch import PyTorch, PyTorchModel
 from sagemaker.inputs import TrainingInput
+from utils import FEATURE_COLUMNS
 
 # Load environment variables from .env if present
 load_dotenv()
@@ -83,8 +84,8 @@ def build_parser():
     p.add_argument("--prefix", default=os.getenv("S3_PREFIX", "eth-1m"))
     p.add_argument("--instance-type", default=os.getenv("TRAIN_INSTANCE_TYPE", "ml.g5.2xlarge"))
     p.add_argument("--instance-count", type=int, default=int(os.getenv("TRAIN_INSTANCE_COUNT", 1)))
-    p.add_argument("--py-version", default=os.getenv("PY_VERSION", "py311"))
-    p.add_argument("--framework-version", default=os.getenv("FRAMEWORK_VERSION", "2.3"))
+    p.add_argument("--py-version", default=os.getenv("PY_VERSION", "py310"))
+    p.add_argument("--framework-version", default=os.getenv("FRAMEWORK_VERSION", "2.2.0"))
     p.add_argument("--image-uri", default=None, help="Optional custom image")
     p.add_argument("--job-name", default=None)
 
@@ -93,22 +94,34 @@ def build_parser():
     p.add_argument("--train-s3-uri", default=os.getenv("TRAIN_S3_URI"), required=False)
 
     # Trainer flags (SUPPORTED ONLY; optimistic defaults)
-    p.add_argument("--window-size", type=int, default=240)
-    p.add_argument("--hidden-size", type=int, default=512)
-    p.add_argument("--num-layers", type=int, default=3)
+    p.add_argument("--window-size", type=int, default=None,
+                   help="Single sequence length. If not set, train_model uses DEFAULT_SEQ_LENS.")
+    p.add_argument("--seq-lens", type=str, default=None,
+                   help="Comma/space-separated sequence lengths (e.g., '60,90,120').")
+    p.add_argument("--hidden-size", type=int, default=128)
+    p.add_argument("--num-layers", type=int, default=2)
     p.add_argument("--dropout", type=float, default=0.25)
     p.add_argument("--bidirectional", type=bool, default=True)
     p.add_argument("--disable-scaling", type=bool, default=False)
-    p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--learning-rate", type=float, default=1e-3)
-    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--learning-rate", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-6)
     p.add_argument("--val-frac", type=float, default=0.15)
     p.add_argument("--accumulate", type=int, default=2)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--price-col", default="close")
-    p.add_argument("--model-type", default="transformer")
+    p.add_argument("--model-type", default="lstm_regressor")
     p.add_argument("--task", choices=["classification", "regression"], default="classification")
+    p.add_argument("--time-limit", type=int, default=5)
+    p.add_argument("--fee-pct", type=float, default=0.0001)
+    p.add_argument("--slippage-pct", type=float, default=0.0001)
+    p.add_argument("--cost-mult", type=float, default=1.5)
+    p.add_argument("--k-tp", type=float, default=1.2)
+    p.add_argument("--k-sl", type=float, default=1.0)
+    p.add_argument("--atr-col", type=str, default="atr_14")
+    p.add_argument("--feature-cols", nargs="*", default=None,
+                   help="Optional explicit feature list; defaults to shared FEATURE_COLUMNS")
 
     # Deployment controls (defaults from .env)
     p.add_argument("--deploy", action="store_true", default=True)
@@ -127,11 +140,11 @@ def main():
         raise ValueError("Missing --bucket (or S3_BUCKET_NAME in .env)")
 
     script_dir = Path(__file__).resolve().parent
-    entry_point_path = script_dir / "aws_train_model.py"
+    entry_point_path = script_dir / "train_model.py"
     if not entry_point_path.exists():
         raise ValueError(
-            f'No file named "aws_train_model.py" was found in directory "{script_dir}". '
-            "Ensure aws_train_model.py is alongside launch_sagemaker_job.py."
+            f'No file named "train_model.py" was found in directory "{script_dir}". '
+            "Ensure train_model.py is alongside launch_sagemaker_job.py."
         )
 
     if args.train_s3_uri:
@@ -139,9 +152,11 @@ def main():
         print(f"\nUsing provided training S3 URI: {train_s3_uri}")
     else:
         s3 = boto3.client("s3", region_name=args.region)
-        local_dir = (Path(args.local_train_dir)
+        # Resolve data path relative to current working dir (not script_dir) so
+        # running from repo root finds ../eth_1m_data by default.
+        local_dir = (Path(args.local_train_dir).resolve()
                      if Path(args.local_train_dir).is_absolute()
-                     else (script_dir / args.local_train_dir).resolve())
+                     else (Path.cwd() / args.local_train_dir).resolve())
         train_s3_uri = ensure_data_in_s3(local_dir, s3, args.bucket, args.prefix)
 
     job_name = args.job_name or f"eth-lstm-opt-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
@@ -158,7 +173,6 @@ def main():
     print(f"Job Name:           {job_name}")
 
     hyperparameters = {
-        "window-size": args.window_size,
         "hidden-size": args.hidden_size,
         "num-layers": args.num_layers,
         "dropout": args.dropout,
@@ -173,7 +187,19 @@ def main():
         "price-col": args.price_col,
         "model-type": args.model_type,
         "task": args.task,
+        "time-limit": args.time_limit,
+        "fee-pct": args.fee_pct,
+        "slippage-pct": args.slippage_pct,
+        "cost-mult": args.cost_mult,
+        "k-tp": args.k_tp,
+        "k-sl": args.k_sl,
+        "atr-col": args.atr_col,
+        "feature-cols": " ".join(args.feature_cols) if args.feature_cols else " ".join(FEATURE_COLUMNS),
     }
+    if args.window_size is not None:
+        hyperparameters["window-size"] = args.window_size
+    if args.seq_lens:
+        hyperparameters["seq-lens"] = args.seq_lens
     if args.disable_scaling:
         hyperparameters["disable-scaling"] = True
 

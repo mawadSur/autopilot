@@ -42,7 +42,8 @@ def prefill(sig: SignalGenerator, client: Client) -> None:
 
 def latest(client: Client) -> Tuple[Dict[str, Any], int]:
     kl = client.get_klines(symbol=SYMBOL, interval=INTERVAL, limit=2)
-    last = to_row(kl[-1])
+    # Use last closed candle for features/signals
+    last = to_row(kl[-2])
     return last, last["date"]
 
 def place_market_quote_order(client: Client, side: str, symbol: str, quote_qty: float) -> Dict[str, Any]:

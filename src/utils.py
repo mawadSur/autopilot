@@ -4,7 +4,6 @@
 utils.py — shared helpers for data IO, feature/window building, model/meta loading, and formatting.
 
 Centralizes functionality used by:
-- aws_train_model.py
 - backtest.py
 - paper_trade.py
 - inference.py
@@ -233,36 +232,347 @@ def infer_feature_cols(sample_df: pd.DataFrame, feature_cols: Optional[List[str]
 # ---------------------------
 
 ROLL_WINDOW = 20
-ATR_ALPHA = 1 / 14
-RSI_ALPHA = 1 / 14
+
+# ---------------------------
+# Shared defaults / feature list
+# ---------------------------
+
+DEFAULT_SEQ_LENS = [60, 90, 120]
+DEFAULT_SEQ_LEN = 90
+
+FEATURE_COLUMNS = [
+    "open", "high", "low", "close", "volume",
+    "return_1", "return_5", "return_15",
+    "log_ret", "zret_20", "zret_60",
+    "range_pct", "body_to_range_ratio", "body_to_range", "abs_body_to_range",
+    "upper_wick_ratio", "lower_wick_ratio",
+    "ema_9", "ema_21", "ema_50", "ema_spread_9_21", "ema_spread_21_50",
+    "macd", "macd_signal", "macd_hist",
+    "atr_14", "atrp_14", "ret_std_30",
+    "bb_mid_20", "bb_upper_20", "bb_lower_20", "bb_width_20", "bb_pctb_20",
+    "vol_log", "vol_ma_20", "vol_z_20",
+    "price_pos_donchian20", "vwap_roll_50",
+    # Bucket 2 raw microstructure inputs (optional)
+    "best_bid", "best_ask", "bid_size_l1", "ask_size_l1",
+    "bid_depth_5", "ask_depth_5", "bid_depth_10", "ask_depth_10", "bid_depth_20", "ask_depth_20",
+    "vwap_bid_5", "vwap_ask_5", "vwap_bid_10", "vwap_ask_10", "vwap_bid_20", "vwap_ask_20",
+    "trade_count", "buy_count", "sell_count",
+    "taker_buy_volume_base", "taker_sell_volume_base",
+    "taker_buy_volume_quote", "taker_sell_volume_quote",
+    "volume_quote",
+    # Bucket 2 derived features
+    "mid", "spread_abs", "spread_pct", "microprice", "l1_imbalance", "mid_log_ret", "spread_z_60",
+    "l2_imbalance_5", "l2_imbalance_10", "l2_imbalance_20",
+    "depth_ratio_5", "depth_ratio_10", "depth_ratio_20", "book_pressure_5",
+    "total_taker_vol_base", "ofi_base", "ofi_ratio", "buy_sell_count_imb",
+    "avg_trade_size_base", "avg_trade_size_quote",
+    "ofi_over_depth_10", "spread_times_imbalance",
+    # Time-of-day features
+    "minute_of_day", "tod_sin", "tod_cos",
+    "day_of_week", "dow_sin", "dow_cos",
+    # Volatility regime
+    "rv_5", "rv_15", "rv_60", "rv_240", "vol_of_vol_60", "range_ma_20",
+    # Gap / micro-momentum
+    "open_to_prev_close", "close_to_prev_close", "hlc3", "close_pos_in_range",
+    # Stationary ratios / zscores
+    "close_over_ema_9", "close_over_ema_21", "close_over_ema_50", "close_over_vwap_50",
+    "price_z_60", "price_z_240",
+    # Multi-timeframe (5m/15m/60m)
+    "tf5_log_ret_1", "tf5_rv_20", "tf5_atrp_14", "tf5_ema_spread",
+    "tf15_log_ret_1", "tf15_rv_20", "tf15_atrp_14", "tf15_ema_spread",
+    "tf60_log_ret_1", "tf60_rv_20", "tf60_atrp_14", "tf60_ema_spread",
+]
+
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute the full training feature set used by train_model.py."""
-    required = ["open", "high", "low", "close"]
+    """Feature engineering using only OHLCV.
+
+    Outputs a compact, high-signal set that aligns with FEATURE_COLUMNS (single source of truth).
+    Keeps the original OHLCV columns; adds engineered columns; fills early NaNs.
+    """
+
+    required = ["open", "high", "low", "close", "volume"]
     for col in required:
         if col not in df.columns:
             raise ValueError(f"Missing required column '{col}'")
-    
-   
-    df["return"] = df["close"].pct_change().fillna(1.0)
-    df["Range"] = (df["high"] / df["low"]) - 1
-    # df["Volatility"] = df['return'].rolling(window=ROLL_WINDOW).std()
 
-    # # Volume-Based Indicators
-    # df['OBV'] = ta.OBV(df['close'], df['volume'])
-    # df['ADL'] = ta.AD(df['high'], df['low'], df['close'], df['volume'])
+    df = df.copy()
 
+    # ---------- Price / return ----------
+    df["return_1"] = df["close"].pct_change().fillna(0.0)
+    df["return_5"] = df["close"].pct_change(5).fillna(0.0)
+    df["return_15"] = df["close"].pct_change(15).fillna(0.0)
+    # Log return (more stationary); optionally clip to tame outliers
+    df["log_ret"] = np.log(df["close"]).diff().fillna(0.0)
+    # Uncomment to clip extreme moves (e.g., +/-5%)
+    # df["log_ret"] = df["log_ret"].clip(-0.05, 0.05)
 
-    # # Momentum-Based Indicators
-    # df['Stoch_Oscillator'] = ta.STOCH(df['high'], df['low'], df['close'])[0]
+    # Rolling z-scores of log returns (short- and mid-horizon)
+    def _zscore(series: pd.Series, window: int) -> pd.Series:
+        mean = series.rolling(window, min_periods=1).mean()
+        std = series.rolling(window, min_periods=1).std().replace(0, 1e-12)
+        return (series - mean) / std
 
-    # df['PSAR'] = ta.SAR(df['high'], df['low'], acceleration=0.02, maximum=0.2)
+    df["zret_20"] = _zscore(df["log_ret"], 20).fillna(0.0)
+    df["zret_60"] = _zscore(df["log_ret"], 60).fillna(0.0)
 
-    # Remove rows containing inf or nan values
-    df.dropna(inplace=True)
-    df.drop(columns=["timestamp"], inplace=True)
-    
-    
+    # Volatility regime (log-return based)
+    df["rv_5"] = df["log_ret"].rolling(5, min_periods=1).std().fillna(0.0)
+    df["rv_15"] = df["log_ret"].rolling(15, min_periods=1).std().fillna(0.0)
+    df["rv_60"] = df["log_ret"].rolling(60, min_periods=1).std().fillna(0.0)
+    df["rv_240"] = df["log_ret"].rolling(240, min_periods=1).std().fillna(0.0)
+    df["vol_of_vol_60"] = df["rv_15"].rolling(60, min_periods=1).std().fillna(0.0)
+
+    # ---------- Candle structure ----------
+    range_raw = (df["high"] - df["low"]).replace(0, 1e-12)
+    df["range_pct"] = (df["high"] - df["low"]) / df["close"].replace(0, 1e-12)
+    df["body_to_range_ratio"] = (df["close"] - df["open"]) / range_raw
+    # Normalized imbalance of the candle body; absolute version for magnitude
+    df["body_to_range"] = (df["close"] - df["open"]) / range_raw
+    df["abs_body_to_range"] = df["body_to_range"].abs()
+    df["upper_wick_ratio"] = (df["high"] - df[["open", "close"]].max(axis=1)) / range_raw
+    df["lower_wick_ratio"] = (df[["open", "close"]].min(axis=1) - df["low"]) / range_raw
+    df["range_ma_20"] = df["range_pct"].rolling(20, min_periods=1).mean().fillna(0.0)
+
+    # Gap / micro-momentum
+    prev_close = df["close"].shift(1)
+    df["open_to_prev_close"] = (df["open"] / prev_close.replace(0, 1e-12)) - 1.0
+    df["close_to_prev_close"] = (df["close"] / prev_close.replace(0, 1e-12)) - 1.0
+    df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3.0
+    df["close_pos_in_range"] = (df["close"] - df["low"]) / ((df["high"] - df["low"]) + 1e-12)
+
+    # ---------- Trend / momentum ----------
+    df["ema_9"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema_21"] = df["close"].ewm(span=21, adjust=False).mean()
+    df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
+    df["ema_spread_9_21"] = (df["ema_9"] - df["ema_21"]) / df["close"].replace(0, 1e-12)
+    df["ema_spread_21_50"] = (df["ema_21"] - df["ema_50"]) / df["close"].replace(0, 1e-12)
+    # Stationary ratios vs EMA
+    df["close_over_ema_9"] = (df["close"] / df["ema_9"].replace(0, 1e-12)) - 1.0
+    df["close_over_ema_21"] = (df["close"] / df["ema_21"].replace(0, 1e-12)) - 1.0
+    df["close_over_ema_50"] = (df["close"] / df["ema_50"].replace(0, 1e-12)) - 1.0
+
+    ema_fast = df["close"].ewm(span=12, adjust=False).mean()
+    ema_slow = df["close"].ewm(span=26, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+    df["macd"] = macd_line
+    df["macd_signal"] = macd_signal
+    df["macd_hist"] = macd_line - macd_signal
+
+    # ---------- Volatility ----------
+    true_range = (df["high"] - df["low"]).abs().combine(
+        (df["high"] - df["close"].shift(1)).abs(), max
+    ).combine(
+        (df["low"] - df["close"].shift(1)).abs(), max
+    )
+    df["atr_14"] = true_range.rolling(14, min_periods=1).mean()
+    df["atrp_14"] = df["atr_14"] / df["close"].replace(0, 1e-12)
+    df["ret_std_30"] = df["return_1"].rolling(30, min_periods=1).std().fillna(0.0)
+
+    # ---------- Bollinger / bands ----------
+    bb_mid = df["close"].rolling(20, min_periods=1).mean()
+    bb_std = df["close"].rolling(20, min_periods=1).std().fillna(0.0)
+    df["bb_mid_20"] = bb_mid
+    df["bb_upper_20"] = bb_mid + 2 * bb_std
+    df["bb_lower_20"] = bb_mid - 2 * bb_std
+    df["bb_width_20"] = (df["bb_upper_20"] - df["bb_lower_20"]) / bb_mid.replace(0, 1e-12)
+    df["bb_pctb_20"] = (df["close"] - df["bb_lower_20"]) / (
+        (df["bb_upper_20"] - df["bb_lower_20"]).replace(0, 1e-12)
+    )
+
+    # ---------- Volume ----------
+    df["vol_log"] = np.log1p(df["volume"])
+    vol_ma = df["volume"].rolling(20, min_periods=1).mean()
+    vol_std = df["volume"].rolling(20, min_periods=1).std().replace(0, 1e-12)
+    df["vol_ma_20"] = vol_ma
+    df["vol_z_20"] = (df["volume"] - vol_ma) / vol_std
+
+    # ---------- Positioning ----------
+    roll_max = df["close"].rolling(20, min_periods=1).max()
+    roll_min = df["close"].rolling(20, min_periods=1).min()
+    df["price_pos_donchian20"] = (df["close"] - roll_min) / (roll_max - roll_min + 1e-12)
+
+    # Rolling VWAP proxy over 50 bars
+    pv = (df["close"] * df["volume"]).rolling(50, min_periods=1).sum()
+    v = df["volume"].rolling(50, min_periods=1).sum().replace(0, 1e-12)
+    df["vwap_roll_50"] = pv / v
+    df["close_over_vwap_50"] = (df["close"] / df["vwap_roll_50"].replace(0, 1e-12)) - 1.0
+
+    # Price z-scores (log price)
+    log_close = np.log(df["close"].replace(0, 1e-12))
+    df["price_z_60"] = _zscore(log_close, 60).fillna(0.0)
+    df["price_z_240"] = _zscore(log_close, 240).fillna(0.0)
+
+    # Time-of-day features (UTC) if timestamp present
+    if "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+        if ts.notna().any():
+            minute_of_day = (ts.dt.hour * 60 + ts.dt.minute).astype("float64")
+            df["minute_of_day"] = minute_of_day
+            df["tod_sin"] = np.sin(2 * np.pi * minute_of_day / 1440.0)
+            df["tod_cos"] = np.cos(2 * np.pi * minute_of_day / 1440.0)
+            dow = ts.dt.dayofweek.astype("float64")
+            df["day_of_week"] = dow
+            df["dow_sin"] = np.sin(2 * np.pi * dow / 7.0)
+            df["dow_cos"] = np.cos(2 * np.pi * dow / 7.0)
+
+            # Multi-timeframe context without lookahead
+            df_mt = df.copy()
+            df_mt["_ts"] = ts
+            df_mt = df_mt.sort_values("_ts")
+
+            def _tf_features(rule: str, prefix: str) -> pd.DataFrame:
+                base = df_mt.set_index("_ts")[["open", "high", "low", "close"]]
+                tf = base.resample(rule, label="right", closed="right").agg({
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                }).dropna(subset=["close"])
+                tf_log_ret = np.log(tf["close"].replace(0, 1e-12)).diff()
+                tf_rv_20 = tf_log_ret.rolling(20, min_periods=1).std()
+                tr = (tf["high"] - tf["low"]).abs().combine(
+                    (tf["high"] - tf["close"].shift(1)).abs(), max
+                ).combine(
+                    (tf["low"] - tf["close"].shift(1)).abs(), max
+                )
+                tf_atr = tr.rolling(14, min_periods=1).mean()
+                tf_atrp = tf_atr / tf["close"].replace(0, 1e-12)
+                tf_ema9 = tf["close"].ewm(span=9, adjust=False).mean()
+                tf_ema21 = tf["close"].ewm(span=21, adjust=False).mean()
+                tf_ema_spread = (tf_ema9 - tf_ema21) / tf["close"].replace(0, 1e-12)
+
+                feat = pd.DataFrame({
+                    "tf_ts": tf.index,
+                    f"{prefix}_log_ret_1": tf_log_ret,
+                    f"{prefix}_rv_20": tf_rv_20,
+                    f"{prefix}_atrp_14": tf_atrp,
+                    f"{prefix}_ema_spread": tf_ema_spread,
+                })
+                # Shift by 1 TF bar to avoid lookahead
+                feat[[f"{prefix}_log_ret_1", f"{prefix}_rv_20", f"{prefix}_atrp_14", f"{prefix}_ema_spread"]] = (
+                    feat[[f"{prefix}_log_ret_1", f"{prefix}_rv_20", f"{prefix}_atrp_14", f"{prefix}_ema_spread"]].shift(1)
+                )
+                return feat.dropna(subset=["tf_ts"])
+
+            tf5 = _tf_features("5min", "tf5")
+            tf15 = _tf_features("15min", "tf15")
+            tf60 = _tf_features("60min", "tf60")
+
+            for tf_df in (tf5, tf15, tf60):
+                if tf_df.empty:
+                    continue
+                df_mt = pd.merge_asof(
+                    df_mt,
+                    tf_df.sort_values("tf_ts"),
+                    left_on="_ts",
+                    right_on="tf_ts",
+                    direction="backward",
+                )
+                if "tf_ts" in df_mt.columns:
+                    df_mt = df_mt.drop(columns=["tf_ts"])
+
+            # Restore to original order and copy merged tf columns back
+            df_mt = df_mt.sort_index()
+            for col in df_mt.columns:
+                if col.startswith("tf5_") or col.startswith("tf15_") or col.startswith("tf60_"):
+                    df[col] = df_mt[col]
+
+    # ---------- Bucket 2 microstructure (optional inputs) ----------
+    eps = 1e-12
+    bucket2_raw = [
+        "best_bid", "best_ask", "bid_size_l1", "ask_size_l1",
+        "bid_depth_5", "ask_depth_5", "bid_depth_10", "ask_depth_10", "bid_depth_20", "ask_depth_20",
+        "vwap_bid_5", "vwap_ask_5", "vwap_bid_10", "vwap_ask_10", "vwap_bid_20", "vwap_ask_20",
+        "trade_count", "buy_count", "sell_count",
+        "taker_buy_volume_base", "taker_sell_volume_base",
+        "taker_buy_volume_quote", "taker_sell_volume_quote",
+        "volume_quote",
+    ]
+    for c in bucket2_raw:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    # Fill sizes/volumes/counts with 0.0 when missing
+    size_like = [
+        "bid_size_l1", "ask_size_l1",
+        "bid_depth_5", "ask_depth_5", "bid_depth_10", "ask_depth_10", "bid_depth_20", "ask_depth_20",
+        "taker_buy_volume_base", "taker_sell_volume_base",
+        "taker_buy_volume_quote", "taker_sell_volume_quote",
+        "trade_count", "buy_count", "sell_count",
+        "volume_quote",
+    ]
+    for c in size_like:
+        if c in df.columns:
+            df[c] = df[c].fillna(0.0)
+
+    # Forward-fill price-like columns within the same day if timestamp exists
+    price_like = [
+        "best_bid", "best_ask",
+        "vwap_bid_5", "vwap_ask_5", "vwap_bid_10", "vwap_ask_10", "vwap_bid_20", "vwap_ask_20",
+    ]
+    if "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+        if ts.notna().any():
+            day = ts.dt.date
+            for c in price_like:
+                if c in df.columns:
+                    df[c] = df[c].groupby(day).ffill()
+
+    # Derived top-of-book features (if available)
+    if "best_bid" in df.columns and "best_ask" in df.columns:
+        df["mid"] = (df["best_bid"] + df["best_ask"]) / 2.0
+        df["spread_abs"] = df["best_ask"] - df["best_bid"]
+        df["spread_pct"] = df["spread_abs"] / (df["mid"] + eps)
+        if "bid_size_l1" in df.columns and "ask_size_l1" in df.columns:
+            denom = df["bid_size_l1"] + df["ask_size_l1"] + eps
+            df["microprice"] = (df["best_ask"] * df["bid_size_l1"] + df["best_bid"] * df["ask_size_l1"]) / denom
+            df["l1_imbalance"] = (df["bid_size_l1"] - df["ask_size_l1"]) / denom
+        df["mid_log_ret"] = np.log(df["mid"].replace(0, eps)).diff()
+        df["spread_z_60"] = _zscore(df["spread_pct"], 60)
+
+    # Derived L2 depth features (if available)
+    if "bid_depth_5" in df.columns and "ask_depth_5" in df.columns:
+        df["l2_imbalance_5"] = (df["bid_depth_5"] - df["ask_depth_5"]) / (df["bid_depth_5"] + df["ask_depth_5"] + eps)
+        df["depth_ratio_5"] = df["bid_depth_5"] / (df["ask_depth_5"] + eps)
+    if "bid_depth_10" in df.columns and "ask_depth_10" in df.columns:
+        df["l2_imbalance_10"] = (df["bid_depth_10"] - df["ask_depth_10"]) / (df["bid_depth_10"] + df["ask_depth_10"] + eps)
+        df["depth_ratio_10"] = df["bid_depth_10"] / (df["ask_depth_10"] + eps)
+    if "bid_depth_20" in df.columns and "ask_depth_20" in df.columns:
+        df["l2_imbalance_20"] = (df["bid_depth_20"] - df["ask_depth_20"]) / (df["bid_depth_20"] + df["ask_depth_20"] + eps)
+        df["depth_ratio_20"] = df["bid_depth_20"] / (df["ask_depth_20"] + eps)
+
+    if "microprice" in df.columns and "mid" in df.columns and "spread_abs" in df.columns:
+        df["book_pressure_5"] = (df["microprice"] - df["mid"]) / (df["spread_abs"] + eps)
+
+    # Derived trade-flow features (if available)
+    if "taker_buy_volume_base" in df.columns and "taker_sell_volume_base" in df.columns:
+        df["total_taker_vol_base"] = df["taker_buy_volume_base"] + df["taker_sell_volume_base"]
+        df["ofi_base"] = df["taker_buy_volume_base"] - df["taker_sell_volume_base"]
+        df["ofi_ratio"] = df["ofi_base"] / (df["total_taker_vol_base"] + eps)
+        if "trade_count" in df.columns:
+            df["buy_sell_count_imb"] = (df["buy_count"] - df["sell_count"]) / (df["trade_count"] + eps)
+            df["avg_trade_size_base"] = df["total_taker_vol_base"] / (df["trade_count"] + eps)
+            df["avg_trade_size_quote"] = (
+                (df["taker_buy_volume_quote"] + df["taker_sell_volume_quote"]) / (df["trade_count"] + eps)
+            )
+
+    # Cross features (book + trades)
+    if "ofi_base" in df.columns and "bid_depth_10" in df.columns and "ask_depth_10" in df.columns:
+        df["ofi_over_depth_10"] = df["ofi_base"] / (df["bid_depth_10"] + df["ask_depth_10"] + eps)
+    if "spread_pct" in df.columns and "l1_imbalance" in df.columns:
+        df["spread_times_imbalance"] = df["spread_pct"] * df["l1_imbalance"]
+
+    # Fill any remaining gaps created by rolling windows
+    df.bfill(inplace=True)
+    df.ffill(inplace=True)
+
+    # Ensure column order includes all FEATURE_COLUMNS (missing ones are filled later)
+    for col in FEATURE_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+
     return df
 
 
@@ -498,6 +808,7 @@ class SignalGenerator:
 
 __all__ = [
     # defaults
+    "DEFAULT_SEQ_LENS", "DEFAULT_SEQ_LEN", "FEATURE_COLUMNS",
     "PRICE_CANDIDATES",
     # env / device / seed
     "load_dotenv", "set_seed", "get_device_str",

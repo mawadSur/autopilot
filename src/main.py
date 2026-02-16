@@ -119,7 +119,7 @@ def create_app() -> FastAPI:
     # S3 / SageMaker utilities
     # ---------------------------
     class TrainAWSBody(BaseModel):
-        # match aws_train_model.py args
+        # match train_model.py args
         pair: str = "ETHUSDT"
         interval: str = "1m"
         window_size: int = 150
@@ -134,10 +134,10 @@ def create_app() -> FastAPI:
     @app.post("/train/aws")
     async def train_aws(body: TrainAWSBody):
         """
-        Starts the torch training defined in aws_train_model.py as a subprocess.
+        Starts the torch training defined in train_model.py as a subprocess.
         Returns a process id you can poll/stop.
         """
-        script = BASE_DIR / "aws_train_model.py"
+        script = BASE_DIR / "train_model.py"
         if not script.exists():
             raise HTTPException(404, f"Missing script: {script}")
 

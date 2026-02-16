@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from utils import (
     read_csv_concat_sorted, resolve_price_col, build_windows,
-    load_model_bundle, fmt_money, compute_features
+    load_model_bundle, fmt_money, compute_features, FEATURE_COLUMNS
 )
 
 def main():
@@ -46,6 +46,8 @@ def main():
     # Load model + meta
     model, scaler, meta = load_model_bundle(args.model_dir)
     feature_cols = list(meta["feature_cols"])  # strict: must exist
+    if feature_cols != FEATURE_COLUMNS:
+        raise ValueError(f"Feature list mismatch: meta has {feature_cols}, expected {FEATURE_COLUMNS}")
     window_size = int(meta.get("window_size", 150))
     # Prefer CLI override, otherwise meta, otherwise use a high-confidence fallback
     buy_threshold = float(meta.get("buy_threshold", 0.75)) if args.threshold is None else float(args.threshold)
@@ -71,6 +73,8 @@ def main():
 
     # Create feature matrix in the same order as training
     X_flat = df[feature_cols].to_numpy(dtype=np.float32)
+    if scaler is not None and hasattr(scaler, "feature_names_in_"):
+        assert list(scaler.feature_names_in_) == feature_cols, "Scaler feature order mismatch"
     print(f"[INFO] Feature matrix created with shape: {X_flat.shape}")
 
     # Windows

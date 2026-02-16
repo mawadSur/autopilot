@@ -41,7 +41,7 @@ try:
 except Exception:  # pragma: no cover - ccxt optional
     ccxt = None
 
-from utils import compute_features, load_model_bundle, fmt_money
+from utils import compute_features, load_model_bundle, fmt_money, FEATURE_COLUMNS
 
 PROJECT = Path(__file__).resolve().parent
 MODEL_DIR = PROJECT / "model"
@@ -221,6 +221,8 @@ def run_loop(args: argparse.Namespace) -> None:
     feature_cols = list(meta.get("feature_cols", []))
     if not feature_cols:
         raise ValueError("model_meta.json missing feature_cols; cannot stream.")
+    if feature_cols != FEATURE_COLUMNS:
+        raise ValueError(f"Feature list mismatch: meta has {feature_cols}, expected {FEATURE_COLUMNS}")
 
     # Load optimizer-derived live config overrides
     best_cfg = load_best_live_config(model_dir)
@@ -289,6 +291,8 @@ def run_loop(args: argparse.Namespace) -> None:
 
         arr = window_frame.to_numpy()
         if scaler is not None:
+            if hasattr(scaler, "feature_names_in_"):
+                assert list(scaler.feature_names_in_) == feature_cols, "Scaler feature order mismatch"
             arr = scaler.transform(arr)
         arr = arr.reshape(1, window, -1)
 
@@ -400,7 +404,8 @@ def fetch_kline(args: argparse.Namespace, exchange) -> Optional[Dict[str, float]
             ohlcv = exchange.fetch_ohlcv(args.symbol, timeframe="1m", limit=2)
             if not ohlcv:
                 return None
-            ts, o, h, l, c, v = ohlcv[-1]
+            # Use last closed candle for features/signals
+            ts, o, h, l, c, v = ohlcv[-2]
             args._last_close = float(c)
             return {
                 "date": ts,
