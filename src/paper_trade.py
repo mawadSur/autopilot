@@ -17,7 +17,6 @@ python paper_trade.py --threshold 0.65 --tp-pct 0.005 --sl-pct 0.0025 --fee-pct 
 
 from __future__ import annotations
 
-import argparse
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -25,23 +24,28 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from utils import (
-    read_csv_concat_sorted, resolve_price_col, build_windows,
-    load_model_bundle, fmt_money, compute_features, FEATURE_COLUMNS
+    read_csv_concat_sorted,
+    resolve_price_col,
+    build_windows,
+    load_model_bundle,
+    compute_features,
+    FEATURE_COLUMNS,
 )
+try:
+    from simulator import simulate_trades_with_tp_sl, print_portfolio_report
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    ROOT = Path(__file__).resolve().parent.parent
+    if str(ROOT) not in sys.path:
+        sys.path.append(str(ROOT))
+    from simulator import simulate_trades_with_tp_sl, print_portfolio_report
+from config import cfg
+from logging_utils import setup_logging, logger
 
 def main():
-    ap = argparse.ArgumentParser(description="Paper (simulated) trading with TP/SL and threshold.")
-    ap.add_argument("--data-dir", type=str, default="eth_1m_data", help="Dir or single CSV")
-    ap.add_argument("--model-dir", type=str, default="model", help="Where model_meta.json & model.pt live")
-    ap.add_argument("--capital", type=float, default=10_000.0)
-    ap.add_argument("--threshold", type=float, default=None, help="Buy prob threshold (classification)")
-    ap.add_argument("--up-thr", type=float, default=0.002,
-                    help="Predicted return threshold for long entries in regression mode (+0.2%)")
-    ap.add_argument("--tp-pct", type=float, default=None)
-    ap.add_argument("--sl-pct", type=float, default=None)
-    ap.add_argument("--fee-pct", type=float, default=None)
-    ap.add_argument("--batch-size", type=int, default=2048)
-    args = ap.parse_args()
+    setup_logging()
+    args = cfg  # use shared settings
 
     # Load model + meta
     model, scaler, meta = load_model_bundle(args.model_dir)
@@ -49,11 +53,10 @@ def main():
     if feature_cols != FEATURE_COLUMNS:
         raise ValueError(f"Feature list mismatch: meta has {feature_cols}, expected {FEATURE_COLUMNS}")
     window_size = int(meta.get("window_size", 150))
-    # Prefer CLI override, otherwise meta, otherwise use a high-confidence fallback
-    buy_threshold = float(meta.get("buy_threshold", 0.75)) if args.threshold is None else float(args.threshold)
-    fee_pct = float(meta.get("tx_cost", 0.0008)) if args.fee_pct is None else float(args.fee_pct)
-    tp_pct = float(meta.get("tp_pct", 0.005)) if args.tp_pct is None else float(args.tp_pct)
-    sl_pct = float(meta.get("sl_pct", 0.0025)) if args.sl_pct is None else float(args.sl_pct)
+    buy_threshold = float(meta.get("buy_threshold", cfg.thr_long))
+    fee_pct = float(meta.get("tx_cost", cfg.fee_pct))
+    tp_pct = float(meta.get("tp_pct", cfg.tp_pct))
+    sl_pct = float(meta.get("sl_pct", cfg.sl_pct))
 
     # Load data
     df = read_csv_concat_sorted(args.data_dir)
@@ -101,9 +104,9 @@ def main():
     task = str(meta.get("task", "classification")).lower()
     scores = np.zeros(len(X), dtype=np.float32)
     long_flags = np.zeros(len(X), dtype=bool)
-    up_threshold = float(args.up_thr)
+    up_threshold = float(cfg.up_thr)
     with torch.no_grad():
-        BS = int(args.batch_size)
+        BS = int(cfg.batch_size)
         for start in range(0, len(X), BS):
             end = min(start + BS, len(X))
             xb = torch.from_numpy(X[start:end]).to(device)
@@ -122,95 +125,24 @@ def main():
                 scores[start:end] = long_probs.astype(np.float32, copy=False)
                 long_flags[start:end] = long_probs >= buy_threshold
 
-    # Paper trading loop (same logic as backtester)
-    cash = float(args.capital)
-    in_trade = False
-    entry_price = None
-    tp_price = None
-    sl_price = None
-    trades = []
-    wins = losses = 0
+    # Build class signals: 2=long, 1=hold (no shorts here)
+    classes = np.ones(len(long_flags), dtype=int)
+    classes[long_flags] = 2
 
-    for i in range(1, len(closes)):
-        o, h, l, c = float(opens[i]), float(highs[i]), float(lows[i]), float(closes[i])
-        t = times.iloc[i] if hasattr(times, "iloc") else times[i]
+    report, curve = simulate_trades_with_tp_sl(
+        opens,
+        highs,
+        lows,
+        closes,
+        classes,
+        start_capital=cfg.capital,
+        fee_pct=fee_pct,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        slippage_pct=cfg.slippage_pct,
+    )
 
-        if not in_trade:
-            if long_flags[i-1]:
-                entry_price = o
-                tp_price = entry_price * (1.0 + tp_pct)
-                sl_price = entry_price * (1.0 - sl_pct)
-                cash *= (1.0 - fee_pct)  # entry fee
-                in_trade = True
-                trades.append({
-                    "time": t,
-                    "side": "BUY",
-                    "price": entry_price,
-                    "signal": float(scores[i-1]),
-                    "mode": task,
-                })
-        else:
-            exit_px = None
-            win = None
-            # conservative order: SL before TP if both touched (path dependent)
-            if l <= sl_price <= h:
-                exit_px = sl_price
-                win = False
-            elif h >= tp_price:
-                exit_px = tp_price
-                win = True
-            elif l <= sl_price:
-                exit_px = sl_price
-                win = False
-
-            if exit_px is not None:
-                gross_ret = (exit_px / entry_price) - 1.0
-                cash *= (1.0 + gross_ret)
-                cash *= (1.0 - fee_pct)  # exit fee
-                in_trade = False
-                trades.append({
-                    "time": t, "side": "SELL", "price": exit_px, "result": "WIN" if win else "LOSS"
-                })
-                if win: wins += 1
-                else: losses += 1
-
-    # If still open at end, close at last close
-    if in_trade and entry_price is not None:
-        final_exit = float(closes[-1])
-        gross_ret = (final_exit / entry_price) - 1.0
-        cash *= (1.0 + gross_ret)
-        cash *= (1.0 - fee_pct)
-        trades.append({"time": times.iloc[-1] if hasattr(times,"iloc") else times[-1], "side": "SELL", "price": final_exit, "result": "CLOSE_END"})
-
-    # Blotter + summary
-    print("\n=== PAPER TRADE BLOTTER ===")
-    for tr in trades:
-        if tr["side"] == "BUY":
-            sig = tr.get("signal")
-            mode = tr.get("mode", task)
-            if sig is None:
-                sig_txt = "n/a"
-            elif mode == "regression" or num_classes == 1:
-                sig_txt = f"{sig*100:.2f}%"
-            else:
-                sig_txt = f"{sig:.3f}"
-            print(f"{tr['time']}  BUY  @ {fmt_money(tr['price'])}  (signal={sig_txt})")
-        else:
-            res = tr.get("result", "")
-            print(f"{tr['time']}  SELL @ {fmt_money(tr['price'])}  {res}")
-
-    start = float(args.capital)
-    end = cash
-    multiple = end / start if start else float("nan")
-    ret = multiple - 1.0
-    print("\n=== PAPER TRADE SUMMARY ===")
-    print(f"Start capital  : {fmt_money(start)}")
-    print(f"End equity     : {fmt_money(end)}")
-    print(f"Return         : {ret*100:.2f}%  (×{multiple:.2f})")
-    total_trades = sum(1 for tr in trades if tr["side"] == "SELL")
-    if total_trades:
-        print(f"Trades         : {total_trades}  (wins {wins}, losses {losses}, win rate {wins/max(1,total_trades):.2%})")
-    print("")
+    print_portfolio_report(report, currency="$")
 
 if __name__ == "__main__":
     main()

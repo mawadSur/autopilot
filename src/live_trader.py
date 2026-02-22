@@ -24,7 +24,6 @@ Requires:
 
 from __future__ import annotations
 
-import argparse
 import collections
 import json
 import os
@@ -35,6 +34,7 @@ from typing import Deque, Dict, Optional
 
 import numpy as np
 import pandas as pd
+from logging_utils import setup_logging, logger
 
 try:
     import ccxt  # optional for real trading
@@ -42,6 +42,16 @@ except Exception:  # pragma: no cover - ccxt optional
     ccxt = None
 
 from utils import compute_features, load_model_bundle, fmt_money, FEATURE_COLUMNS
+from config import cfg
+try:
+    from simulator import SimulationConfig, PortfolioSimulator, Bar
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    ROOT = Path(__file__).resolve().parent.parent
+    if str(ROOT) not in sys.path:
+        sys.path.append(str(ROOT))
+    from simulator import SimulationConfig, PortfolioSimulator, Bar
 
 PROJECT = Path(__file__).resolve().parent
 MODEL_DIR = PROJECT / "model"
@@ -79,21 +89,6 @@ def load_best_live_config(model_dir: Path) -> Dict[str, float]:
             return {}
     return {}
 
-
-@dataclass
-class Position:
-    side: str  # "long" or "short"
-    entry_price: float
-    qty: float
-    atr_at_entry: float
-    tp: float
-    sl: float
-    bars_held: int = 0
-
-    def pnl(self, last: float) -> float:
-        if self.side == "long":
-            return (last - self.entry_price) * self.qty
-        return (self.entry_price - last) * self.qty
 
 
 # ----------------------------
@@ -157,12 +152,13 @@ def decide_direction(probs: np.ndarray, gating: GatingCfg) -> int:
     probs = np.asarray(probs).flatten()
     if probs.size >= 3:
         p_short, p_hold, p_long = probs[:3]
-        best_index = int(np.argmax(probs[:3]))
+        max_prob = max(p_long, p_short)
         top_two = np.sort(probs[:3])[-2:]
-        gap = float(top_two[-1] - top_two[-2]) if len(top_two) == 2 else 0.0
-        if best_index == 2 and p_long >= gating.thr_long and gap >= gating.margin:
+        second_max = float(top_two[-2]) if len(top_two) == 2 else 0.0
+        gap = float(max_prob - second_max)
+        if p_long >= p_short and max_prob >= gating.thr_long and gap >= gating.margin:
             return +1
-        if best_index == 0 and p_short >= gating.thr_short and gap >= gating.margin:
+        if p_short > p_long and max_prob >= gating.thr_short and gap >= gating.margin:
             return -1
         return 0
     if probs.size == 2:
@@ -207,10 +203,17 @@ def make_exchange(testnet: bool) -> Optional["ccxt.binance"]:
 # ----------------------------
 
 
-def run_loop(args: argparse.Namespace) -> None:
+def run_loop() -> None:
     import torch
 
-    model_dir = Path(args.model_dir).expanduser().resolve()
+    setup_logging()
+    args = cfg
+    setattr(args, "_last_close", None)
+    setattr(args, "interval", getattr(cfg, "interval_sec", 5.0))
+    if cfg.capital is not None:
+        setattr(args, "starting_cash", cfg.capital)
+
+    model_dir = Path(cfg.model_dir).expanduser().resolve()
     model, scaler, meta = load_model_bundle(str(model_dir))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -227,24 +230,38 @@ def run_loop(args: argparse.Namespace) -> None:
     # Load optimizer-derived live config overrides
     best_cfg = load_best_live_config(model_dir)
     gating = GatingCfg(
-        thr_long=float(best_cfg.get("thr_long", args.thr_long)),
-        thr_short=float(best_cfg.get("thr_short", args.thr_short)),
-        margin=float(best_cfg.get("margin", args.margin)),
-        consensus=int(best_cfg.get("consensus", args.consensus)),
-        cooldown=int(best_cfg.get("cooldown", args.cooldown)),
+        thr_long=float(best_cfg.get("thr_long", cfg.thr_long)),
+        thr_short=float(best_cfg.get("thr_short", cfg.thr_short)),
+        margin=float(best_cfg.get("margin", cfg.margin)),
+        consensus=int(best_cfg.get("consensus", cfg.consensus)),
+        cooldown=int(best_cfg.get("cooldown", cfg.cooldown)),
     )
     risk = RiskCfg(
         atr_tp_mult=float(best_cfg.get("atr_tp", args.atr_tp_mult)),
         atr_sl_mult=float(best_cfg.get("atr_sl", args.atr_sl_mult)),
-        risk_pct_per_trade=args.risk_pct_per_trade,
-        max_leverage=args.max_leverage,
-        allow_shorts=str2bool(best_cfg.get("allow_shorts", args.allow_shorts)),
+        risk_pct_per_trade=cfg.risk_pct_per_trade,
+        max_leverage=cfg.max_leverage,
+        allow_shorts=cfg.allow_shorts,
     )
 
-    equity = float(args.starting_cash)
-    position: Optional[Position] = None
     consensus = ConsensusBuffer(gating.consensus)
-    bars_since_exit = max(0, gating.cooldown)
+    sim_cfg = SimulationConfig(
+        start_capital=float(cfg.starting_cash),
+        fee_pct=float(cfg.fee_pct),
+        slippage_pct=float(cfg.slippage_pct),
+        cooldown=int(gating.cooldown),
+        use_atr_stops=True,
+        atr_tp_mult=risk.atr_tp_mult,
+        atr_sl_mult=risk.atr_sl_mult,
+        dynamic_sizing=True,
+        max_risk_per_trade=risk.risk_pct_per_trade,
+        leverage=risk.max_leverage if hasattr(risk, "max_leverage") else 1.0,
+        allow_shorts=risk.allow_shorts,
+        use_regime_filter=True,
+        record_trades=True,
+    )
+    sim = PortfolioSimulator(sim_cfg)
+    prev_log_len = 0
 
     exchange = make_exchange(testnet=args.testnet)
 
@@ -255,7 +272,7 @@ def run_loop(args: argparse.Namespace) -> None:
         except Exception:
             args._last_close = None
 
-    print("[INFO] Starting live loop — initial equity:", fmt_money(equity))
+    print("[INFO] Starting live loop — initial equity:", fmt_money(sim.last_equity))
     while True:
         kline = fetch_kline(args, exchange)
         if kline is not None:
@@ -312,57 +329,43 @@ def run_loop(args: argparse.Namespace) -> None:
 
         direction = decide_direction(probs, gating)
         consensus.push(direction)
-        long_ready = consensus.ok(+1) and regime >= 0
-        short_ready = consensus.ok(-1) and regime <= 0 and risk.allow_shorts
-        cooldown_ready = bars_since_exit >= gating.cooldown
 
-        if position is not None:
-            position.bars_held += 1
-            pnl_now = position.pnl(last_close)
-            notional = abs(position.qty * last_close)
-            hit_tp = last_close >= position.tp if position.side == "long" else last_close <= position.tp
-            hit_sl = last_close <= position.sl if position.side == "long" else last_close >= position.sl
-            exit_signal = (
-                (position.side == "long" and direction <= 0) or
-                (position.side == "short" and direction >= 0)
-            )
-            if hit_tp or hit_sl or exit_signal:
-                fee_out = notional * args.fee_pct
-                equity += pnl_now - fee_out
-                print(
-                    f"[EXIT {position.side.upper()}] price={last_close:.2f} "
-                    f"pnl={pnl_now:.2f} eq={fmt_money(equity)}"
-                )
-                position = None
-                bars_since_exit = 0
-        else:
-            if cooldown_ready and (long_ready or short_ready):
-                side = "long" if long_ready else "short"
-                per_unit_risk = max(1e-8, last_atr)
-                equity_risk = max(0.0, equity) * risk.risk_pct_per_trade
-                qty = (equity_risk / per_unit_risk) / max(1e-8, last_close)
-                qty = max(0.0, qty * risk.max_leverage)
-                if qty > 0:
-                    notional = qty * last_close
-                    fee_in = notional * args.fee_pct
-                    equity -= fee_in
-                    if side == "long":
-                        entry = last_close * (1.0 + args.slippage_pct)
-                        tp = entry + risk.atr_tp_mult * last_atr
-                        sl = entry - risk.atr_sl_mult * last_atr
-                    else:
-                        entry = last_close * (1.0 - args.slippage_pct)
-                        tp = entry - risk.atr_tp_mult * last_atr
-                        sl = entry + risk.atr_sl_mult * last_atr
-                    position = Position(side=side, entry_price=entry, qty=qty,
-                                         atr_at_entry=last_atr, tp=tp, sl=sl)
-                    print(
-                        f"[ENTER {side.upper()}] price={entry:.2f} qty={qty:.6f} "
-                        f"tp={tp:.2f} sl={sl:.2f} eq={fmt_money(equity)}"
-                    )
-                    bars_since_exit = 0
+        signal = 0
+        if direction == +1 and consensus.ok(+1) and regime >= 0:
+            signal = +1
+        elif direction == -1 and consensus.ok(-1) and regime <= 0 and risk.allow_shorts:
+            signal = -1
 
-        bars_since_exit += 1
+        # Build bar for simulator (executes previous pending signal)
+        last_row = feats.iloc[-1]
+        bar = Bar(
+            open=float(last_row["open"]),
+            high=float(last_row["high"]),
+            low=float(last_row["low"]),
+            close=last_close,
+            atr=last_atr,
+            regime=regime,
+            timestamp=last_row.get("timestamp"),
+        )
+        sim.step(bar, signal=signal)
+
+        # Emit new trades as they happen
+        if sim.trade_log and len(sim.trade_log) > prev_log_len:
+            new_logs = sim.trade_log[prev_log_len:]
+            prev_log_len = len(sim.trade_log)
+            for tr in new_logs:
+                side = tr.get("side", "").upper()
+                action = tr.get("action", "").upper()
+                price = tr.get("price")
+                pnl = tr.get("pnl")
+                ret = tr.get("ret")
+                eq = tr.get("equity", sim.last_equity)
+                reason = tr.get("reason", "")
+                if action == "ENTER":
+                    print(f"[ENTER {side}] price={price:.2f} tp={tr.get('tp'):.2f} sl={tr.get('sl'):.2f} eq={fmt_money(eq)}")
+                elif action == "EXIT":
+                    print(f"[EXIT  {side}] price={price:.2f} pnl={pnl:.2f} ret={ret:.4f} reason={reason} eq={fmt_money(eq)}")
+
         time.sleep(max(0.5, args.interval))
 
 
@@ -440,66 +443,8 @@ def fetch_kline(args: argparse.Namespace, exchange) -> Optional[Dict[str, float]
 
 
 # ----------------------------
-# CLI
+# Entry
 # ----------------------------
 
-def str2bool(val) -> bool:
-    if isinstance(val, bool):
-        return val
-    return str(val).lower() in {"1", "true", "yes", "y", "t"}
-
-
-def parse_args(argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir", type=str, default=str(MODEL_DIR))
-    parser.add_argument("--symbol", type=str, default="ETH/USDT")
-    parser.add_argument("--interval", type=float, default=5.0, help="Seconds between polls.")
-    parser.add_argument("--csv-path", type=str, default="", help="Optional seed CSV path.")
-    parser.add_argument("--starting-cash", type=float, default=10_000.0)
-    parser.add_argument("--capital", type=float, default=None,
-                        help="Alias for starting equity (overrides --starting-cash if provided)")
-    parser.add_argument("--fee-pct", type=float, default=0.0008)
-    parser.add_argument("--slippage-pct", "--slippage", dest="slippage_pct", type=float, default=0.0002,
-                        help="Per-side slippage fraction for fills (e.g., 0.0002 = 2 bps)")
-
-    # gating defaults (overridden by best_live_config.json when present)
-    parser.add_argument("--thr-long", type=float, default=0.75,
-                        help="Minimum probability for a long signal")
-    parser.add_argument("--thr-short", type=float, default=0.75,
-                        help="Minimum probability for a short signal")
-    parser.add_argument("--margin", type=float, default=0.25,
-                        help="Required margin between top classes to act")
-    parser.add_argument("--consensus", type=int, default=2,
-                        help="Consecutive bars required for a signal")
-    parser.add_argument("--cooldown", type=int, default=1,
-                        help="Bars to wait after exit before re-entering")
-
-    # risk configuration
-    parser.add_argument("--atr-tp-mult", type=float, default=2.0,
-                        help="ATR multiplier for take-profit targets")
-    parser.add_argument("--atr-sl-mult", type=float, default=1.0,
-                        help="ATR multiplier for stop-loss levels")
-    parser.add_argument("--risk-pct-per-trade", type=float, default=0.005,
-                        help="Fraction of equity to risk per trade")
-    parser.add_argument("--max-leverage", type=float, default=1.0)
-    parser.add_argument("--allow-shorts", action="store_true",
-                        help="Enable short trades when venue permits")
-
-    # exchange mode
-    parser.add_argument("--real", type=str2bool, default=False)
-    parser.add_argument("--testnet", type=str2bool, default=True)
-
-    args = parser.parse_args(argv)
-    if args.capital is not None:
-        args.starting_cash = args.capital
-    setattr(args, "_last_close", None)
-    return args
-
-
-def main() -> None:
-    args = parse_args()
-    run_loop(args)
-
-
 if __name__ == "__main__":
-    main()
+    run_loop()

@@ -1,0 +1,36 @@
+{
+  "fold": 5,
+  "val_acc": 0.4968076706147772,
+  "val_macro_f1": 0.5211403727150893,
+  "precision": {
+    "short_win": 0.47,
+    "timeout": 0.8346,
+    "long_win": 0.398
+  },
+  "recall": {
+    "short_win": 0.4017,
+    "timeout": 0.5354,
+    "long_win": 0.5804
+  },
+  "pred_dist": {
+    "short_win": 0.3427,
+    "timeout": 0.1698,
+    "long_win": 0.4876
+  },
+  "temperature": 0.80572509765625,
+  "optimized_thresholds": {
+    "thr_long": 0.6,
+    "thr_short": 0.6,
+    "score": 1.0
+  },
+  "train_files": [
+    "eth_1m_data/eth-usdt_coinbase_1m_2025-03.csv",
+    "eth_1m_data/eth-usdt_coinbase_1m_2025-04.csv",
+    "eth_1m_data/eth-usdt_coinbase_1m_2025-05.csv",
+    "eth_1m_data/eth-usdt_coinbase_1m_2025-06.csv",
+    "eth_1m_data/eth-usdt_coinbase_1m_2025-07.csv"
+  ],
+  "val_files": [
+    "eth_1m_data/eth-usdt_coinbase_1m_2025-08.csv"
+  ]
+}

@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from config import cfg
 
 # NOTE: We intentionally avoid heavy AWS / ML imports at module import time.
 #       They will be imported inside endpoints to keep `uvicorn main:app --reload` reliable.
@@ -86,50 +87,16 @@ def create_app() -> FastAPI:
     # ---------------------------
     # Local prediction (optional; uses best_model.pth + inference.LSTMModel)
     # ---------------------------
-    @app.post("/predict/local")
-    async def predict_local(body: PredictBody):
-        try:
-            import torch
-            import numpy as np
-            import json
-            from inference import LSTMModel
-        except Exception as e:
-            raise HTTPException(500, f"Failed to import local model deps: {e}")
-
-        model_path = BASE_DIR / "best_model.pth"
-        if not model_path.exists():
-            raise HTTPException(404, f"Missing local model weights: {model_path}")
-
-        # Hyperparams must match your trained model; feel free to adjust or load from a meta file
-        input_size = len(body.inputs[0]) if body.inputs else 17
-        model = LSTMModel(input_size=input_size, hidden_size=64, num_layers=2, output_size=1, dropout_rate=0.3)
-        try:
-            state = torch.load(str(model_path), map_location="cpu")
-            model.load_state_dict(state)
-        except Exception as e:
-            raise HTTPException(500, f"Failed to load model: {e}")
-        model.eval()
-        x = np.asarray(body.inputs, dtype="float32")[None, ...]  # [1, T, F]
-        with torch.no_grad():
-            logits = model(torch.from_numpy(x))
-            prob = float(torch.sigmoid(logits).item())
-        return {"probability": prob, "signal": 1 if prob > 0.5 else 0}
+    # Removed /predict/local (legacy path). Use /predict with a deployed endpoint.
 
     # ---------------------------
     # S3 / SageMaker utilities
     # ---------------------------
     class TrainAWSBody(BaseModel):
-        # match train_model.py args
-        pair: str = "ETHUSDT"
-        interval: str = "1m"
-        window_size: int = 150
-        epochs: int = 100
-        batch_size: int = 1024
-        learning_rate: float = 0.001
-        patience: int = 5
-        lookahead_period: int = 10
-        risk_reward_ratio: float = 2.0
-        profit_threshold_pct: float = 0.5
+        bucket: Optional[str] = None
+        prefix: str = "eth-training"
+        local_train_dir: str = cfg.data_dir
+        train_s3_uri: Optional[str] = None
 
     @app.post("/train/aws")
     async def train_aws(body: TrainAWSBody):
@@ -137,24 +104,20 @@ def create_app() -> FastAPI:
         Starts the torch training defined in train_model.py as a subprocess.
         Returns a process id you can poll/stop.
         """
-        script = BASE_DIR / "train_model.py"
+        script = BASE_DIR / "deploy.py"
         if not script.exists():
             raise HTTPException(404, f"Missing script: {script}")
 
         cmd = [
             os.getenv("PYTHON", "python"),
             str(script),
-            "--pair", body.pair,
-            "--interval", body.interval,
-            "--window-size", str(body.window_size),
-            "--epochs", str(body.epochs),
-            "--batch-size", str(body.batch_size),
-            "--learning-rate", str(body.learning_rate),
-            "--patience", str(body.patience),
-            "--lookahead-period", str(body.lookahead_period),
-            "--risk-reward-ratio", str(body.risk_reward_ratio),
-            "--profit-threshold-pct", str(body.profit_threshold_pct),
+            "--mode", "training",
+            "--bucket", body.bucket or os.getenv("S3_BUCKET_NAME", ""),
+            "--prefix", body.prefix,
+            "--local-train-dir", body.local_train_dir,
         ]
+        if body.train_s3_uri:
+            cmd.extend(["--train-s3-uri", body.train_s3_uri])
         try:
             proc = subprocess.Popen(cmd, cwd=str(BASE_DIR))
             app.state.procs[f"train-aws:{proc.pid}"] = proc
@@ -165,36 +128,31 @@ def create_app() -> FastAPI:
     class DeployBody(BaseModel):
         model_s3_path: str
         endpoint_name: str
-        instance_type: str = "ml.t2.medium"
+        serverless_memory: int = cfg.serverless_memory_mb
+        serverless_max_concurrency: int = cfg.serverless_max_concurrency
 
     @app.post("/deploy")
     async def deploy(body: DeployBody):
         """
         Deploy a model artifact to a SageMaker endpoint.
         """
-        try:
-            import sagemaker
-            from sagemaker.pytorch import PyTorchModel
-        except Exception as e:
-            raise HTTPException(500, f"Failed to import sagemaker: {e}")
+        script = BASE_DIR / "deploy.py"
+        if not script.exists():
+            raise HTTPException(404, f"Missing script: {script}")
 
+        cmd = [
+            os.getenv("PYTHON", "python"),
+            str(script),
+            "--mode", "serverless",
+            "--model-s3", body.model_s3_path,
+            "--endpoint-name", body.endpoint_name,
+            "--serverless-memory", str(body.serverless_memory),
+            "--serverless-max-concurrency", str(body.serverless_max_concurrency),
+        ]
         try:
-            sm_session = sagemaker.Session()
-            role = os.getenv("SAGEMAKER_ROLE") or sagemaker.get_execution_role()
-            model = PyTorchModel(
-                model_data=body.model_s3_path,
-                role=role,
-                entry_point="inference.py",
-                framework_version="2.4",
-                py_version="py310",
-                sagemaker_session=sm_session,
-            )
-            predictor = model.deploy(
-                initial_instance_count=1,
-                instance_type=body.instance_type,
-                endpoint_name=body.endpoint_name,
-            )
-            return {"status": "deployed", "endpoint_name": predictor.endpoint_name}
+            proc = subprocess.Popen(cmd, cwd=str(BASE_DIR))
+            app.state.procs[f"deploy:{proc.pid}"] = proc
+            return {"status": "started", "pid": proc.pid, "cmd": cmd}
         except Exception as e:
             raise HTTPException(500, f"Deploy failed: {e}")
 
@@ -204,12 +162,12 @@ def create_app() -> FastAPI:
         Deletes SageMaker endpoints and trial components using delete.py helpers.
         """
         try:
-            from delete import delete_trial_components, delete_endpoints
+            from delete import delete_experiments, delete_endpoints
         except Exception as e:
             raise HTTPException(500, f"Import error: {e}")
         try:
-            delete_trial_components()
-            delete_endpoints()
+            delete_experiments(boto3.client("sagemaker"), dry_run=False)
+            delete_endpoints(boto3.client("sagemaker"), dry_run=False)
             return {"status": "ok"}
         except Exception as e:
             raise HTTPException(500, f"Cleanup failed: {e}")

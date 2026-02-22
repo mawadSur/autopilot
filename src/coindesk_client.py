@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -39,7 +39,7 @@ class CoinDeskConfig:
     timeout_s: int = 30
     max_retries: int = 6
     retry_backoff_s: float = 1.0
-    endpoints: CoinDeskEndpoints = CoinDeskEndpoints()
+    endpoints: CoinDeskEndpoints = field(default_factory=CoinDeskEndpoints)
 
 
 def _pick(d: Dict[str, Any], *keys: str, default=None):
@@ -64,6 +64,26 @@ def _ts_to_seconds(ts_val: Any) -> Optional[int]:
     if ts_int > 10_000_000_000:  # ms
         return ts_int // 1000
     return ts_int
+
+
+def _extract_data_list(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Handle both flat and nested CoinDesk/CCC payload shapes.
+
+    Examples:
+    - {"Data": [...]}                 -> [...]
+    - {"data": [...]}                 -> [...]
+    - {"Data": {"Data": [...]}}       -> [...]
+    - {"data": {"data": [...]}}       -> [...]
+    """
+    root = payload.get("Data", payload.get("data", []))
+    if isinstance(root, dict):
+        nested = root.get("Data", root.get("data", []))
+        if isinstance(nested, list):
+            return nested
+        return []
+    if isinstance(root, list):
+        return root
+    return []
 
 
 class CoinDeskClient:
@@ -114,7 +134,7 @@ class CoinDeskClient:
 
     @staticmethod
     def normalize_ohlcv_minutes(payload: Dict[str, Any]) -> pd.DataFrame:
-        data = payload.get("Data") or payload.get("data") or []
+        data = _extract_data_list(payload)
         if not data:
             return pd.DataFrame(columns=[
                 "timestamp", "open", "high", "low", "close",
@@ -164,7 +184,9 @@ class CoinDeskClient:
 
     @staticmethod
     def normalize_trades(payload: Dict[str, Any]) -> pd.DataFrame:
-        data = payload.get("Data") or payload.get("data") or []
+        data = payload.get("Data", payload.get("data", []))
+        if not isinstance(data, list):
+            data = []
         if not data:
             return pd.DataFrame(columns=["timestamp", "price", "qty_base", "qty_quote", "side"])
 
@@ -221,7 +243,9 @@ class CoinDeskClient:
 
     @staticmethod
     def normalize_l2_metrics(payload: Dict[str, Any]) -> pd.DataFrame:
-        data = payload.get("Data") or payload.get("data") or []
+        data = payload.get("Data", payload.get("data", []))
+        if not isinstance(data, list):
+            data = []
         if not data:
             return pd.DataFrame()
         rows = []
@@ -255,7 +279,9 @@ class CoinDeskClient:
 
     @staticmethod
     def normalize_l2_snapshots(payload: Dict[str, Any]) -> pd.DataFrame:
-        data = payload.get("Data") or payload.get("data") or []
+        data = payload.get("Data", payload.get("data", []))
+        if not isinstance(data, list):
+            data = []
         if not data:
             return pd.DataFrame(columns=["timestamp", "bids", "asks"])
         rows = []
@@ -290,4 +316,3 @@ def build_client_from_env() -> CoinDeskClient:
         endpoints=endpoints,
     )
     return CoinDeskClient(cfg)
-

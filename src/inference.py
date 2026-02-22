@@ -31,36 +31,20 @@ except Exception:
 
 # Project utils/models
 from utils import load_meta, build_windows
-from models import LSTMClassifier
+from models import build_model_from_meta
+from config import cfg
 
 
 # ---------- SageMaker entrypoints ----------
 
 def model_fn(model_dir: str):
-    """
-    Load artifacts from model_dir.
-    Returns a tuple (model.eval(), scaler_or_None, meta_dict).
-    """
+    """Load model/scaler/meta using the shared builders (SageMaker entrypoint)."""
     meta = load_meta(model_dir)
     feature_cols: List[str] = list(meta["feature_cols"])  # strict: must exist
-    hidden_size = int(meta.get("hidden_size", 512))
-    num_layers = int(meta.get("num_layers", 3))
-    dropout = float(meta.get("dropout", 0.3))
-    bidirectional = bool(meta.get("bidirectional", True))
-    num_classes = int(meta.get("num_classes", 2))
 
-    model = LSTMClassifier(
-        input_size=len(feature_cols),
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        dropout=dropout,
-        bidirectional=bidirectional,
-        num_classes=num_classes,
-    )
-
+    model = build_model_from_meta(meta)
     weights_path = os.path.join(model_dir, meta.get("model_state_path", "model.pt"))
     state = torch.load(weights_path, map_location="cpu")
-    # Allow non-strict loading to tolerate attention or head changes
     model.load_state_dict(state, strict=False)
     model.eval()
 
@@ -139,13 +123,15 @@ def input_fn(request_body: str, content_type: str):
 
 def predict_fn(input_object: Dict[str, Any], model_bundle):
     """
-    Build windows and predict class-1 probabilities.
-    Output dict includes probs and hard labels using buy_threshold from meta.
+    Build windows and predict class probabilities.
+    Output dict includes probs and hard labels using thresholds + margin gating.
     """
     model, scaler, meta = model_bundle
     feature_cols: List[str] = list(meta["feature_cols"])  # strict: must exist
     window_size = int(meta.get("window_size", 150))
-    threshold = float(meta.get("buy_threshold", 0.60))
+    thr_long = float(meta.get("thr_long", meta.get("buy_threshold", 0.60)))
+    thr_short = float(meta.get("thr_short", thr_long))
+    p_margin = float(meta.get("p_margin", meta.get("margin", 0.15)))
 
     # Parse input into flat matrix [N,F]
     if "payload" in input_object:
@@ -157,7 +143,7 @@ def predict_fn(input_object: Dict[str, Any], model_bundle):
 
     if X_flat.shape[0] < window_size:
         # Not enough rows to form a single window
-        return {"probs": [], "labels": [], "threshold": threshold}
+        return {"probs": [], "labels": [], "thresholds": {"long": thr_long, "short": thr_short}, "p_margin": p_margin}
 
     # Build windows and scale
     X = build_windows(X_flat, window_size)  # [W, T, F]
@@ -170,11 +156,46 @@ def predict_fn(input_object: Dict[str, Any], model_bundle):
     model = model.to(device)
     with torch.no_grad():
         xb = torch.from_numpy(X).to(device)
-        logits = model(xb)  # [W, 2]
-        probs = F.softmax(logits, dim=-1)[:, 1].detach().cpu().numpy()
+        logits = model(xb)
+        probs = F.softmax(logits, dim=-1).detach().cpu().numpy()
 
-    labels = (probs >= threshold).astype(int).tolist()
-    return {"probs": probs.tolist(), "labels": labels, "threshold": threshold}
+    # Margin-gated signals
+    signals: List[int] = []
+    for row in probs:
+        row = np.asarray(row).flatten()
+        if row.size >= 3:
+            p_short, p_hold, p_long = row[:3]
+            max_prob = max(p_long, p_short)
+            top_two = np.sort(row[:3])[-2:]
+            gap = float(top_two[-1] - top_two[-2]) if len(top_two) == 2 else 0.0
+            if p_long >= p_short and p_long >= thr_long and gap >= p_margin:
+                signals.append(1)
+            elif p_short > p_long and p_short >= thr_short and gap >= p_margin:
+                signals.append(-1)
+            else:
+                signals.append(0)
+        elif row.size == 2:
+            p_short, p_long = float(row[0]), float(row[1])
+            max_prob = max(p_long, p_short)
+            gap = abs(p_long - p_short)
+            if p_long >= p_short and p_long >= thr_long and gap >= p_margin:
+                signals.append(1)
+            elif p_short > p_long and p_short >= thr_short and gap >= p_margin:
+                signals.append(-1)
+            else:
+                signals.append(0)
+        else:
+            p_long = float(row[0])
+            signals.append(1 if p_long >= thr_long else 0)
+
+    # Preserve old behavior: if binary, expose class-1 probs; else full probs
+    probs_out = probs[:, 1].tolist() if probs.shape[1] == 2 else probs.tolist()
+    return {
+        "probs": probs_out,
+        "signals": signals,
+        "thresholds": {"long": thr_long, "short": thr_short},
+        "p_margin": p_margin,
+    }
 
 
 def output_fn(prediction: Dict[str, Any], accept: str = "application/json"):

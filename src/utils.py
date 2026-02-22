@@ -41,14 +41,13 @@ except Exception:
 import numpy as np
 import pandas as pd
 import torch
-import subprocess
-import sys
 
+# TA-Lib is optional. Current feature engineering is implemented with pandas/numpy,
+# so training/inference should not hard-fail when TA-Lib is unavailable.
 try:
-    import talib as ta
-except ModuleNotFoundError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "TA-Lib"])
-    import talib as ta
+    import talib as ta  # type: ignore  # pragma: no cover
+except Exception:  # pragma: no cover
+    ta = None
 
 # Optional scaler persistence
 try:
@@ -408,6 +407,15 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     if "timestamp" in df.columns:
         ts = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
         if ts.notna().any():
+            # Drop any prior TF columns to make compute_features idempotent
+            drop_cols = [c for c in df.columns if (
+                c.startswith("tf5_") or c.startswith("tf15_") or c.startswith("tf60_") or c == "tf_ts" or
+                c.startswith("tf5_") and (c.endswith("_x") or c.endswith("_y")) or
+                c.startswith("tf15_") and (c.endswith("_x") or c.endswith("_y")) or
+                c.startswith("tf60_") and (c.endswith("_x") or c.endswith("_y"))
+            )]
+            if drop_cols:
+                df = df.drop(columns=drop_cols, errors="ignore")
             minute_of_day = (ts.dt.hour * 60 + ts.dt.minute).astype("float64")
             df["minute_of_day"] = minute_of_day
             df["tod_sin"] = np.sin(2 * np.pi * minute_of_day / 1440.0)
@@ -564,14 +572,22 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     if "spread_pct" in df.columns and "l1_imbalance" in df.columns:
         df["spread_times_imbalance"] = df["spread_pct"] * df["l1_imbalance"]
 
-    # Fill any remaining gaps created by rolling windows
-    df.bfill(inplace=True)
+    # Fill any remaining gaps created by rolling windows.
+    # NOTE: avoid backfilling (bfill) because it can leak future info into the past.
     df.ffill(inplace=True)
 
-    # Ensure column order includes all FEATURE_COLUMNS (missing ones are filled later)
+    # Ensure all FEATURE_COLUMNS exist. For OHLCV-only inputs, many optional
+    # microstructure columns will be missing — default them to 0.0 to prevent NaNs.
     for col in FEATURE_COLUMNS:
         if col not in df.columns:
-            df[col] = np.nan
+            df[col] = 0.0
+
+    missing_after = [c for c in FEATURE_COLUMNS if c not in df.columns]
+    if missing_after:
+        raise ValueError(f"compute_features missing engineered columns: {missing_after}")
+
+    # Final safety: eliminate any NaN/Inf in model features (prevents NaN losses).
+    df = df[FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     return df
 
@@ -731,20 +747,13 @@ class SignalGenerator:
     def _ensure_feature_cols(self, engineered_df: pd.DataFrame) -> List[str]:
         """Pick an ordered feature list aligned with training.
 
-        Prefers train_model.FEATURES; falls back to DEFAULT_FEATURE_COLS.
+        Uses FEATURE_COLUMNS as the canonical list.
         """
         if self._feature_cols is not None:
             return self._feature_cols
 
-        try:
-            from train_model import FEATURES as TRAIN_FEATURES  # type: ignore
-        except Exception:
-            TRAIN_FEATURES = []
-
         available = set(engineered_df.columns.tolist())
-        cols = [c for c in TRAIN_FEATURES if c in available]
-        if len(cols) < 4:
-            cols = [c for c in DEFAULT_FEATURE_COLS if c in available]
+        cols = [c for c in FEATURE_COLUMNS if c in available]
         if not cols:
             # As a last resort, take numeric columns (best effort)
             cols = engineered_df.select_dtypes(include=[np.number]).columns.tolist()

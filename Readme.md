@@ -1,6 +1,13 @@
 # 🤖 AI Crypto Trading Bot
 
-This project is an end-to-end automated trading bot for cryptocurrencies (specifically ETH/USDT). It uses a deep learning model (LSTM) to predict short-term price movements and provides trading signals via a real-time API. The entire MLOps pipeline is managed, from data collection and model training on AWS SageMaker to deployment and live inference.
+An end‑to‑end crypto trading system focused on **1‑minute ETH/USDT** data. It includes:
+- data ingestion (Binance or CoinDesk),
+- feature engineering + labeling,
+- model training (local or SageMaker),
+- backtesting,
+- live inference + optional paper/real execution.
+
+This README explains **how to get started** and **how the system works**.
 
 ## Table of Contents
 - [Project Overview](#project-overview)
@@ -14,7 +21,10 @@ This project is an end-to-end automated trading bot for cryptocurrencies (specif
 
 ## Project Overview
 
-The core of this project is a predictive model that analyzes 1-minute candlestick data (OHLCV) for ETH/USDT. It learns patterns from historical data to generate a "BUY" or "HOLD" signal based on the likelihood of a price increase in the near future.
+The core of this project is a predictive model that analyzes 1‑minute OHLCV (and optionally microstructure) data for ETH/USDT. It learns short‑term patterns and outputs a **3‑class signal**:
+- **short_win** (-1),
+- **timeout/hold** (0),
+- **long_win** (+1).
 
 The project is designed with a clear separation of concerns:
 1.  **Data Engineering**: Scripts to fetch and prepare large datasets.
@@ -25,35 +35,40 @@ The project is designed with a clear separation of concerns:
 
 The project follows a standard MLOps workflow:
 
-1.  **📥 Data Ingestion**: `history.py` fetches historical 1-minute k-line data from the Binance API and stores it locally as monthly CSV files.  
-    **CoinDesk alternative**: `build_coindesk_dataset.py` builds unified 1-minute datasets (OHLCV + trades + L1/L2) and writes one CSV per month under `data/coindesk/<INSTRUMENT>/1m/`.
-2.  **🛠️ Data Preparation**: `label.py` processes the raw data, engineers features, and generates labels for supervised learning.
-3.  **☁️ Model Training (AWS)**: `launch_sagemaker_job.py` uploads the prepared data to an S3 bucket and starts a training job on AWS SageMaker, utilizing GPU instances for speed.
-4.  **🧠 Training Script**: `train_model.py` is executed by SageMaker. It defines the PyTorch model, trains it, and saves model artifacts (`model.pt`, `scaler.joblib`) back to S3.
-5.  **🚀 Model Deployment (AWS)**: After a successful training job, `launch_sagemaker_job.py` automatically deploys the best model to a SageMaker real-time endpoint. The `inference.py` script defines the logic for this endpoint.
-6.  **📡 Live API Server**: `main.py` runs a local FastAPI server that loads the model artifacts and provides endpoints for inference.
-7.  **💻 Client Interaction**: A frontend application can connect to the FastAPI server's WebSocket to receive live trading signals and display them on a dashboard.
+1.  **📥 Data Ingestion**
+    - Binance OHLCV: `history.py`
+    - CoinDesk data via reusable client: `coindesk_client.py`
+2.  **🛠️ Feature Engineering + Labeling**
+    - `utils.compute_features` builds the full feature set.
+    - `train_model.py` applies dynamic triple‑barrier labels (cost‑aware, ATR‑aware).
+3.  **🧠 Model Training**
+    - Local: `python src/train_model.py`
+    - SageMaker: `python src/launch_sagemaker_job.py`
+4.  **📊 Backtesting**
+    - `python src/backtest.py --model-dir model/seq_90`
+5.  **📡 Live / Paper Trading**
+    - CoinDesk live collector + inference: `python src/live_coindesk_collector.py --paper`
 
 ## Features
 
 - **Automated Data Fetching**: Pulls years of 1-minute ETH/USDT data from Binance or CoinDesk.
-- **Advanced Feature Engineering**: Creates 17+ technical indicators to feed the model.
+- **Advanced Feature Engineering**: Robust bucketed features (OHLCV + stationarity + microstructure).
 - **Cloud-Based Training**: Leverages AWS SageMaker for scalable, powerful GPU-based model training.
 - **Real-time Inference API**: A non-blocking API built with FastAPI to deliver signals with low latency.
 - **Live Signal Streaming**: A WebSocket endpoint streams predictions every 5 seconds, perfect for a live dashboard.
 - **Paper Trading Simulation**: Endpoints to run and monitor a simulated trading strategy in the background.
-- **Backtesting Support**: `backtest.py` can generate signals over the entire historical dataset for strategy evaluation.
+- **Backtesting Support**: `backtest.py` evaluates full-history strategies.
 
 ## Project Structure
 
 ```
 .
 ├── eth_1m_data/              # Stores raw historical data from Binance
-├── data/coindesk/...         # Stores unified CoinDesk datasets (1 CSV per month)
+├── data/coindesk/...         # Unified CoinDesk datasets (1 CSV per month)
 ├── backtest.py               # Generates signals over historical data for backtesting.
 ├── history.py                # Fetches historical 1-minute data from Binance.
-├── history_coindesk.py       # Fetches CoinDesk minute candles (OHLCV-only).
-├── build_coindesk_dataset.py # Builds unified CoinDesk dataset (OHLCV + trades + book).
+├── coindesk_client.py        # Reusable CoinDesk Data API client.
+├── live_coindesk_collector.py# Live CoinDesk collector + inference + (paper) execution.
 ├── inference.py              # Contains the code for the SageMaker real-time inference endpoint.
 ├── label.py                  # Performs feature engineering and creates labels for the dataset.
 ├── launch_sagemaker_job.py   # Orchestrates the AWS SageMaker training and deployment process.
@@ -82,16 +97,22 @@ The project follows a standard MLOps workflow:
     ```bash
     pip install -r requirements.txt
     ```
+    (TA-Lib is required; if pip fails on wheels, install the conda-forge package: `conda install -c conda-forge ta-lib`)
 
-4.  **Set up environment variables:**
+4.  **Set up environment variables**
     Create a `.env` file in the root directory and add your Binance API keys (if using Binance data) and CoinDesk API key (if using CoinDesk data).
     ```env
     # For history.py (fetching data)
     BINANCE_KEY="your_binance_api_key"
     BINANCE_SECRET="your_binance_api_secret"
 
-    # For CoinDesk Data API (build_coindesk_dataset.py / history_coindesk.py)
+    # For CoinDesk Data API (used by coindesk_client.py)
     COINDESK_API_KEY="your_coindesk_api_key"
+
+    # Optional: live execution via Coinbase (ccxt)
+    COINBASE_API_KEY="..."
+    COINBASE_API_SECRET="..."
+    COINBASE_PASSPHRASE="..."
     ```
 
 5.  **Configure AWS Credentials**:
@@ -101,22 +122,49 @@ The project follows a standard MLOps workflow:
     ```
     You will also need to **provide the correct IAM Role ARN** in `launch_sagemaker_job.py`.
 
-## Workflow
+## Getting Started (Quickstart)
+
+1) **Fetch data**
+   - Binance:  
+     ```bash
+     python src/history.py
+     ```
+   - CoinDesk via client:  
+     ```bash
+     python src/coindesk_client.py --help
+     ```
+
+2) **Train locally**
+   ```bash
+   python src/train_model.py --data-path data/coindesk/ETH-USDT/1m --output-dir model
+   ```
+
+3) **Backtest**
+   ```bash
+   python src/backtest.py --model-dir model/seq_90
+   ```
+
+4) **Run live collector (paper mode)**
+   ```bash
+   python src/live_coindesk_collector.py --paper
+   ```
+
+## Workflow (Detailed)
 
 Follow these steps to run the project from end to end:
 
 1.  **Fetch Data**:
-    - Binance (OHLCV only): `python history.py`
-    - CoinDesk (unified dataset): `python build_coindesk_dataset.py --market coinbase --instrument ETH-USDT`
+    - Binance (OHLCV only): `python src/history.py`
+    - CoinDesk (via client): `python src/coindesk_client.py --help`
     ```bash
-    python history.py
-    # or
-    python build_coindesk_dataset.py --market coinbase --instrument ETH-USDT
+    python src/history.py
+    # or (see options)
+    python src/coindesk_client.py --help
     ```
 
 2.  **Train and Deploy on AWS**: Execute the `launch_sagemaker_job.py` script. This will handle uploading data, training the model, and deploying it to a live endpoint.
     ```bash
-    python launch_sagemaker_job.py
+    python src/launch_sagemaker_job.py
     ```
     After this step is complete, you will have a trained model in S3 and a live SageMaker endpoint.
 

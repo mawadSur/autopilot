@@ -1,30 +1,41 @@
 #!/usr/bin/env python3
 """
-Fetch historical klines from Binance and store monthly CSVs with headers:
-timestamp,open,high,low,close,volume
+history_coindesk.py — CoinDesk Data API version of your Binance history puller.
 
-Example:
-  python history.py --symbol ETHUSDT --interval 1m --start 2023-01-01 --end 2025-08-10 --out-dir eth_1m_data
-  # or: python history.py --days 1000  (backfill N days up to now)
+Outputs the same shape as history.py:
+  timestamp,open,high,low,close,volume
+
+Defaults:
+  • market     : coinbase
+  • instrument : ETH-USDT
+  • range      : last 3 years (UTC)
+  • out-dir    : eth_1m_data
+
+Notes:
+- This endpoint is capped at 2000 minute points per call; we page backwards using `to_ts`. :contentReference[oaicite:1]{index=1}
+- If you want to confirm the exact market/instrument mappings CoinDesk recognizes, see:
+  /spot/v1/markets/instruments (Markets + Instruments Mapped). :contentReference[oaicite:2]{index=2}
+
+
+Uses reusable coindesk_client.py to fetch minute OHLCV and normalize responses.
 """
 
 import os
 import time
-import math
 import argparse
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
-
-import pandas as pd
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 
+import pandas as pd
 
-# -------------------- Helpers --------------------
+from coindesk_client import CoinDeskConfig, CoinDeskClient, CoinDeskEndpoints
+
+
+# -------:contentReference[oaicite:4]{index=4}pers --------------------
 
 def parse_date(s: str) -> datetime:
-    """Parse YYYY-MM-DD (UTC midnight)."""
+    """Parse YYYY-MM-DD as UTC midnight."""
     return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
 
@@ -38,8 +49,14 @@ def next_month(dt: datetime) -> datetime:
     return dt.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
-def to_ms(dt: datetime) -> int:
-    return int(dt.timestamp() * 1000)
+def to_unix_s(dt: datetime) -> int:
+    return int(dt.timestamp())
+
+
+# -------------------- File helpers --------------------
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
 
 def safe_write_csv(df: pd.DataFrame, path: str) -> None:
@@ -49,198 +66,200 @@ def safe_write_csv(df: pd.DataFrame, path: str) -> None:
     os.replace(tmp, path)
 
 
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def build_month_path(out_dir: str, symbol: str, interval: str, month_dt: datetime) -> str:
+def build_month_path(out_dir: str, market: str, instrument: str, month_dt: datetime) -> str:
     y_m = month_dt.strftime("%Y-%m")
-    fname = f"{symbol.lower()}_{interval.lower()}_{y_m}.csv"
+    m = market.lower().replace(" ", "_")
+    inst = instrument.lower().replace("/", "-").replace("_", "-")
+    # Similar spirit to your Binance file naming (one file per month)
+    fname = f"{inst}_{m}_1m_{y_m}.csv"
     return os.path.join(out_dir, fname)
 
 
-def normalize_klines(klines: List[List]) -> pd.DataFrame:
-    """
-    Binance klines come as lists:
-    [
-      open_time, open, high, low, close, volume,
-      close_time, quote_asset_volume, num_trades,
-      taker_buy_base_volume, taker_buy_quote_volume, ignore
-    ]
-    """
-    if not klines:
-        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+def _normalize_minutes_payload(payload: dict) -> pd.DataFrame:
+    """Normalize OHLCV minutes from coindesk_client into history.py-compatible format."""
+    df = CoinDeskClient.normalize_ohlcv_minutes(payload)
+    if df.empty:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-    cols = [
-        "open_time","open","high","low","close","volume",
-        "close_time","qav","num_trades","taker_base_vol","taker_quote_vol","ignore"
-    ]
-    df = pd.DataFrame(klines, columns=cols)
-
-    df = df[["open_time", "open", "high", "low", "close", "volume"]].copy()
-    df.rename(columns={"open_time": "timestamp"}, inplace=True)
-
-    # Convert to UTC timestamp (ms) -> datetime ISO or keep ms; we keep ISO for readability
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    # Coerce numerics
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df.dropna(subset=["timestamp","open","high","low","close","volume"], inplace=True)
-    df.sort_values("timestamp", inplace=True)
-    # Final column order
-    return df[["timestamp","open","high","low","close","volume"]]
+    # convert unix seconds to UTC datetime for compatibility with history.py
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+    # volume_base -> volume
+    if "volume_base" in df.columns:
+        df["volume"] = df["volume_base"].astype(float)
+    return df[["timestamp", "open", "high", "low", "close", "volume"]]
 
 
-def merge_month(existing_path: str, new_df: pd.DataFrame) -> pd.DataFrame:
-    if os.path.exists(existing_path):
-        try:
-            old = pd.read_csv(existing_path, parse_dates=["timestamp"], dtype={
-                "open":"float64","high":"float64","low":"float64","close":"float64","volume":"float64"
-            })
-            combined = pd.concat([old, new_df], ignore_index=True)
-        except Exception:
-            # If the existing file is malformed, prefer the new data
-            combined = new_df.copy()
-    else:
-        combined = new_df.copy()
+# -------------------- Paging logic --------------------
 
-    combined.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
-    combined.sort_values("timestamp", inplace=True)
-    # Keep only the 6 canonical columns
-    return combined[["timestamp","open","high","low","close","volume"]]
-
-
-# -------------------- Downloader --------------------
-
-def fetch_month(
-    client: Client,
-    symbol: str,
-    interval: str,
-    start: datetime,
-    end: datetime,
-    tries: int = 5,
-    sleep_base: float = 1.5,
-) -> pd.DataFrame:
-    """Fetch klines for [start, end) and return normalized OHLCV."""
-    assert start.tzinfo is not None and end.tzinfo is not None, "Use timezone-aware datetimes (UTC)."
-    for attempt in range(tries):
-        try:
-            klines = client.get_historical_klines(
-                symbol=symbol,
-                interval=interval,
-                start_str=to_ms(start),
-                end_str=to_ms(end),
-                # limit=1000,  # To Limit the number of results returned in a single call (max 1000
-            )
-            return normalize_klines(klines)
-        except BinanceAPIException as e:
-            # Throttle / network: exponential backoff
-            wait = sleep_base * (2 ** attempt)
-            print(f"[warn] BinanceAPIException on {symbol} {interval} {start:%Y-%m}: {e}. Retry in {wait:.1f}s")
-            time.sleep(wait)
-        except Exception as e:
-            wait = sleep_base * (2 ** attempt)
-            print(f"[warn] Error on {symbol} {interval} {start:%Y-%m}: {e}. Retry in {wait:.1f}s")
-            time.sleep(wait)
-    # Final failure returns empty
-    return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
-
-
-def backfill_months(
-    client: Client,
-    symbol: str,
-    interval: str,
+def fetch_range_minutes(
+    client: CoinDeskClient,
+    *,
+    market: str,
+    instrument: str,
     start_dt: datetime,
     end_dt: datetime,
-    out_dir: str,
-    skip_complete: bool = True,
-) -> None:
-    """Iterate month-by-month and save/merge monthly CSVs with atomic writes."""
-    ensure_dir(out_dir)
-    start_m = month_floor(start_dt)
-    end_m = month_floor(end_dt)
+    limit: int,
+    aggregate: int,
+    fill: bool,
+    groups: Optional[str],
+    sleep_s: float,
+) -> pd.DataFrame:
+    """
+    Pull minute candles for [start_dt, end_dt) by paging backwards with to_ts.
+    """
+    start_s = to_unix_s(start_dt)
+    end_s = to_unix_s(end_dt)
 
-    cur = start_m
-    while cur <= end_m:
-        nxt = next_month(cur)
-        out_path = build_month_path(out_dir, symbol, interval, cur)
+    # Work backwards: anchor at the end boundary - 1 second
+    to_ts = end_s - 1
 
-        # If file exists and appears complete (last ts >= last second of month), skip
-        if skip_complete and os.path.exists(out_path):
-            try:
-                last_ts = pd.read_csv(out_path, usecols=["timestamp"]).timestamp
-                last_ts = pd.to_datetime(last_ts, utc=True).max()
-                if last_ts is not pd.NaT and last_ts >= (nxt - timedelta(seconds=1)):
-                    print(f"[skip] {cur:%Y-%m} already complete -> {out_path}")
-                    cur = nxt
-                    continue
-            except Exception:
-                pass  # fall through to re-fetch/merge
+    chunks: List[pd.DataFrame] = []
+    last_earliest_s: Optional[int] = None
 
-        print(f"[fetch] {symbol} {interval} {cur:%Y-%m} ...")
-        month_df = fetch_month(client, symbol, interval, cur, nxt)
-        if month_df.empty:
-            print(f"[warn] No data returned for {cur:%Y-%m}")
-            cur = nxt
-            continue
+    while to_ts >= start_s:
+        payload = client.get_ohlcv_minutes(
+            market=market,
+            instrument=instrument,
+            to_ts=to_ts,
+            limit=limit,
+            aggregate=aggregate,
+            fill=fill,
+            groups=groups,
+            response_format="JSON",
+        )
+        df = _normalize_minutes_payload(payload)
+        if df.empty:
+            break
 
-        merged = merge_month(out_path, month_df)
-        safe_write_csv(merged, out_path)
-        print(f"[save] {out_path}  rows={len(merged):,}")
+        # Filter to the requested window
+        ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        ts_i64 = ts.astype("int64")
 
-        # polite rate limit
-        time.sleep(0.5)
-        cur = nxt
+        # If it's ms-resolution (13 digits), convert ms->seconds; otherwise ns->seconds
+        # ms since epoch ~ 1e12–1e13, ns since epoch ~ 1e18–1e19
+        if ts_i64.max() < 10_000_000_000_000:   # < 1e13-ish => milliseconds
+            df_s = (ts_i64 // 1_000).astype("int64")
+        else:                                   # nanoseconds
+            df_s = (ts_i64 // 1_000_000_000).astype("int64")
+
+        df = df[(df_s >= start_s) & (df_s < end_s)]
+        if df.empty:
+            break
+
+        earliest_s = int(df["timestamp"].min().timestamp())
+        if last_earliest_s is not None and earliest_s >= last_earliest_s:
+            # Not making progress; stop to avoid loop
+            break
+        last_earliest_s = earliest_s
+
+        chunks.append(df)
+
+        # Page backwards: next request ends just before earliest candle we got
+        to_ts = earliest_s - 1
+
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+
+    if not chunks:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    out = pd.concat(chunks, ignore_index=True)
+    out = out.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    return out
 
 
 # -------------------- Main / CLI --------------------
 
-def main():
+def main() -> None:
     load_dotenv()
 
-    parser = argparse.ArgumentParser(description="Download Binance klines into monthly CSVs with headers.")
-    parser.add_argument("--symbol", default=os.getenv("SYMBOL", "ETHUSDT"))
-    parser.add_argument("--interval", default=os.getenv("INTERVAL", Client.KLINE_INTERVAL_1MINUTE))
-    parser.add_argument("--out-dir", default=os.getenv("DATA_DIR", "eth_1m_data"))
-    group = parser.add_mutually_exclusive_group(required=False)
-    group.add_argument("--days", type=int, help="Backfill this many days up to now (UTC).")
-    group.add_argument("--start", type=str, help="YYYY-MM-DD UTC (inclusive start).")
-    parser.add_argument("--end", type=str, help="YYYY-MM-DD UTC (exclusive end; default today).")
-    parser.add_argument("--skip-complete", action="store_true", default=True, help="Skip months already complete.")
-    parser.add_argument("--no-skip-complete", dest="skip_complete", action="store_false")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Download CoinDesk spot minute candles into monthly CSVs (Binance history.py-compatible output).")
 
-    api_key = os.getenv("BINANCE_KEY")
-    api_secret = os.getenv("BINANCE_SECRET")
-    if not api_key or not api_secret:
-        raise ValueError("Missing BINANCE_KEY / BINANCE_SECRET in environment (or .env)")
+    # Defaults you requested:
+    ap.add_argument("--market", type=str, default="coinbase", help="Default: coinbase")
+    ap.add_argument("--instrument", type=str, default="ETH-USDT", help="Default: ETH-USDT")
+    ap.add_argument("--out-dir", type=str, default="eth_1m_data", help="Default: eth_1m_data")
 
-    client = Client(api_key, api_secret, {"timeout": 30})
+    # Range controls
+    ap.add_argument("--days", type=int, default=None, help="Backfill N days up to now (UTC).")
+    ap.add_argument("--start", type=str, default=None, help="YYYY-MM-DD UTC (inclusive start).")
+    ap.add_argument("--end", type=str, default=None, help="YYYY-MM-DD UTC (exclusive end; default now).")
 
-    # Compute time range
+    # API paging controls
+    ap.add_argument("--limit", type=int, default=2000, help="Rows per request (endpoint max ~2000).")
+    ap.add_argument("--aggregate", type=int, default=1, help="Aggregate N minutes per candle. :contentReference[oaicite:6]{index=6}")
+    ap.add_argument("--no-fill", action="store_true", help="Disable fill=true (gap filling).")
+    ap.add_argument("--groups", type=str, default=None, help="Optional groups parameter.")
+    ap.add_argument("--sleep", type=float, default=0.2, help="Sleep between API calls (seconds).")
+
+    # Overrides
+    ap.add_argument("--base-url", type=str, default=os.getenv("COINDESK_BASE_URL", "https://data-api.coindesk.com"), help="Override base URL.")
+    ap.add_argument("--endpoint", type=str, default=os.getenv("COINDESK_OHLCV_ENDPOINT", "/spot/v1/historical/minutes"), help="Override endpoint path.")
+    args = ap.parse_args()
+
+    api_key = os.getenv("COINDESK_API_KEY", "").strip()
+    if not api_key:
+        raise SystemExit("Missing COINDESK_API_KEY in environment.")
+
     utc_now = datetime.now(timezone.utc)
-    if args.days:
-        start_dt = utc_now - timedelta(days=args.days)
-    elif args.start:
+
+    # Your requested default: last 3 years if user doesn't specify range
+    if args.days is not None:
+        end_dt = utc_now
+        start_dt = end_dt - timedelta(days=int(args.days))
+    elif args.start is not None:
         start_dt = parse_date(args.start)
+        end_dt = parse_date(args.end) if args.end else utc_now
     else:
-        # default: 2 years back
-        start_dt = utc_now - timedelta(days=int(os.getenv("HISTORY_DAYS", "730")))
+        end_dt = utc_now
+        start_dt = end_dt - timedelta(days=365 * 3)
 
-    end_dt = parse_date(args.end) if args.end else utc_now
+    if end_dt <= start_dt:
+        raise SystemExit("End must be after start.")
 
-    print(f"[config] SYM={args.symbol} INT={args.interval} RANGE={start_dt:%Y-%m-%d} -> {end_dt:%Y-%m-%d} OUT={args.out_dir}")
-    backfill_months(
-        client=client,
-        symbol=args.symbol,
-        interval=args.interval,
-        start_dt=start_dt,
-        end_dt=end_dt,
-        out_dir=args.out_dir,
-        skip_complete=args.skip_complete,
-    )
+    ensure_dir(args.out_dir)
+
+    endpoints = CoinDeskEndpoints(ohlcv_minutes=args.endpoint)
+    cfg = CoinDeskConfig(api_key=api_key, base_url=args.base_url, endpoints=endpoints)
+    client = CoinDeskClient(cfg)
+
+    print(f"[config] market={args.market} instrument={args.instrument} range={start_dt:%Y-%m-%d} -> {end_dt:%Y-%m-%d} out={args.out_dir}")
+
+    cur = month_floor(start_dt)
+    while cur < end_dt:
+        m_end = min(next_month(cur), end_dt)
+        w_start = max(cur, start_dt)
+        w_end = m_end
+
+        out_path = build_month_path(args.out_dir, args.market, args.instrument, cur)
+        print(f"[fetch] {args.market} {args.instrument} {cur:%Y-%m} ...")
+
+        df = fetch_range_minutes(
+            client,
+            market=args.market,
+            instrument=args.instrument,
+            start_dt=w_start,
+            end_dt=w_end,
+            limit=int(args.limit),
+            aggregate=int(args.aggregate),
+            fill=(not args.no_fill),
+            groups=args.groups,
+            sleep_s=float(args.sleep),
+        )
+
+        if df.empty:
+            print(f"[warn] No data returned for {cur:%Y-%m}")
+        else:
+            # Ensure column order matches your Binance script exactly
+            df = df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+            safe_write_csv(df, out_path)
+            print(f"[save] {out_path} rows={len(df):,}")
+
+        cur = next_month(cur)
+
     print("✅ Done.")
+
 
 if __name__ == "__main__":
     main()

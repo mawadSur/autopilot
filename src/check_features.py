@@ -68,9 +68,25 @@ def check_tf_shift():
     assert max_diff < 1e-8, f"TF shift mismatch: max_diff={max_diff}"
 
 
+def check_tf_idempotent():
+    df = _build_ohlcv(180)
+    first = compute_features(df)
+    second = compute_features(first)
+    # No tf*_x/_y artifacts
+    bad_cols = [c for c in second.columns if (
+        (c.startswith("tf5_") or c.startswith("tf15_") or c.startswith("tf60_")) and
+        (c.endswith("_x") or c.endswith("_y"))
+    )]
+    assert not bad_cols, f"Found tf merge artifacts: {bad_cols}"
+    # Canonical tf columns exist
+    for c in ("tf5_log_ret_1", "tf15_log_ret_1", "tf60_log_ret_1"):
+        assert c in second.columns, f"Missing canonical TF column: {c}"
+
+
 def main():
     check_required_columns()
     check_tf_shift()
+    check_tf_idempotent()
     print("✅ Feature checks passed.")
 
 

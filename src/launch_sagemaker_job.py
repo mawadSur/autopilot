@@ -82,7 +82,7 @@ def build_parser():
     p.add_argument("--region", default=os.getenv("AWS_REGION", "us-east-1"))
     p.add_argument("--bucket", default=os.getenv("S3_BUCKET_NAME"), required=False)
     p.add_argument("--prefix", default=os.getenv("S3_PREFIX", "eth-1m"))
-    p.add_argument("--instance-type", default=os.getenv("TRAIN_INSTANCE_TYPE", "ml.g5.2xlarge"))
+    p.add_argument("--instance-type", default=os.getenv("TRAIN_INSTANCE_TYPE", "ml.g5.48xlarge"))
     p.add_argument("--instance-count", type=int, default=int(os.getenv("TRAIN_INSTANCE_COUNT", 1)))
     p.add_argument("--py-version", default=os.getenv("PY_VERSION", "py310"))
     p.add_argument("--framework-version", default=os.getenv("FRAMEWORK_VERSION", "2.2.0"))

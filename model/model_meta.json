@@ -1,5 +1,5 @@
 {
-  "model_type": "performer_bilstm",
+  "model_type": "lstm_attention",
   "framework": "pytorch",
   "feature_scaling": true,
   "scaler_type": "standard",

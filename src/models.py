@@ -6,6 +6,11 @@ Import this everywhere instead of redefining the model:
 
 The design is intentionally minimal and framework-agnostic, but robust enough for
 your training/backtest/inference use cases.
+
+Note on legacy architectures (Feb 2026):
+- Removed PerformerBiLSTM and the regression LSTM variants after sustained underperformance and added maintenance cost.
+- Maintained winners: TransformerClassifier and LSTMAttentionClassifier (and its alias LSTMClassifier for back-compat).
+  build_model_from_meta will now reject the legacy model_type values and prompt retraining.
 """
 
 from __future__ import annotations
@@ -294,279 +299,6 @@ class LSTMClassifier(LSTMAttentionClassifier):
         )
 
 
-class LSTMAttentionRegressor(nn.Module):
-    """LSTM regressor with additive attention for time-series regression."""
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int = 128,
-        num_layers: int = 2,
-        dropout: float = 0.3,
-        bidirectional: bool = True,
-        num_classes: int = 1,  # Fixed to 1 for regression
-    ):
-        super().__init__()
-        self.save_hyperparameters = {
-            "input_size": input_size,
-            "hidden_size": hidden_size,
-            "num_layers": num_layers,
-            "dropout": dropout,
-            "bidirectional": bidirectional,
-            "num_classes": num_classes,
-        }
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=bidirectional,
-            batch_first=True,
-        )
-        self.dropout = nn.Dropout(p=0.2)
-        direction_factor = 2 if bidirectional else 1
-        embed_dim = hidden_size * direction_factor
-        self.attn = Attention(input_dim=embed_dim, attn_dim=hidden_size)
-        self.head = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_size // 2, num_classes),
-        )
-        self._attn_weights: Optional[torch.Tensor] = None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, F]
-        output, _ = self.lstm(x)  # [B, T, H*D]
-        output = self.dropout(output)
-        context, weights = self.attn(output)  # [B, H*D], [B, T]
-        self._attn_weights = weights
-        output = self.head(context)  # [B, 1]
-        return output
-
-class LSTMRegressor(nn.Module):
-    """Simple LSTM regressor without attention for time-series regression."""
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int = 128,
-        num_layers: int = 2,
-        dropout: float = 0.3,
-        bidirectional: bool = True,
-        num_classes: int = 1,  # Fixed to 1 for regression
-    ):
-        super().__init__()
-        self.save_hyperparameters = {
-            "input_size": input_size,
-            "hidden_size": hidden_size,
-            "num_layers": num_layers,
-            "dropout": dropout,
-            "bidirectional": bidirectional,
-            "num_classes": num_classes,
-        }
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=bidirectional,
-            batch_first=True,
-        )
-        self.dropout = nn.Dropout(p=0.2)
-        direction_factor = 2 if bidirectional else 1
-        embed_dim = hidden_size * direction_factor
-        self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Sequential(
-            nn.Linear(embed_dim, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_size // 2, num_classes),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, F]
-        output, _ = self.lstm(x)  # [B, T, H*D]
-        output = self.dropout(output)
-        pooled = torch.mean(output, dim=1)  # Mean pooling over timesteps [B, H*D]
-        pooled = self.norm(pooled)
-        output = self.head(pooled)  # [B, 1]
-        return output
-
-
-# --------------------------
-# Performer-style linear attention block (approx FAVOR+)
-# reference: https://arxiv.org/abs/2009.14794
-# --------------------------
-class RandomFeatureMap(nn.Module):
-    """
-    Random feature map for FAVOR+/Performer-style linear attention.
-    We implement a stable, commonly-used map: phi(x) = elu(x) + 1.
-    This is the practical variant used in many linear-attention implementations.
-    (Exact FAVOR+ uses orthogonal random features and exponentials; to keep code
-    stable and simple we use elu+1.)
-    """
-
-    def __init__(self, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor):
-        # x: (..., dim)
-        return torch.nn.functional.elu(x) + 1.0 + self.eps
-
-
-class LinearAttention(nn.Module):
-    """
-    Linear attention using feature maps: attention(Q, K, V) ≈ phi(Q) (phi(K)^T V) / normalization
-    Implementation works with batch-first tensors.
-    """
-
-    def __init__(self, dim, feature_map=None, causal: bool = False):
-        super().__init__()
-        self.dim = dim
-        self.feature_map = feature_map or RandomFeatureMap()
-        self.causal = causal
-
-    def forward(self, q, k, v, mask: Optional[torch.Tensor] = None):
-        # q, k, v: (B, T, D)
-        # Compute phi(q), phi(k)
-        phi_q = self.feature_map(q)        # (B, T, D)
-        phi_k = self.feature_map(k)        # (B, T, D)
-
-        # If a mask is provided, zero out masked positions in phi_k and v
-        if mask is not None:
-            # mask: (B, T) or (B, 1, T)
-            mask_ = mask.unsqueeze(-1).to(q.dtype)  # (B, T, 1)
-            phi_k = phi_k * mask_
-            v = v * mask_
-
-        # Compute K^T V: (B, D, D_v)  where D_v = v.size(-1)
-        kv = torch.einsum('btd, bte -> bde', phi_k, v)  # (B, D, Vdim)
-
-        # compute normalization (fixed)
-        z = torch.einsum('btd, bd -> bt', phi_q, phi_k.sum(dim=1))
-        z = z.unsqueeze(-1).clamp(min=1e-6)
-
-        out = torch.einsum('btd, bde -> bte', phi_q, kv)
-        out = out / z
-        return out
-
-
-class PerformerBlock(nn.Module):
-    def __init__(self, dim, n_heads=8, head_dim=32, dropout=0.0):
-        super().__init__()
-        self.dim = dim
-        self.n_heads = n_heads
-        self.head_dim = head_dim
-        self.total_head_dim = n_heads * head_dim
-        assert self.total_head_dim == dim, "dim must equal n_heads * head_dim"
-
-        # projectors
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
-
-        self.attn = LinearAttention(dim=head_dim)  # will be applied per-head
-        self.dropout = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ff = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.ReLU(),
-            nn.Linear(dim * 4, dim),
-            nn.Dropout(dropout)
-        )
-
-    def _split_heads(self, x):
-        # x: (B, T, dim) -> (B, n_heads, T, head_dim)
-        B, T, D = x.shape
-        x = x.view(B, T, self.n_heads, self.head_dim).permute(0,2,1,3)
-        return x
-
-    def _merge_heads(self, x):
-        # x: (B, n_heads, T, head_dim) -> (B, T, dim)
-        x = x.permute(0,2,1,3).contiguous()
-        B, T, _, _ = x.shape
-        return x.view(B, T, self.total_head_dim)
-
-    def forward(self, x, mask: Optional[torch.Tensor] = None):
-        # x: (B, T, dim)
-        B, T, D = x.shape
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        qh = self._split_heads(q)  # (B, H, T, head_dim)
-        kh = self._split_heads(k)
-        vh = self._split_heads(v)
-
-        # compute per-head linear attention
-        heads_out = []
-        for hi in range(self.n_heads):
-            qi = qh[:, hi, :, :]  # (B, T, head_dim)
-            ki = kh[:, hi, :, :]
-            vi = vh[:, hi, :, :]
-            out_hi = self.attn(qi, ki, vi, mask=mask)  # (B, T, head_dim)
-            heads_out.append(out_hi)
-
-        heads_out = torch.stack(heads_out, dim=1)  # (B, H, T, head_dim)
-        out = self._merge_heads(heads_out)  # (B, T, dim)
-        out = self.out_proj(out)
-        out = self.dropout(out)
-
-        # Residual + FFN
-        x = self.norm1(x + out)
-        x = self.norm2(x + self.ff(x))
-        return x
-
-# --------------------------
-# Full model: Performer -> BiLSTM x2 -> FC
-# --------------------------
-class PerformerBiLSTM(nn.Module):
-    def __init__(self, input_dim, model_dim=128, n_heads=8, head_dim=16,
-                 lstm_hidden=128, lstm_layers=1, dropout=0.0, out_dim=1):
-        super().__init__()
-        print(n_heads, head_dim, model_dim)
-        assert n_heads * head_dim == model_dim, "n_heads * head_dim must equal model_dim"
-
-        self.input_linear = nn.Linear(input_dim, model_dim)
-        self.pos_dropout = nn.Dropout(dropout)
-
-        self.performer = PerformerBlock(dim=model_dim, n_heads=n_heads, head_dim=head_dim, dropout=dropout)
-
-        # two BiLSTM layers
-        self.bilstm1 = nn.LSTM(input_size=model_dim, hidden_size=lstm_hidden,
-                               num_layers=1, batch_first=True, bidirectional=True)
-        self.bilstm2 = nn.LSTM(input_size=2 * lstm_hidden, hidden_size=lstm_hidden,
-                               num_layers=1, batch_first=True, bidirectional=True)
-
-        # FC head
-        self.fc = nn.Sequential(
-            nn.Linear(2 * lstm_hidden, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, out_dim)
-        )
-
-    def forward(self, x, mask: Optional[torch.Tensor] = None):
-        # x: (B, T, input_dim)
-        x = self.input_linear(x)  # (B, T, model_dim)
-        x = self.pos_dropout(x)
-
-        x = self.performer(x, mask=mask)  # (B, T, model_dim)
-
-        # BiLSTM layers: return sequences
-        out1, _ = self.bilstm1(x)  # (B, T, 2*hidden)
-        out2, _ = self.bilstm2(out1)  # (B, T, 2*hidden)
-
-        # Predict one-step-ahead return / price for last timestep of sequence:
-        # select last time-step representation
-        last = out2[:, -1, :]  # (B, 2*hidden)
-        y = self.fc(last)  # (B, out_dim)
-        return y
-
-
 # ----------------------------
 # Metadata utilities
 # ----------------------------
@@ -647,28 +379,7 @@ def build_model_from_meta(meta: Union[ModelMeta, Dict[str, Any]]) -> nn.Module:
             dropout=meta.dropout,
             num_classes=meta.num_classes,
         )
-    if model_type in {"lstm_regressor", "lstm_attention_regressor"}:
-        return LSTMRegressor(
-            input_size=meta.input_size,
-            hidden_size=meta.hidden_size,
-            num_layers=meta.num_layers,
-            dropout=meta.dropout,
-            bidirectional=meta.bidirectional,
-            num_classes=meta.num_classes,
-        )
-    if model_type in {"performer_bilstm", "performer"}:
-        return PerformerBiLSTM(
-            input_dim=meta.input_size,
-            model_dim=meta.hidden_size,
-            n_heads=8,
-            head_dim=getattr(meta, "head_dim", 16) or 16,
-            lstm_hidden=meta.hidden_size,
-            lstm_layers=meta.num_layers,
-            dropout=meta.dropout,
-            out_dim=meta.num_classes,
-        )
-    
-    if model_type in {"lstm_attention", "lstm_attention_classifier"}:
+    if model_type in {"lstm_attention", "lstm_attention_classifier", "lstm_classifier"}:
         return LSTMAttentionClassifier(
             input_size=meta.input_size,
             hidden_size=meta.hidden_size,
@@ -678,7 +389,15 @@ def build_model_from_meta(meta: Union[ModelMeta, Dict[str, Any]]) -> nn.Module:
             num_classes=meta.num_classes,
         )
 
-    return LSTMClassifier(
+    legacy = {"lstm_regressor", "lstm_attention_regressor", "performer_bilstm", "performer"}
+    if model_type in legacy:
+        raise ValueError(
+            f"Model type '{model_type}' was deprecated after underperforming and maintenance burden. "
+            "Please retrain using 'transformer' or 'lstm_attention' (the two maintained winners)."
+        )
+
+    # Fallback to maintained LSTM attention classifier for unknown types
+    return LSTMAttentionClassifier(
         input_size=meta.input_size,
         hidden_size=meta.hidden_size,
         num_layers=meta.num_layers,
