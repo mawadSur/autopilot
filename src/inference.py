@@ -31,7 +31,7 @@ except Exception:
 
 # Project utils/models
 from utils import load_meta, build_windows
-from models import build_model_from_meta
+from models import build_model_from_meta, load_checkpoint_state, load_state_dict_flexible
 from config import cfg
 
 
@@ -44,8 +44,12 @@ def model_fn(model_dir: str):
 
     model = build_model_from_meta(meta)
     weights_path = os.path.join(model_dir, meta.get("model_state_path", "model.pt"))
-    state = torch.load(weights_path, map_location="cpu")
-    model.load_state_dict(state, strict=False)
+    state, ckpt_meta = load_checkpoint_state(weights_path)
+    if int(ckpt_meta.get("feature_count") or 0) != len(feature_cols):
+        raise ValueError(
+            "Model retrain required for profitability — delete old checkpoint in model_dir and retrain."
+        )
+    load_state_dict_flexible(model, state)
     model.eval()
 
     scaler = None

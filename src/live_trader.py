@@ -41,7 +41,7 @@ try:
 except Exception:  # pragma: no cover - ccxt optional
     ccxt = None
 
-from utils import compute_features, load_model_bundle, fmt_money, FEATURE_COLUMNS
+from utils import compute_features, load_model_bundle, fmt_money, FEATURE_COLUMNS_PROFITABLE, align_feature_columns
 from config import cfg
 try:
     from simulator import SimulationConfig, PortfolioSimulator, Bar
@@ -221,11 +221,11 @@ def run_loop() -> None:
 
     num_classes = int(meta.get("num_classes", 1))
     window = int(meta.get("window_size", 1))
-    feature_cols = list(meta.get("feature_cols", []))
-    if not feature_cols:
+    feature_cols_raw = meta.get("feature_cols", [])
+    if not feature_cols_raw:
         raise ValueError("model_meta.json missing feature_cols; cannot stream.")
-    if feature_cols != FEATURE_COLUMNS:
-        raise ValueError(f"Feature list mismatch: meta has {feature_cols}, expected {FEATURE_COLUMNS}")
+    expected_size = int(meta.get("input_size") or len(feature_cols_raw) or len(FEATURE_COLUMNS_PROFITABLE))
+    feature_cols = align_feature_columns(feature_cols_raw, expected_size=expected_size)
 
     # Load optimizer-derived live config overrides
     best_cfg = load_best_live_config(model_dir)

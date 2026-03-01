@@ -12,7 +12,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from utils import compute_features, FEATURE_COLUMNS
+from utils import compute_features, FEATURE_COLUMNS_PROFITABLE
 
 
 def _build_ohlcv(n: int = 120) -> pd.DataFrame:
@@ -32,8 +32,8 @@ def _build_ohlcv(n: int = 120) -> pd.DataFrame:
 def check_required_columns():
     df = _build_ohlcv()
     feats = compute_features(df)
-    missing = [c for c in FEATURE_COLUMNS if c not in feats.columns]
-    assert not missing, f"Missing FEATURE_COLUMNS: {missing}"
+    missing = [c for c in FEATURE_COLUMNS_PROFITABLE if c not in feats.columns]
+    assert not missing, f"Missing FEATURE_COLUMNS_PROFITABLE: {missing}"
 
 
 def check_tf_shift():

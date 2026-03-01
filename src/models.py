@@ -32,6 +32,8 @@ except Exception:  # pragma: no cover
 import warnings
 warnings.filterwarnings("ignore")
 
+PROFIT_MODEL_VERSION = "profit_v2"
+
 # ----------------------------
 # Model definition
 # ----------------------------
@@ -194,7 +196,7 @@ class LSTMAttentionClassifier(nn.Module):
 
         self,
 
-        input_size: int,
+        input_size: Optional[int] = None,
 
         hidden_size: int = 128,
 
@@ -209,6 +211,9 @@ class LSTMAttentionClassifier(nn.Module):
     ):
 
         super().__init__()
+        if input_size is None:
+            raise ValueError("input_size is required for LSTMAttentionClassifier")
+        input_size = int(input_size)
 
         self.save_hyperparameters = {
 
@@ -330,6 +335,7 @@ class ModelMeta:
     window_size: int = 150
     buy_threshold: float = 0.60
     tx_cost: float = 0.0008
+    profitability_score: float = 0.0
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "ModelMeta":
@@ -353,6 +359,7 @@ class ModelMeta:
             window_size=int(d.get("window_size", 150)),
             buy_threshold=float(d.get("buy_threshold", 0.60)),
             tx_cost=float(d.get("tx_cost", 0.0008)),
+            profitability_score=float(d.get("profitability_score", 0.0)),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -428,6 +435,65 @@ def load_model_state(model: nn.Module, state_path: str, strict: bool = False) ->
     state = torch.load(state_path, map_location="cpu", weights_only=False)
     # Allow non-strict to tolerate minor key mismatches or buffer names
     model.load_state_dict(state, strict=strict)
+
+
+def load_checkpoint_state(state_path: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    """
+    Load a checkpoint saved via torch.save({"state_dict": ..., "metadata": ...}).
+    Enforces presence of profitability metadata and version.
+    """
+    raw = torch.load(state_path, map_location="cpu", weights_only=False)
+    if not isinstance(raw, dict) or "state_dict" not in raw:
+        raise ValueError(
+            "Checkpoint missing metadata. Retrain required — delete old checkpoint and retrain."
+        )
+    state_dict = raw.get("state_dict")
+    metadata = raw.get("metadata")
+    if not isinstance(state_dict, dict) or not isinstance(metadata, dict):
+        raise ValueError(
+            "Checkpoint metadata missing. Retrain required — delete old checkpoint and retrain."
+        )
+    version = str(metadata.get("version", "")).strip()
+    if version != PROFIT_MODEL_VERSION:
+        raise ValueError(
+            f"Model version mismatch (checkpoint={version or 'unknown'}, expected={PROFIT_MODEL_VERSION}). "
+            "Retrain required — delete old checkpoint and retrain."
+        )
+    return state_dict, metadata
+
+
+def _copy_input_weights(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    """Copy overlapping input columns from src into dst (for input-size migrations)."""
+    out = dst.clone()
+    if src.ndim != 2 or dst.ndim != 2:
+        return out
+    cols = min(src.shape[1], dst.shape[1])
+    out[:, :cols] = src[:, :cols]
+    return out
+
+
+def load_state_dict_flexible(model: nn.Module, state_dict: Dict[str, torch.Tensor]):
+    """
+    Load state_dict with safe remapping for input-size changes.
+    Only adapts the first-layer input projection (LSTM or Transformer).
+    """
+    target_state = model.state_dict()
+    remapped: Dict[str, torch.Tensor] = {}
+
+    for key, tensor in state_dict.items():
+        if key not in target_state:
+            continue
+        if tensor.shape == target_state[key].shape:
+            remapped[key] = tensor
+            continue
+        if key.startswith("lstm.weight_ih_l"):
+            remapped[key] = _copy_input_weights(tensor, target_state[key])
+            continue
+        if key == "input_proj.weight":
+            remapped[key] = _copy_input_weights(tensor, target_state[key])
+            continue
+
+    return model.load_state_dict(remapped, strict=False)
 
 
 def load_scaler(scaler_path: Optional[str]):

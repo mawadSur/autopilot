@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, ClassVar
 
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -18,8 +18,11 @@ except Exception:
 # NOTE: If you need CLI overrides, prefer environment variables or set fields directly
 # before importing `cfg`, e.g. `TRADING_CAPITAL=20000 python src/backtest.py`.
 
+FEATURE_VERSION = "v2026-02-119"
+
 
 class TradingConfig(BaseSettings):
+    FEATURE_VERSION: ClassVar[str] = FEATURE_VERSION
     # Data / model
     data_dir: str = Field("eth_1m_data", env="DATA_DIR")
     model_dir: str = Field("model", env="MODEL_DIR")
@@ -47,6 +50,9 @@ class TradingConfig(BaseSettings):
     margin: float = Field(0.25, env="MARGIN")
     consensus: int = Field(2, env="CONSENSUS")
 
+    # Profit mode
+    profit_mode: bool = Field(True, env="PROFIT_MODE")
+
     # Regression thresholds
     up_thr: float = Field(0.002, env="UP_THR")
     down_thr: float = Field(0.002, env="DOWN_THR")
@@ -58,7 +64,6 @@ class TradingConfig(BaseSettings):
     allow_shorts: bool = Field(False, env="ALLOW_SHORTS")
     max_leverage: float = Field(1.0, env="MAX_LEVERAGE")
     risk_pct_per_trade: float = Field(0.004, env="RISK_PCT_PER_TRADE")
-    capital: Optional[float] = Field(None, env="CAPITAL")
     csv_path: str = Field("", env="CSV_PATH")
     testnet: bool = Field(True, env="TESTNET")
     real: bool = Field(False, env="REAL")

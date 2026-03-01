@@ -29,7 +29,8 @@ from utils import (
     build_windows,
     load_model_bundle,
     compute_features,
-    FEATURE_COLUMNS,
+    FEATURE_COLUMNS_PROFITABLE,
+    align_feature_columns,
 )
 try:
     from simulator import simulate_trades_with_tp_sl, print_portfolio_report
@@ -49,9 +50,11 @@ def main():
 
     # Load model + meta
     model, scaler, meta = load_model_bundle(args.model_dir)
-    feature_cols = list(meta["feature_cols"])  # strict: must exist
-    if feature_cols != FEATURE_COLUMNS:
-        raise ValueError(f"Feature list mismatch: meta has {feature_cols}, expected {FEATURE_COLUMNS}")
+    expected_size = int(meta.get("input_size") or len(meta.get("feature_cols") or []) or len(FEATURE_COLUMNS_PROFITABLE))
+    try:
+        feature_cols = align_feature_columns(meta.get("feature_cols"), expected_size=expected_size)
+    except ValueError as exc:
+        raise SystemExit(f"Model feature mismatch: {exc}")
     window_size = int(meta.get("window_size", 150))
     buy_threshold = float(meta.get("buy_threshold", cfg.thr_long))
     fee_pct = float(meta.get("tx_cost", cfg.fee_pct))

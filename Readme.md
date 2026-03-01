@@ -97,6 +97,7 @@ The project follows a standard MLOps workflow:
     ```bash
     pip install -r requirements.txt
     ```
+    Note: If you see TensorFlow `runtime_version` warnings, re-pin `protobuf==5.28.3` (or 5.28.x) to match the generated protos.
     (TA-Lib is required; if pip fails on wheels, install the conda-forge package: `conda install -c conda-forge ta-lib`)
 
 4.  **Set up environment variables**
@@ -190,6 +191,25 @@ aws s3 cp s3://sagemaker-pytorch-2025-07-17-03-15-00-123/output/model.tar.gz .
 
 
 4.  **Connect a Frontend**: The API is now running on `http://127.0.0.1:8000`. You can connect a client to the WebSocket at `ws://127.0.0.1:8000/ws/signal-stream`.
+
+## How to Stay Profitable
+
+This project is profit-obsessed by design. The training pipeline now:
+- Computes forward returns and ranks features by correlation to 5-minute forward return.
+- Drops low-signal features and any feature that increases walk-forward drawdown.
+- Trains only on the most profitable subset (fast + generalizes better).
+- Writes a `profit_report.json` after every backtest with EV/expectancy and a retrain recommendation.
+
+**Recommended flow**
+1. Run the profit-optimized retrain command:
+   ```bash
+   python src/retrain_profit.py
+   ```
+2. Backtest the new model:
+   ```bash
+   python src/backtest.py --model-dir model/seq_90
+   ```
+3. If `profit_report.json` says “Retrain recommended”, rerun step 1.
 
 ## API Endpoints
 

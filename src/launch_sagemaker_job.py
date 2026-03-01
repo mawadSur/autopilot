@@ -25,7 +25,7 @@ from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from sagemaker.pytorch import PyTorch, PyTorchModel
 from sagemaker.inputs import TrainingInput
-from utils import FEATURE_COLUMNS
+from utils import FEATURE_COLUMNS_PROFITABLE
 
 # Load environment variables from .env if present
 load_dotenv()
@@ -121,7 +121,7 @@ def build_parser():
     p.add_argument("--k-sl", type=float, default=1.0)
     p.add_argument("--atr-col", type=str, default="atr_14")
     p.add_argument("--feature-cols", nargs="*", default=None,
-                   help="Optional explicit feature list; defaults to shared FEATURE_COLUMNS")
+                   help="Optional explicit feature list; defaults to shared FEATURE_COLUMNS_PROFITABLE")
 
     # Deployment controls (defaults from .env)
     p.add_argument("--deploy", action="store_true", default=True)
@@ -194,7 +194,7 @@ def main():
         "k-tp": args.k_tp,
         "k-sl": args.k_sl,
         "atr-col": args.atr_col,
-        "feature-cols": " ".join(args.feature_cols) if args.feature_cols else " ".join(FEATURE_COLUMNS),
+        "feature-cols": " ".join(args.feature_cols) if args.feature_cols else " ".join(FEATURE_COLUMNS_PROFITABLE),
     }
     if args.window_size is not None:
         hyperparameters["window-size"] = args.window_size

@@ -15,7 +15,8 @@ import json
 import os
 import random
 import time
-from dataclasses import dataclass
+from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 from collections import deque
@@ -28,15 +29,15 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
-from torch.utils.data import IterableDataset, DataLoader, get_worker_info
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.utils.data import IterableDataset, DataLoader, get_worker_info, WeightedRandomSampler
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from utils import compute_features, normalize_headers
 from models import (
     ModelMeta,
     TransformerClassifier,
     build_model_from_meta as build_model_from_meta_core,
 )
-from utils import FEATURE_COLUMNS, DEFAULT_SEQ_LENS
+from utils import FEATURE_COLUMNS_PROFITABLE, DEFAULT_SEQ_LENS, ProfitOptimizedFeatureEngineer
 try:
     from streamer import KlineStreamer
 except ModuleNotFoundError:  # when executed from src/ without repo root on sys.path
@@ -46,6 +47,8 @@ except ModuleNotFoundError:  # when executed from src/ without repo root on sys.
         sys.path.append(str(ROOT))
     from streamer import KlineStreamer
 from logging_utils import logger, setup_logging
+
+FEATURE_COLUMNS_SELECTED: List[str] = []
 
 # Simple CSV lister reused from KlineStreamer
 def _list_csvs(path: str) -> List[Path]:
@@ -190,6 +193,13 @@ def get_device(preferred: Optional[str] = None, force_cpu_on_mac: bool = True) -
     return torch.device("cpu")
 
 
+def _format_pred_distribution(pred_dist: Dict[int, float], class_names: List[str]) -> str:
+    return ", ".join(
+        f"{class_names[i]}={float(pred_dist.get(i, 0.0)) * 100.0:.2f}%"
+        for i in range(len(class_names))
+    )
+
+
 def log_epoch_summary(
     *,
     fold_idx: int,
@@ -205,6 +215,13 @@ def log_epoch_summary(
     recalls: List[float],
     pred_dist: Dict[int, float],
     expected_value: Optional[float] = None,
+    filtered_ev: Optional[float] = None,
+    risk_adjusted_ev: Optional[float] = None,
+    confidence_threshold: Optional[float] = None,
+    best_ev_so_far: Optional[float] = None,
+    ev_not_improved_streak: Optional[int] = None,
+    collapse_reason: Optional[str] = None,
+    collapse_false_positive: bool = False,
 ) -> None:
     """Log a compact epoch summary with per-class diagnostics."""
     precision_lines = [f"  {name}: {float(value):.4f}" for name, value in zip(class_names, precisions)]
@@ -233,8 +250,143 @@ def log_epoch_summary(
     ]
     if expected_value is not None:
         lines.append(f"Expected Value per Trade: {float(expected_value):.4f}")
+    if filtered_ev is not None:
+        if confidence_threshold is not None:
+            lines.append(
+                f"Filtered EV (conf>{float(confidence_threshold):.2f}): {float(filtered_ev):.4f}"
+            )
+        else:
+            lines.append(f"Filtered EV: {float(filtered_ev):.4f}")
+    if risk_adjusted_ev is not None:
+            lines.append(f"Risk-Adjusted EV: {float(risk_adjusted_ev):.4f}")
+    if best_ev_so_far is not None:
+        lines.append(f"Best EV so far: {float(best_ev_so_far):.4f}")
+    if ev_not_improved_streak is not None:
+        lines.append(f"Current streak without EV improvement: {int(ev_not_improved_streak)}")
+    if collapse_reason:
+        verdict = "false_positive" if collapse_false_positive else "triggered"
+        lines.append(f"Collapse Check: reason='{collapse_reason}' verdict={verdict}")
+        lines.append(f"Collapse Pred Dist: {_format_pred_distribution(pred_dist, class_names)}")
     lines.append("=" * 60)
     logger.info("\n".join(lines))
+
+
+@dataclass
+class CollapseCheckResult:
+    triggered: bool
+    reason: Optional[str] = None
+    false_positive: bool = False
+
+
+@dataclass
+class CollapseCheckState:
+    fold_idx: int
+    total_folds: int
+    min_epoch: int = 4  # disallow collapse until after epoch 4 inclusive
+    profit_patience: int = 6
+    no_improve_patience: int = 8
+    consecutive_low_epochs: int = 3
+    low_threshold: float = 0.03
+    dummy_pass_done: bool = False
+    best_ev: float = -float("inf")
+    best_macro_f1: float = -float("inf")
+    profit_flat_epochs: int = 0
+    no_improve_epochs: int = 0
+    short_low_streak: int = 0
+    long_low_streak: int = 0
+    last_pred_dist: Dict[int, float] = field(default_factory=dict)
+
+
+def detect_model_collapse(
+    state: CollapseCheckState,
+    *,
+    epoch: int,
+    pred_dist: Dict[int, float],
+    macro_f1: float,
+    expected_value: Optional[float],
+) -> CollapseCheckResult:
+    """Return collapse verdict while enforcing the new guardrails."""
+    state.last_pred_dist = {int(k): float(v) for k, v in pred_dist.items()}
+    ev = float(expected_value) if expected_value is not None else 0.0
+    macro = float(macro_f1)
+    eps = 1e-9
+
+    ev_improved = ev > state.best_ev + eps
+    macro_improved = macro > state.best_macro_f1 + eps
+
+    if ev_improved:
+        state.best_ev = ev
+        state.profit_flat_epochs = 0
+    else:
+        state.profit_flat_epochs += 1
+    if macro_improved:
+        state.best_macro_f1 = macro
+
+    if ev_improved or macro_improved:
+        state.no_improve_epochs = 0
+    else:
+        state.no_improve_epochs += 1
+
+    short_pct = float(pred_dist.get(0, 0.0))
+    long_pct = float(pred_dist.get(2, 0.0))
+    # Track consecutive epochs where short/long predictions are below 3%.
+    state.short_low_streak = state.short_low_streak + 1 if short_pct < state.low_threshold else 0
+    state.long_low_streak = state.long_low_streak + 1 if long_pct < state.low_threshold else 0
+
+    if not state.dummy_pass_done:
+        state.dummy_pass_done = True
+        # Allow a warmup validation pass before any collapse logic runs.
+        return CollapseCheckResult(triggered=False)
+
+    if epoch <= 1 or epoch <= state.min_epoch:
+        # Respect the minimum epoch guardrail (no collapse until after epoch 4).
+        return CollapseCheckResult(triggered=False)
+
+    if (
+        state.short_low_streak >= state.consecutive_low_epochs
+        or state.long_low_streak >= state.consecutive_low_epochs
+    ):  # Imbalance only after 3 consecutive low-share epochs.
+        return CollapseCheckResult(triggered=True, reason="imbalance")
+
+    if state.profit_flat_epochs >= state.profit_patience:
+        return CollapseCheckResult(triggered=True, reason="profit_stagnation")
+
+    if state.no_improve_epochs >= state.no_improve_patience:
+        return CollapseCheckResult(triggered=True, reason="no_improvement")
+
+    return CollapseCheckResult(triggered=False)
+
+
+def should_stop(
+    result: CollapseCheckResult,
+    *,
+    fold_idx: int,
+    pred_dist: Dict[int, float],
+    class_names: List[str],
+) -> Tuple[bool, CollapseCheckResult]:
+    """Log collapse context and optionally halt training."""
+    if not result.triggered or not result.reason:
+        return False, result
+
+    dist_str = _format_pred_distribution(pred_dist, class_names)
+    if fold_idx >= 18:
+        # Do not stop folds >=18; just log a warning and continue.
+        result.false_positive = True
+        logger.warning(
+            "[collapse] fold=%d reason='%s' triggered but ignored (fold>=18) | pred_dist=%s",
+            fold_idx,
+            result.reason,
+            dist_str,
+        )
+        return False, result
+
+    logger.warning(
+        "[collapse] fold=%d reason='%s' -> stopping | pred_dist=%s",
+        fold_idx,
+        result.reason,
+        dist_str,
+    )
+    return True, result
 
 
 def compute_expected_value(
@@ -245,31 +397,46 @@ def compute_expected_value(
     take_profit: float,
     stop_loss: float,
     trading_fee: float,
-) -> float:
-    """Estimate expected value per executed trade from triple-barrier outcomes.
+    confidence_threshold: float = 0.0,
+) -> Tuple[float, float, float, Dict[int, List[float]], List[float], np.ndarray]:
+    """Estimate EV metrics from triple-barrier outcomes.
 
-    Class mapping is assumed to be:
-    - 0: short_win
-    - 1: timeout
-    - 2: long_win
+    Returns (raw_ev, filtered_ev, risk_adjusted_ev, class_returns_dict, filtered_sequence, returns_all).
+    Only short/long predictions are considered executes; timeout stays flat.
+    confidence_threshold filters trades used for filtered/risk metrics.
     """
     preds = np.asarray(predictions, dtype=np.int64).reshape(-1)
     targs = np.asarray(targets, dtype=np.int64).reshape(-1)
     probs = np.asarray(probabilities) if probabilities is not None else np.zeros((0, 0), dtype=np.float32)
 
     if preds.size == 0 or targs.size == 0:
-        return 0.0
+        return (
+            0.0,
+            0.0,
+            0.0,
+            {0: [], 1: [], 2: []},
+            [],
+            np.zeros(0, dtype=np.float64),
+        )
 
     n = min(preds.size, targs.size)
     preds = preds[:n]
     targs = targs[:n]
     if probs.ndim >= 2 and probs.shape[0] >= n:
         probs = probs[:n]
+    else:
+        probs = np.zeros((n, 0), dtype=np.float32)
 
-    # Execute only directional signals (short/long), skip timeout predictions.
     exec_mask = (preds == 0) | (preds == 2)
     if not np.any(exec_mask):
-        return 0.0
+        return (
+            0.0,
+            0.0,
+            0.0,
+            {0: [], 1: [], 2: []},
+            [],
+            np.zeros(0, dtype=np.float64),
+        )
 
     p = preds[exec_mask]
     y = targs[exec_mask]
@@ -278,22 +445,211 @@ def compute_expected_value(
     long_mask = p == 2
     short_mask = p == 0
 
-    # Long trade outcomes
     gross[long_mask & (y == 2)] = float(take_profit)
     gross[long_mask & (y == 0)] = -float(stop_loss)
-    # Short trade outcomes
     gross[short_mask & (y == 0)] = float(take_profit)
     gross[short_mask & (y == 2)] = -float(stop_loss)
-    # Timeout outcomes remain 0.0 gross
 
     net = gross - float(trading_fee)
-    return float(np.mean(net)) if net.size else 0.0
+    returns_all = net.astype(np.float64, copy=False)
+
+    if probs.shape[0] == len(preds):
+        exec_conf = probs[exec_mask].max(axis=1)
+    else:
+        exec_conf = None
+
+    if exec_conf is None or exec_conf.size == 0:
+        confident_idx = np.arange(len(returns_all))
+    else:
+        confident_mask = exec_conf >= float(confidence_threshold)
+        confident_idx = np.where(confident_mask)[0]
+
+    filtered_returns = returns_all[confident_idx] if confident_idx.size else np.zeros(0, dtype=np.float64)
+    class_returns: Dict[int, List[float]] = {0: [], 1: [], 2: []}
+    if confident_idx.size:
+        for idx in confident_idx:
+            cls = int(p[idx])
+            class_returns.setdefault(cls, []).append(float(returns_all[idx]))
+
+    raw_ev = float(np.mean(returns_all)) if returns_all.size else 0.0
+    if filtered_returns.size:
+        filtered_ev = float(np.mean(filtered_returns))
+        std = float(np.std(filtered_returns))
+        risk_adj = float(filtered_ev / max(std, 1e-6))
+        filtered_sequence = filtered_returns.astype(float).tolist()
+    else:
+        filtered_ev = 0.0
+        risk_adj = 0.0
+        filtered_sequence = []
+    return raw_ev, filtered_ev, risk_adj, class_returns, filtered_sequence, returns_all
+
+
+def _compute_dynamic_class_weights(
+    counts: Optional[np.ndarray],
+    ev_history: Optional[np.ndarray],
+    boost_strength: float,
+) -> np.ndarray:
+    """Blend inverse-frequency weights with EV-driven boosts."""
+    if counts is None:
+        counts_arr = np.ones(3, dtype=np.float64)
+    else:
+        counts_arr = np.asarray(counts, dtype=np.float64)
+    counts_arr = np.clip(counts_arr, 1.0, None)
+    inv_freq = (counts_arr.sum() / counts_arr)
+    inv_freq /= np.mean(inv_freq)
+
+    if ev_history is None:
+        ev_arr = np.ones(3, dtype=np.float64)
+    else:
+        ev_arr = np.asarray(ev_history, dtype=np.float64)
+    ev_arr = np.nan_to_num(ev_arr, nan=1.0, posinf=1.0, neginf=1.0)
+    ev_arr = np.clip(ev_arr, 0.25, 4.0)
+    ev_arr /= np.mean(ev_arr)
+
+    directional_bias = np.array([1.15, 0.85, 1.15], dtype=np.float64)
+    ev_boost = 1.0 + float(boost_strength) * (ev_arr - 1.0)
+    combined = inv_freq * ev_boost * directional_bias
+    combined = np.clip(combined, 0.1, None)
+    return combined / np.mean(combined)
+
+
+def _compute_ev_multipliers(ev_history: Optional[np.ndarray]) -> np.ndarray:
+    """Convert EV history to positive scaling factors for EV-aware loss."""
+    if ev_history is None:
+        base = np.ones(3, dtype=np.float64)
+    else:
+        base = np.asarray(ev_history, dtype=np.float64)
+    base = np.nan_to_num(base, nan=1.0, posinf=1.0, neginf=1.0)
+    base = np.clip(base, 0.25, 4.0)
+    return base / np.mean(base)
+
+
+def build_weighted_ensemble(
+    best_states: Sequence[Tuple[float, Dict[str, torch.Tensor]]]
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Blend checkpoints with weights proportional to EV."""
+    if not best_states:
+        return None
+    top_states = best_states[:3]
+    weights = np.array([max(float(ev), 1e-9) for ev, _ in top_states], dtype=np.float64)
+    if not np.isfinite(weights).all() or float(weights.sum()) <= 0.0:
+        weights = np.ones(len(top_states), dtype=np.float64)
+    weights = weights / float(weights.sum())
+    ensemble: Dict[str, torch.Tensor] = {}
+    ref_state = top_states[0][1]
+    for key in ref_state.keys():
+        acc = None
+        dtype = ref_state[key].dtype
+        for weight, (_, state) in zip(weights, top_states):
+            tensor = state[key].to(torch.float32)
+            contrib = tensor * float(weight)
+            acc = contrib if acc is None else acc + contrib
+        ensemble[key] = acc.to(dtype)
+    return ensemble
+
+
+def run_profit_simulation(
+    *,
+    model: nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+    loader: DataLoader,
+    device: torch.device,
+    cfg: "TrainConfig",
+) -> None:
+    """Replay validation set, estimate EV/Sharpe-like stats, and log drawdowns."""
+    if not state_dict:
+        return
+    model.load_state_dict(state_dict)
+    model.eval()
+    all_probs: List[np.ndarray] = []
+    all_preds: List[int] = []
+    all_targets: List[int] = []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+            logits = model(xb)
+            probs = torch.softmax(logits, dim=-1)
+            preds = probs.argmax(dim=-1)
+            all_probs.append(probs.detach().cpu().numpy())
+            all_preds.extend(preds.detach().cpu().tolist())
+            all_targets.extend(yb.detach().cpu().tolist())
+    if not all_preds:
+        logger.info("[profit_sim] No validation samples for profit simulation.")
+        return
+    probs_np = np.concatenate(all_probs, axis=0)
+    ev_raw, filtered_ev, risk_adj, _class_returns, filtered_returns, returns_all = compute_expected_value(
+        probabilities=probs_np,
+        predictions=np.asarray(all_preds, dtype=np.int64),
+        targets=np.asarray(all_targets, dtype=np.int64),
+        take_profit=float(cfg.tp_pct),
+        stop_loss=float(cfg.sl_pct),
+        trading_fee=float(2.0 * (cfg.fee_pct + cfg.slippage_pct)),
+        confidence_threshold=float(getattr(cfg, "ev_conf_threshold", 0.55)),
+    )
+    filtered_arr = np.asarray(filtered_returns, dtype=np.float64)
+    trades = len(filtered_arr)
+    metrics = {
+        "total_ev": float(filtered_arr.sum()) if trades else 0.0,
+        "sharpe_like": 0.0,
+        "max_drawdown": 0.0,
+        "win_rate": 0.0,
+        "profit_factor": 0.0,
+        "avg_hold_bars": float(getattr(cfg, "time_limit", 0)),
+        "trade_count": trades,
+    }
+    if trades > 0:
+        mean_ret = float(np.mean(filtered_arr))
+        std_ret = float(np.std(filtered_arr)) or 1e-6
+        sharpe_like = float((mean_ret / std_ret) * np.sqrt(max(trades, 1)))
+        equity = 1.0
+        peak = 1.0
+        max_drawdown = 0.0
+        wins = 0
+        gain_sum = 0.0
+        loss_sum = 0.0
+        for r in filtered_arr:
+            equity *= (1.0 + r)
+            peak = max(peak, equity)
+            dd = (peak - equity) / max(peak, 1e-12)
+            max_drawdown = max(max_drawdown, dd)
+            if r > 0:
+                wins += 1
+                gain_sum += float(r)
+            elif r < 0:
+                loss_sum += float(-r)
+        win_rate = float(wins) / trades
+        if loss_sum > 0.0:
+            profit_factor = gain_sum / loss_sum
+        else:
+            profit_factor = float("inf") if gain_sum > 0.0 else 0.0
+        metrics.update({
+            "sharpe_like": sharpe_like,
+            "max_drawdown": max_drawdown,
+            "win_rate": win_rate,
+            "profit_factor": profit_factor,
+        })
+    logger.info(
+        "[profit_sim] EV=%.4f FilteredEV=%.4f RiskAdj=%.4f SharpeLike=%.4f MaxDD=%.4f "
+        "TotalEV=%.4f WinRate=%.2f%% ProfitFactor=%.3f AvgHoldBars=%.1f (trades=%d)",
+        ev_raw,
+        filtered_ev,
+        risk_adj,
+        metrics["sharpe_like"],
+        metrics["max_drawdown"],
+        metrics["total_ev"],
+        metrics["win_rate"] * 100.0,
+        metrics["profit_factor"],
+        metrics["avg_hold_bars"],
+        metrics["trade_count"],
+    )
+    return metrics
 
 
 # ----------------------------
 # Feature Names (single source of truth)
 # ----------------------------
-ALL_FEATURES = FEATURE_COLUMNS
+ALL_FEATURES = FEATURE_COLUMNS_PROFITABLE
 
 
 
@@ -672,6 +1028,13 @@ class TrainConfig:
     focal_gamma: float = 2.0
     calibrate_temp: bool = True
     optimize_thresholds: bool = True
+    weighted_sampling: bool = True
+    use_ev_aware_loss: bool = True
+    ev_conf_threshold: float = 0.55
+    ev_boost_strength: float = 0.5
+    ev_momentum: float = 0.2
+    mixup_alpha: float = 0.2
+    profit_mode: bool = True
 
 
 # ----------------------------
@@ -704,11 +1067,67 @@ def fit_scaler(train_files, feature_cols, chunksize=500_000, max_rows=2_000_000)
         raise ValueError("No valid samples for scaler fitting")
     all_samples = np.vstack(samples)[:max_rows]
     scaler.fit(all_samples)
+    scaler.feature_names_in_ = np.array(feature_cols)
     # Debug output
     print(f"Total rows processed: {total_rows}")
     print("Valid features:", feature_cols)
 
     return scaler, feature_cols
+
+
+def _collect_feature_selection_frames(
+    files: List[Path],
+    cfg: TrainConfig,
+    *,
+    max_rows: int = 250_000,
+) -> pd.DataFrame:
+    """Collect a sampled feature DataFrame for profitability screening."""
+    frames: List[pd.DataFrame] = []
+    total = 0
+    burn_in = max(cfg.window_size, 240, cfg.time_limit + 5)
+    for df in _stream_rows(files, chunksize=cfg.chunksize, overlap=cfg.window_size + 5, burn_in=burn_in):
+        df = normalize_headers(df)
+        df = compute_features(df)
+        frames.append(df)
+        total += len(df)
+        if total >= max_rows:
+            break
+    if not frames:
+        raise ValueError("No samples collected for profit feature selection.")
+    out = pd.concat(frames, ignore_index=True)
+    return out.iloc[:max_rows].reset_index(drop=True)
+
+
+def select_profitable_features(
+    val_files: List[Path],
+    feature_cols: List[str],
+    cfg: TrainConfig,
+    *,
+    top_k: int = 80,
+    max_rows: int = 250_000,
+) -> List[str]:
+    """
+    Profitability-focused feature selection using correlation + drawdown filtering.
+    """
+    if len(feature_cols) <= top_k:
+        return list(feature_cols)
+
+    sample_df = _collect_feature_selection_frames(val_files, cfg, max_rows=max_rows)
+    engineer = ProfitOptimizedFeatureEngineer(
+        horizon_bars=5,
+        min_abs_corr=0.02,
+        walk_folds=3,
+    )
+    filtered = engineer.filter_features(sample_df, feature_cols, price_col=cfg.price_col)
+    if len(filtered) > top_k:
+        filtered = filtered[:top_k]
+    logger.info(
+        "[profit_mode] Selected %d/%d profitable features. Top10=%s",
+        len(filtered),
+        len(feature_cols),
+        filtered[:10],
+    )
+    return filtered
 
 
 def train(cfg: TrainConfig):
@@ -726,10 +1145,7 @@ def train(cfg: TrainConfig):
         print("[device] MPS selected. AMP will be disabled for stability.")
     # AMP is only reliable/beneficial on CUDA; disable for MPS/CPU to avoid NaNs.
     amp_enabled = bool(getattr(cfg, "amp", False) and device.type == "cuda")
-    if getattr(cfg, "grad_clip_norm", None) is None:
-        grad_clip_norm = 0.5 if device.type == "cuda" else 0.25
-    else:
-        grad_clip_norm = float(cfg.grad_clip_norm)
+    grad_clip_norm = float(getattr(cfg, "grad_clip_norm", 1.0) or 1.0)
 
     files = _list_csvs(cfg.data_path)
     if not files:
@@ -871,6 +1287,24 @@ def train(cfg: TrainConfig):
     except Exception as e:
         print(f"[sanity] Feature health diagnostics failed: {e}")
 
+    if getattr(cfg, "profit_mode", False):
+        try:
+            _train_fs, val_fs = _split_stream(files, cfg.val_frac)
+            fs_files = val_fs if val_fs else files
+            feature_cols = select_profitable_features(
+                fs_files,
+                feature_cols,
+                cfg,
+                top_k=80,
+                max_rows=200_000,
+                stride=5,
+            )
+            global FEATURE_COLUMNS_SELECTED
+            FEATURE_COLUMNS_SELECTED = list(feature_cols)
+            print(f"[profit_mode] Using {len(feature_cols)} profitability-ranked features.")
+        except Exception as exc:
+            logger.warning("[profit_mode] Feature selection failed; using full feature set. err=%s", exc)
+
     # Walk-forward folds: train on months 1..k, validate on month k+1
     folds: List[Tuple[List[Path], List[Path]]] = []
     if len(files) >= 2:
@@ -892,6 +1326,9 @@ def train(cfg: TrainConfig):
     last_fold_scaler = None
     scaler: Optional[StandardScaler] = None
     temperature_final: float = 1.0
+    best_ev_global = -float("inf")
+    best_ev_global_state: Optional[Dict[str, torch.Tensor]] = None
+    best_ev_global_scaler: Optional[StandardScaler] = None
     for fold_idx, (train_files, val_files) in enumerate(folds, start=1):
         if getattr(cfg, "detect_anomaly", False):
             torch.autograd.set_detect_anomaly(True)
@@ -905,6 +1342,7 @@ def train(cfg: TrainConfig):
         best_macro_f1 = 0.0
         best_ev = 0.0
         best_epoch_for_fold = 0
+        collapse_state = CollapseCheckState(fold_idx=fold_idx, total_folds=len(folds))
 
         def seed_worker(worker_id: int):
             seed = int(cfg.seed) + int(worker_id) + (int(fold_idx) * 1000)
@@ -915,6 +1353,13 @@ def train(cfg: TrainConfig):
         g = torch.Generator()
         g.manual_seed(int(cfg.seed) + int(fold_idx))
 
+        sampler_state = {"weights": torch.ones(3, dtype=torch.float32)}
+        sampler_generator = torch.Generator()
+        sampler_generator.manual_seed(int(cfg.seed) + int(fold_idx) + 1337)
+        weighted_sampler_enabled = bool(
+            getattr(cfg, "task", "classification") != "regression" and getattr(cfg, "weighted_sampling", True)
+        )
+
         def collate_batch(batch):
             xb, yb = zip(*batch)  # xb: [B,T,F]
             xb = torch.stack(list(xb), dim=0)
@@ -922,6 +1367,21 @@ def train(cfg: TrainConfig):
                 yb = torch.stack(list(yb), dim=0)
             else:
                 yb = torch.tensor(yb)
+            if weighted_sampler_enabled and yb.numel() > 1:
+                weights_lookup = sampler_state.get("weights")
+                if isinstance(weights_lookup, torch.Tensor) and weights_lookup.numel() == 3:
+                    y_cpu = yb.detach().cpu().long().view(-1)
+                    sample_weights = weights_lookup[y_cpu]
+                    if torch.isfinite(sample_weights).all() and float(sample_weights.sum()) > 0:
+                        sampler = WeightedRandomSampler(
+                            weights=sample_weights.double(),
+                            num_samples=len(sample_weights),
+                            replacement=True,
+                            generator=sampler_generator,
+                        )
+                        indices = torch.tensor(list(sampler), dtype=torch.long)
+                        xb = xb[indices]
+                        yb = yb[indices]
             return xb, yb
 
         assert isinstance(feature_cols, list) and len(feature_cols) > 0, "feature_cols must be a non-empty list"
@@ -970,6 +1430,8 @@ def train(cfg: TrainConfig):
             pin_memory=(device.type == "cuda"), collate_fn=collate_batch,
             worker_init_fn=seed_worker, generator=g,
         )
+        train_counts_est = np.ones(3, dtype=np.int64)
+        train_pct_est = np.ones(3, dtype=np.float32) / 3.0
         # Estimate label distribution from actual streamed windows (not raw peek)
         if getattr(cfg, "task", "classification") != "regression":
             def _estimate_dist(loader, max_batches=500):
@@ -998,6 +1460,11 @@ def train(cfg: TrainConfig):
                 f"{dict(zip(class_names, val_counts_est.tolist()))} "
                 f"({dict(zip(class_names, np.round(val_pct_est, 4).tolist()))})"
             )
+        running_class_counts = None
+        class_ev_history = None
+        if getattr(cfg, "task", "classification") != "regression":
+            running_class_counts = np.clip(train_counts_est.astype(np.float64), 1.0, None)
+            class_ev_history = np.array([1.15, 0.9, 1.15], dtype=np.float64)
 
         # Build model from meta helper
         model_meta_dict = dict(meta_existing)
@@ -1015,44 +1482,42 @@ def train(cfg: TrainConfig):
         else:
             model_meta_dict.pop("num_heads", None)
         model = build_model_from_meta(model_meta_dict).to(device)
-        # Class weights + train label distribution (classification only)
-        class_weights = None
-        train_label_counts = None
-        if getattr(cfg, 'task', 'classification') != 'regression' and cfg.use_class_weights:
-            # Use label distribution from actual streamed windows (estimate)
-            counts = train_counts_est.astype(np.float32) if 'train_counts_est' in locals() else None
-            if counts is None or counts.sum() <= 0:
-                counts = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-            counts[counts == 0] = 1.0
-            inv = 1.0 / np.sqrt(counts)
-            cw = (inv / inv.sum()) * 3.0
-            class_weights = torch.tensor(cw, device=device, dtype=torch.float32)
-            train_label_counts = counts.astype(int)
-
-        # Loss: focal or cross entropy
-        class FocalLoss(nn.Module):
-            def __init__(self, gamma: float = 2.0, weight: Optional[torch.Tensor] = None):
-                super().__init__()
-                self.gamma = gamma
-                self.weight = weight
-            def forward(self, logits, target):
-                ce = nn.functional.cross_entropy(logits, target, reduction='none', weight=self.weight)
-                pt = torch.exp(-ce)
-                loss = ((1 - pt) ** self.gamma) * ce
-                return loss.mean()
-
         if getattr(cfg, 'task', 'classification') == 'regression':
-            # Huber loss (SmoothL1) with tighter delta to reduce sensitivity to outliers
             criterion = nn.HuberLoss(delta=0.1)
         else:
-            if cfg.use_focal_loss:
-                criterion = FocalLoss(gamma=float(cfg.focal_gamma), weight=class_weights)
-            else:
-                criterion = nn.CrossEntropyLoss(weight=class_weights)
+            criterion = None
+
+        def compute_classification_loss(
+            logits: torch.Tensor,
+            target: torch.Tensor,
+            class_weight_tensor: Optional[torch.Tensor],
+            ev_multiplier_tensor: torch.Tensor,
+        ) -> torch.Tensor:
+            target = target.view(-1)
+            if target.numel() == 0:
+                return torch.tensor(0.0, device=logits.device)
+            weight = class_weight_tensor if cfg.use_class_weights else None
+            ce = nn.functional.cross_entropy(
+                logits.float(),
+                target,
+                weight=weight,
+                reduction="none",
+                label_smoothing=0.05,
+            )
+            if getattr(cfg, "use_focal_loss", False):
+                probs = torch.softmax(logits.float(), dim=-1)
+                row_idx = torch.arange(target.numel(), device=logits.device)
+                pt = probs[row_idx, target]
+                ce = ((1.0 - pt).clamp_min(0.0) ** float(cfg.focal_gamma)) * ce
+            if getattr(cfg, "use_ev_aware_loss", False):
+                ce = ce * ev_multiplier_tensor[target]
+            return ce.mean()
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-        # Cosine annealing with warm restarts (no plateau dependency)
-        t0 = max(5, cfg.epochs // 4)
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=t0, T_mult=1, eta_min=cfg.learning_rate * 0.1)
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, cfg.epochs),
+            eta_min=1e-6,
+        )
         # Use CUDA AMP scaler (torch.amp.GradScaler unavailable in older wheels)
         scaler_obj = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
@@ -1069,7 +1534,14 @@ def train(cfg: TrainConfig):
         long_recall_bad_streak = 0
         warmup_steps = max(50, int(cfg.batch_size))
         global_step = 0
-        steps_per_epoch = None
+        class_weight_tensor: Optional[torch.Tensor] = None
+        ev_multiplier_tensor = torch.ones(3, dtype=torch.float32, device=device)
+        epoch_label_counts = np.zeros(3, dtype=np.float64)
+        top_ev_states: List[Tuple[float, Dict[str, torch.Tensor]]] = []
+        mixup_alpha = max(0.0, float(getattr(cfg, "mixup_alpha", 0.0)))
+        use_mixup = (
+            mixup_alpha > 0.0 and getattr(cfg, "task", "classification") != "regression"
+        )
 
         for epoch in range(1, cfg.epochs + 1):
             epoch_start_time = time.time()
@@ -1082,6 +1554,21 @@ def train(cfg: TrainConfig):
             nan_skip_limit = 20
             printed_input_stats = False
             optimizer.zero_grad(set_to_none=True)
+            if getattr(cfg, 'task', 'classification') != 'regression':
+                weight_vec = _compute_dynamic_class_weights(
+                    running_class_counts,
+                    class_ev_history,
+                    getattr(cfg, "ev_boost_strength", 0.5),
+                )
+                if cfg.use_class_weights:
+                    class_weight_tensor = torch.tensor(weight_vec, dtype=torch.float32, device=device)
+                else:
+                    class_weight_tensor = None
+                ev_vec = _compute_ev_multipliers(class_ev_history)
+                ev_multiplier_tensor = torch.tensor(ev_vec, dtype=torch.float32, device=device)
+                sampler_state["weights"] = torch.tensor(weight_vec, dtype=torch.float32)
+            else:
+                class_weight_tensor = None
 
             for xb, yb in train_loader:
                 xb = xb.to(device, non_blocking=True)
@@ -1095,6 +1582,16 @@ def train(cfg: TrainConfig):
                         continue
                     xb = xb[finite_mask]
                     yb = yb[finite_mask]
+                if getattr(cfg, 'task', 'classification') != 'regression' and yb.numel() > 0:
+                    y_np = yb.detach().cpu().numpy().astype(np.int64).ravel()
+                    epoch_label_counts += np.bincount(y_np, minlength=3)
+                mixup_ctx: Optional[Tuple[float, torch.Tensor, torch.Tensor]] = None
+                if use_mixup and xb.size(0) > 1:
+                    lam = np.random.beta(mixup_alpha, mixup_alpha)
+                    lam = float(np.clip(lam, 0.05, 0.95))
+                    perm = torch.randperm(xb.size(0), device=xb.device)
+                    xb = lam * xb + (1.0 - lam) * xb[perm]
+                    mixup_ctx = (lam, yb.clone(), yb[perm].clone())
                 if not printed_input_stats:
                     with torch.no_grad():
                         xb_stats = xb.detach()
@@ -1114,7 +1611,31 @@ def train(cfg: TrainConfig):
                 else:
                     logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
                     logits = logits.clamp(-20.0, 20.0)
-                    loss = criterion(logits.float(), yb)
+                    if mixup_ctx is not None:
+                        lam, y_a, y_bmix = mixup_ctx
+                        loss = (
+                            lam
+                            * compute_classification_loss(
+                                logits.float(),
+                                y_a.long(),
+                                class_weight_tensor,
+                                ev_multiplier_tensor.to(logits.device),
+                            )
+                            + (1.0 - lam)
+                            * compute_classification_loss(
+                                logits.float(),
+                                y_bmix.long(),
+                                class_weight_tensor,
+                                ev_multiplier_tensor.to(logits.device),
+                            )
+                        )
+                    else:
+                        loss = compute_classification_loss(
+                            logits.float(),
+                            yb.long(),
+                            class_weight_tensor,
+                            ev_multiplier_tensor.to(logits.device),
+                        )
                 if not torch.isfinite(loss):
                     with torch.no_grad():
                         xb_stats = xb.detach()
@@ -1161,10 +1682,8 @@ def train(cfg: TrainConfig):
                         warmup_lr = cfg.learning_rate * (global_step / max(1, warmup_steps))
                         for pg in optimizer.param_groups:
                             pg["lr"] = warmup_lr
-                    elif steps_per_epoch is not None:
-                        progress = (epoch - 1) + (opt_steps / max(1, steps_per_epoch))
-                        scheduler.step(progress)
-                    
+                    else:
+                        scheduler.step()
 
                 running += loss.item()
                 step += 1
@@ -1186,13 +1705,8 @@ def train(cfg: TrainConfig):
                     warmup_lr = cfg.learning_rate * (global_step / max(1, warmup_steps))
                     for pg in optimizer.param_groups:
                         pg["lr"] = warmup_lr
-                elif steps_per_epoch is not None:
-                    progress = (epoch - 1) + (opt_steps / max(1, steps_per_epoch))
-                    scheduler.step(progress)
-
-            # Set steps_per_epoch after first pass (IterableDataset has no __len__)
-            if steps_per_epoch is None:
-                steps_per_epoch = max(1, opt_steps)
+                else:
+                    scheduler.step()
             train_loss_epoch = running / max(1, step)
             if not np.isfinite(train_loss_epoch):
                 logger.warning("⚠ WARNING: Model Collapse Detected")
@@ -1200,6 +1714,14 @@ def train(cfg: TrainConfig):
                 epoch_duration = time.time() - epoch_start_time
                 logger.info(f"Epoch Duration: {epoch_duration:.2f}s")
                 break
+
+            if getattr(cfg, 'task', 'classification') != 'regression' and running_class_counts is not None:
+                momentum = float(np.clip(getattr(cfg, "ev_momentum", 0.2), 0.0, 1.0))
+                running_class_counts = (
+                    (1.0 - momentum) * running_class_counts
+                    + momentum * np.clip(epoch_label_counts, 1.0, None)
+                )
+                epoch_label_counts[:] = 0.0
 
             # Validation
             model.eval()
@@ -1309,7 +1831,12 @@ def train(cfg: TrainConfig):
                             logits = model(xb)
                         pred = logits.argmax(dim=-1)
                         probs = torch.softmax(logits, dim=-1)
-                        batch_val_loss = criterion(logits.float(), yb).item()
+                        batch_val_loss = compute_classification_loss(
+                            logits.float(),
+                            yb.long(),
+                            class_weight_tensor,
+                            ev_multiplier_tensor.to(logits.device),
+                        ).item()
                         val_loss_sum += batch_val_loss * yb.numel()
                         val_loss_count += yb.numel()
                         all_targets.extend(yb.detach().cpu().numpy().tolist())
@@ -1326,11 +1853,9 @@ def train(cfg: TrainConfig):
                         zero_division=0,
                     )
                     val_acc = float(accuracy_score(all_targets, all_preds))
-                    unique, counts = np.unique(all_preds, return_counts=True)
-                    pred_dist = {
-                        int(k): float(v)
-                        for k, v in zip(unique.tolist(), (counts / len(all_preds)).tolist())
-                    }
+                    pred_counts = np.bincount(np.asarray(all_preds, dtype=np.int64), minlength=3)
+                    pred_pct = pred_counts / max(1, pred_counts.sum())
+                    pred_dist = {idx: float(pred_pct[idx]) for idx in range(3)}
 
                     labels_present = np.unique(np.concatenate([
                         np.asarray(all_targets, dtype=np.int64),
@@ -1353,13 +1878,15 @@ def train(cfg: TrainConfig):
                     precisions = [0.0, 0.0, 0.0]
                     recalls = [0.0, 0.0, 0.0]
                     pred_dist = {0: 0.0, 1: 0.0, 2: 0.0}
+                    pred_pct = np.zeros(3, dtype=float)
 
                 # Class distribution
                 val_counts = np.bincount(np.asarray(all_targets, dtype=np.int64), minlength=3) if all_targets else np.zeros(3, dtype=int)
                 val_pct = val_counts / max(1, val_counts.sum())
-                if train_label_counts is None:
-                    train_label_counts = val_counts
-                train_pct = train_label_counts / max(1, train_label_counts.sum())
+                if running_class_counts is not None:
+                    train_pct = running_class_counts / max(1.0, running_class_counts.sum())
+                else:
+                    train_pct = np.ones(3, dtype=np.float64) / 3.0
                 total_support = int(val_counts.sum())
                 baseline_acc = float(val_counts.max() / max(1, total_support))
                 balanced_acc = float(np.mean(recalls)) if recalls else 0.0
@@ -1386,16 +1913,6 @@ def train(cfg: TrainConfig):
                             break
 
                 # Prediction distribution (what model predicts)
-                pred_counts = np.bincount(np.asarray(all_preds, dtype=np.int64), minlength=3) if all_preds else np.zeros(3, dtype=int)
-                pred_pct = pred_counts / max(1, pred_counts.sum())
-                max_pred_share = float(pred_pct.max()) if pred_pct.size else 0.0
-                if max_pred_share > 0.90:
-                    logger.warning("⚠ WARNING: Model Collapse Detected")
-                    logger.warning("Reason: imbalance")
-                    epoch_duration = time.time() - epoch_start_time
-                    logger.info(f"Epoch Duration: {epoch_duration:.2f}s")
-                    break
-
                 # Calibration metrics
                 probs_np = np.concatenate(all_probabilities, axis=0) if all_probabilities else np.zeros((0, 3), dtype=np.float32)
                 if len(all_targets) > 0 and probs_np.shape[0] == len(all_targets):
@@ -1450,15 +1967,25 @@ def train(cfg: TrainConfig):
                     )
                     long_recall_bad_streak = 0
 
-                expected_value = compute_expected_value(
+                ev_raw, filtered_ev, risk_adjusted_ev, class_returns, _, _ = compute_expected_value(
                     probabilities=probs_np,
                     predictions=np.asarray(all_preds, dtype=np.int64),
                     targets=np.asarray(all_targets, dtype=np.int64),
                     take_profit=float(cfg.tp_pct),
                     stop_loss=float(cfg.sl_pct),
                     trading_fee=float(2.0 * (cfg.fee_pct + cfg.slippage_pct)),
+                    confidence_threshold=float(getattr(cfg, "ev_conf_threshold", 0.55)),
                 )
-                ev_for_tracking = float(expected_value)
+                if class_ev_history is not None:
+                    momentum = float(np.clip(getattr(cfg, "ev_momentum", 0.2), 0.0, 1.0))
+                    for cls_idx, returns in class_returns.items():
+                        if returns:
+                            signal = 1.0 + float(np.mean(returns))
+                            class_ev_history[int(cls_idx)] = (
+                                (1.0 - momentum) * class_ev_history[int(cls_idx)]
+                                + momentum * np.clip(signal, 0.25, 4.0)
+                            )
+                ev_for_tracking = float(filtered_ev)
                 if val_acc >= best_val_acc:
                     best_val_acc = float(val_acc)
                     best_epoch_for_fold = epoch
@@ -1466,6 +1993,24 @@ def train(cfg: TrainConfig):
                     best_macro_f1 = float(macro_f1)
                 if ev_for_tracking >= best_ev:
                     best_ev = ev_for_tracking
+                if getattr(cfg, "task", "classification") != "regression":
+                    state_copy = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                    top_ev_states.append((ev_for_tracking, state_copy))
+                    top_ev_states.sort(key=lambda x: x[0], reverse=True)
+                    top_ev_states = top_ev_states[:3]
+                collapse_result = detect_model_collapse(
+                    collapse_state,
+                    epoch=epoch,
+                    pred_dist=pred_dist,
+                    macro_f1=macro_f1,
+                    expected_value=ev_for_tracking,
+                )
+                stop_collapse, collapse_result = should_stop(
+                    collapse_result,
+                    fold_idx=fold_idx,
+                    pred_dist=pred_dist,
+                    class_names=class_names,
+                )
                 log_epoch_summary(
                     fold_idx=fold_idx,
                     total_folds=len(folds),
@@ -1479,16 +2024,16 @@ def train(cfg: TrainConfig):
                     precisions=precisions,
                     recalls=recalls,
                     pred_dist=pred_dist,
-                    expected_value=expected_value,
+                    expected_value=ev_raw,
+                    filtered_ev=filtered_ev,
+                    risk_adjusted_ev=risk_adjusted_ev,
+                    confidence_threshold=float(getattr(cfg, "ev_conf_threshold", 0.55)),
+                    best_ev_so_far=collapse_state.best_ev,
+                    ev_not_improved_streak=collapse_state.profit_flat_epochs,
+                    collapse_reason=collapse_result.reason if collapse_result.triggered else None,
+                    collapse_false_positive=collapse_result.false_positive,
                 )
-                if val_acc > collapse_best_val_acc + 1e-12:
-                    collapse_best_val_acc = float(val_acc)
-                    collapse_flat_epochs = 0
-                else:
-                    collapse_flat_epochs += 1
-                if collapse_flat_epochs >= 10:
-                    logger.warning("⚠ WARNING: Model Collapse Detected")
-                    logger.warning("Reason: no improvement")
+                if stop_collapse:
                     epoch_duration = time.time() - epoch_start_time
                     logger.info(f"Epoch Duration: {epoch_duration:.2f}s")
                     break
@@ -1555,11 +2100,31 @@ def train(cfg: TrainConfig):
                     "win_precision": float(prec_win),
                     "win_recall": float(rec_win),
                     "win_f1": float(f1_win),
-                    "expected_value": float(expected_value),
+                    "expected_value": float(ev_raw),
+                    "filtered_ev": float(filtered_ev),
+                    "risk_adjusted_ev": float(risk_adjusted_ev),
                 })
                 metrics_path.write_text(json.dumps({"fold": fold_idx, "epochs": epoch_metrics}, indent=2))
                 epoch_duration = time.time() - epoch_start_time
                 logger.info(f"Epoch Duration: {epoch_duration:.2f}s")
+
+        if getattr(cfg, "task", "classification") != "regression":
+            ensemble_state = build_weighted_ensemble(top_ev_states)
+            if ensemble_state is not None:
+                best_state = ensemble_state
+            if best_state is not None:
+                run_profit_simulation(
+                    model=model,
+                    state_dict=best_state,
+                    loader=val_loader,
+                    device=device,
+                    cfg=cfg,
+                )
+            if best_state is not None and best_ev >= best_ev_global:
+                best_ev_global = float(best_ev)
+                best_ev_global_state = {k: v.detach().cpu() for k, v in best_state.items()}
+                best_ev_global_scaler = scaler
+                final_val_files = list(val_files)
 
         # Track last fold artifacts
         last_fold_best_state = best_state
@@ -1570,7 +2135,10 @@ def train(cfg: TrainConfig):
         logger.info(f"Best Epoch: {best_epoch_for_fold}")
         logger.info(f"Best Val Acc: {best_val_acc:.4f}")
         logger.info(f"Best Macro F1: {best_macro_f1:.4f}")
-        logger.info(f"Best Expected Value: {best_ev:.4f}")
+        if getattr(cfg, "task", "classification") != "regression":
+            logger.info(
+                f"Best Filtered EV (conf>{float(getattr(cfg, 'ev_conf_threshold', 0.55)):.2f}): {best_ev:.4f}"
+            )
         logger.info("#" * 60)
         if getattr(cfg, 'task', 'classification') == 'regression':
             best_mae_value = best_mae if np.isfinite(best_mae) else 0.0
@@ -1668,14 +2236,18 @@ def train(cfg: TrainConfig):
 
         fold_last_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
         fold_best_state = best_state if best_state is not None else fold_last_state
-        torch.save(fold_last_state, fold_last_path)
-        torch.save(fold_best_state, fold_model_path)
+        fold_checkpoint_meta = {
+            "feature_count": len(feature_cols),
+            "feature_names": list(feature_cols),
+            "version": "profit_v2",
+            "train_date": datetime.now().isoformat(),
+        }
+        torch.save({"state_dict": fold_last_state, "metadata": fold_checkpoint_meta}, fold_last_path)
+        torch.save({"state_dict": fold_best_state, "metadata": fold_checkpoint_meta}, fold_model_path)
         if scaler is not None:
             joblib.dump(scaler, fold_scaler_path)
 
         feature_cols_meta = list(feature_cols)
-        if "adx" not in feature_cols_meta:
-            feature_cols_meta.append("adx")
 
         model_type = selected_model_type or "transformer"
         task = getattr(cfg, 'task', 'classification')
@@ -1741,6 +2313,59 @@ def train(cfg: TrainConfig):
         # keep last fold thresholds for aggregate output
         best_thresholds = best_thresholds_fold
 
+    # Final evaluation across last validation files (classification only)
+    final_best_state = best_ev_global_state or last_fold_best_state
+    final_scaler = best_ev_global_scaler if best_ev_global_scaler is not None else last_fold_scaler
+    if (
+        getattr(cfg, "task", "classification") != "regression"
+        and final_best_state is not None
+        and final_val_files
+    ):
+        logger.info("[final_profit_sim] Replaying validation files for Sharpe-style metrics.")
+        final_val_ds = StreamWindowDataset(
+            final_val_files,
+            feature_cols,
+            cfg.price_col,
+            cfg.window_size,
+            cfg.atr_col,
+            cfg.fee_pct,
+            cfg.slippage_pct,
+            cfg.cost_mult,
+            cfg.k_tp,
+            cfg.k_sl,
+            cfg.tp_pct,
+            cfg.sl_pct,
+            cfg.time_limit,
+            cfg.min_atrp,
+            cfg.min_barrier_pct,
+            chunksize=cfg.chunksize,
+            scaler=final_scaler,
+        )
+        final_val_loader = DataLoader(
+            final_val_ds,
+            batch_size=cfg.batch_size,
+            num_workers=max(0, cfg.workers // 2),
+            pin_memory=(device.type == "cuda"),
+        )
+        metrics = run_profit_simulation(
+            model=model,
+            state_dict=final_best_state,
+            loader=final_val_loader,
+            device=device,
+            cfg=cfg,
+        )
+        logger.info("Overall Best EV per Trade across all folds: %.4f", best_ev_global if best_ev_global > -float("inf") else 0.0)
+        if metrics:
+            logger.info(
+                "[final_strategy] TotalEV=%.4f Sharpe=%.4f MaxDD=%.4f WinRate=%.2f%% ProfitFactor=%.3f AvgHoldBars=%.1f",
+                metrics["total_ev"],
+                metrics["sharpe_like"],
+                metrics["max_drawdown"],
+                metrics["win_rate"] * 100.0,
+                metrics["profit_factor"],
+                metrics["avg_hold_bars"],
+            )
+
     # Save artifacts
     outdir = Path(cfg.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1751,15 +2376,21 @@ def train(cfg: TrainConfig):
 
     if last_fold_last_state is None:
         raise RuntimeError("Training did not produce any model state.")
-    torch.save(last_fold_last_state, last_path)
-    torch.save(last_fold_best_state if last_fold_best_state is not None else last_fold_last_state, model_path)
-    if last_fold_scaler is not None:
-        joblib.dump(last_fold_scaler, scaler_path)
+    checkpoint_meta = {
+        "feature_count": len(feature_cols),
+        "feature_names": list(feature_cols),
+        "version": "profit_v2",
+        "train_date": datetime.now().isoformat(),
+    }
+    torch.save({"state_dict": last_fold_last_state, "metadata": checkpoint_meta}, last_path)
+    final_state_to_save = final_best_state if final_best_state is not None else last_fold_last_state
+    torch.save({"state_dict": final_state_to_save, "metadata": checkpoint_meta}, model_path)
+    scaler_to_save = final_scaler if final_scaler is not None else last_fold_scaler
+    if scaler_to_save is not None:
+        joblib.dump(scaler_to_save, scaler_path)
 
-    # Ensure ADX present in meta feature list
+    # Profitability-first feature list (single source of truth)
     feature_cols_meta = list(feature_cols)
-    if "adx" not in feature_cols_meta:
-        feature_cols_meta.append("adx")
 
     agg_val = float(np.mean([f["val_acc"] for f in fold_logs])) if fold_logs else 0.0
 
@@ -1768,13 +2399,13 @@ def train(cfg: TrainConfig):
     task = getattr(cfg, 'task', 'classification')
     num_classes = 1 if task == 'regression' else 3
     label_def = 'return_regression' if task == 'regression' else 'triple_barrier_{-1,0,1}'
-    notes = meta.get("notes") or ("Return regression with walk-forward validation." if task == 'regression' else "Triple-barrier classification with walk-forward validation.")
+    notes = f"Profitability-focused model v2 - clean {len(feature_cols)} features + EV primary"
     meta.update({
         "model_type": model_type,
         "framework": "pytorch",
         "feature_scaling": True,
-        "scaler_type": "standard",
-        "feature_cols": feature_cols_meta,
+        "scaler_type": "StandardScaler",
+        "feature_cols": list(feature_cols),
         "label_def": label_def,
         "num_classes": num_classes,
         "task": task,
@@ -1792,7 +2423,7 @@ def train(cfg: TrainConfig):
         "min_atrp": cfg.min_atrp,
         "min_barrier_pct": cfg.min_barrier_pct,
         "atr_col": cfg.atr_col,
-        "input_size": len(feature_cols),  # model input matches training features
+        "input_size": len(feature_cols),
         "hidden_size": cfg.hidden_size,
         "num_layers": cfg.num_layers,
         "dropout": cfg.dropout,
@@ -2073,6 +2704,13 @@ def env_default(key: str, fallback: str) -> str:
     return v if v else fallback
 
 
+def env_default_bool(key: str, fallback: bool) -> bool:
+    v = os.environ.get(key)
+    if v is None:
+        return bool(fallback)
+    return str(v).strip().lower() in ("1", "true", "t", "yes", "y")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Memory-safe streaming trainer for LSTM classifier (meta-aware).")
     p.add_argument("--data-path", type=str, default=env_default("SM_CHANNEL_TRAIN", "eth_1m_data"))
@@ -2105,7 +2743,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--price-col", type=str, default="close")
     p.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     p.add_argument("--force-cpu-on-mac", type=str2bool, default=True)
-    p.add_argument("--grad-clip-norm", type=float, default=None, help="Override grad clip norm (default 0.5 CUDA, 0.25 CPU/MPS)")
+    p.add_argument("--grad-clip-norm", type=float, default=1.0, help="Gradient clipping norm (default 1.0)")
     p.add_argument("--detect-anomaly", type=str2bool, default=False, help="Enable autograd anomaly detection for debug runs")
     p.add_argument("--balanced-val-eval", type=str2bool, default=False, help="Report metrics on balanced validation sample")
     p.add_argument("--balanced-val-samples", type=int, default=50_000, help="Total windows to sample for balanced val eval")
@@ -2128,18 +2766,27 @@ def build_parser() -> argparse.ArgumentParser:
     # Task toggle & regression horizon
     p.add_argument("--task", choices=["classification","regression"], default="classification")
     p.add_argument("--feature-cols", nargs="*", default=None,
-                   help="Optional explicit feature list; defaults to FEATURE_COLUMNS")
+                   help="Optional explicit feature list; defaults to FEATURE_COLUMNS_PROFITABLE")
     p.add_argument("--horizon", type=int, default=3, help="Bars ahead to predict for regression (3=3 minutes)")
     # Loss / calibration
     p.add_argument("--use-class-weights", type=str2bool, default=True)
     p.add_argument("--use-focal-loss", type=str2bool, default=True)
     p.add_argument("--focal-gamma", type=float, default=2.0, help="Recommended sweep: 1.0, 1.5, 2.0, 2.5")
+    p.add_argument("--weighted-sampling", type=str2bool, default=True, help="Enable per-batch WeightedRandomSampler balancing")
+    p.add_argument("--use-ev-aware-loss", type=str2bool, default=True, help="Scale per-sample loss by EV multipliers")
+    p.add_argument("--ev-conf-threshold", type=float, default=0.55, help="Confidence floor for EV tracking (0-1)")
+    p.add_argument("--ev-boost-strength", type=float, default=0.5, help="How aggressively EV history tilts class weights")
+    p.add_argument("--ev-momentum", type=float, default=0.2, help="Momentum for historical EV / label stats blending")
+    p.add_argument("--mixup-alpha", type=float, default=0.2, help="Beta distribution alpha for Mixup (0=disabled)")
     p.add_argument("--calibrate-temp", type=str2bool, default=True)
     p.add_argument("--optimize-thresholds", type=str2bool, default=True)
+    p.add_argument("--profit-mode", type=str2bool, default=env_default_bool("PROFIT_MODE", True),
+                   help="Enable profitability-first feature selection (top 80 features).")
     return p
 
 
 def main():
+    print("🚀 Training with clean profitability feature set (119 features) for maximum EV per trade...")
     args = build_parser().parse_args()
 
     def _parse_seq_lens(val):
@@ -2214,9 +2861,16 @@ def main():
             use_class_weights=args.use_class_weights,
             use_focal_loss=args.use_focal_loss,
             focal_gamma=args.focal_gamma,
+            weighted_sampling=args.weighted_sampling,
+            use_ev_aware_loss=args.use_ev_aware_loss,
+            ev_conf_threshold=args.ev_conf_threshold,
+            ev_boost_strength=args.ev_boost_strength,
+            ev_momentum=args.ev_momentum,
+            mixup_alpha=args.mixup_alpha,
             calibrate_temp=args.calibrate_temp,
             optimize_thresholds=args.optimize_thresholds,
             feature_cols=args.feature_cols,
+            profit_mode=args.profit_mode,
         )
         try:
             train(cfg)

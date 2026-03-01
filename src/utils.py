@@ -19,6 +19,7 @@ import logging
 import json
 import math
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Generator, List, Optional
 from collections import deque
@@ -31,12 +32,15 @@ try:
     from models import (
         build_model_from_meta as _build_model_from_meta,
         load_meta as _load_meta_model,
-        load_model_state as _load_model_state,
         load_scaler as _load_scaler,
+        load_checkpoint_state as _load_checkpoint_state,
+        load_state_dict_flexible as _load_state_dict_flexible,
+        PROFIT_MODEL_VERSION as _PROFIT_MODEL_VERSION,
         resolve_path as _resolve_path,
     )
 except Exception:
-    _build_model_from_meta = _load_meta_model = _load_model_state = _load_scaler = _resolve_path = None
+    _build_model_from_meta = _load_meta_model = _load_scaler = _resolve_path = None
+    _load_checkpoint_state = _load_state_dict_flexible = _PROFIT_MODEL_VERSION = None
 
 import numpy as np
 import pandas as pd
@@ -239,7 +243,7 @@ ROLL_WINDOW = 20
 DEFAULT_SEQ_LENS = [60, 90, 120]
 DEFAULT_SEQ_LEN = 90
 
-FEATURE_COLUMNS = [
+FEATURE_COLUMNS_PROFITABLE = [
     "open", "high", "low", "close", "volume",
     "return_1", "return_5", "return_15",
     "log_ret", "zret_20", "zret_60",
@@ -280,13 +284,164 @@ FEATURE_COLUMNS = [
     "tf5_log_ret_1", "tf5_rv_20", "tf5_atrp_14", "tf5_ema_spread",
     "tf15_log_ret_1", "tf15_rv_20", "tf15_atrp_14", "tf15_ema_spread",
     "tf60_log_ret_1", "tf60_rv_20", "tf60_atrp_14", "tf60_ema_spread",
+    "adx",
 ]
+
+class ProfitOptimizedFeatureEngineer:
+    """
+    Profit-obsessed feature selector.
+
+    - Computes forward returns
+    - Ranks features by correlation to 5-min forward return
+    - Drops low-corr features and those that increase walk-forward drawdown
+    """
+
+    def __init__(
+        self,
+        *,
+        horizon_bars: int = 5,
+        min_abs_corr: float = 0.02,
+        walk_folds: int = 3,
+        drawdown_tolerance: float = 1e-6,
+    ) -> None:
+        self.horizon_bars = int(max(1, horizon_bars))
+        self.min_abs_corr = float(min_abs_corr)
+        self.walk_folds = int(max(2, walk_folds))
+        self.drawdown_tolerance = float(drawdown_tolerance)
+
+    @staticmethod
+    def _max_drawdown(equity: np.ndarray) -> float:
+        if equity.size < 2:
+            return 0.0
+        peak = np.maximum.accumulate(equity)
+        dd = (equity - peak) / np.maximum(1e-12, peak)
+        return float(abs(np.min(dd)))
+
+    def compute_forward_returns(self, df: pd.DataFrame, price_col: str) -> pd.Series:
+        if price_col not in df.columns:
+            raise ValueError(f"price_col '{price_col}' missing from DataFrame")
+        prices = df[price_col].astype(float)
+        fwd = prices.pct_change(self.horizon_bars).shift(-self.horizon_bars)
+        return fwd
+
+    def rank_by_correlation(
+        self,
+        df: pd.DataFrame,
+        feature_cols: List[str],
+        price_col: str,
+    ) -> Dict[str, float]:
+        fwd = self.compute_forward_returns(df, price_col)
+        corr = {}
+        for c in feature_cols:
+            if c not in df.columns:
+                continue
+            v = pd.to_numeric(df[c], errors="coerce")
+            corr_val = v.corr(fwd)
+            if corr_val is None or not np.isfinite(corr_val):
+                continue
+            corr[c] = float(corr_val)
+        return corr
+
+    def _walk_forward_indices(self, n: int) -> List[Tuple[int, int]]:
+        fold = max(1, n // self.walk_folds)
+        idx = []
+        start = 0
+        while start < n:
+            end = min(n, start + fold)
+            if end - start >= 10:
+                idx.append((start, end))
+            start = end
+        return idx if idx else [(0, n)]
+
+    def _portfolio_returns(
+        self,
+        features: np.ndarray,
+        corrs: np.ndarray,
+        fwd: np.ndarray,
+    ) -> np.ndarray:
+        pos = np.sign(features * corrs.reshape(1, -1))
+        avg_pos = np.nanmean(pos, axis=1)
+        return avg_pos * fwd
+
+    def filter_features(
+        self,
+        df: pd.DataFrame,
+        feature_cols: List[str],
+        *,
+        price_col: str = "close",
+    ) -> List[str]:
+        corr = self.rank_by_correlation(df, feature_cols, price_col)
+        if not corr:
+            return list(feature_cols)
+
+        ranked = sorted(corr.items(), key=lambda x: abs(x[1]), reverse=True)
+        candidates = [f for f, c in ranked if abs(c) >= self.min_abs_corr]
+        if not candidates:
+            # Keep top 20 by correlation if all are below threshold
+            candidates = [f for f, _ in ranked[:20]]
+
+        fwd = self.compute_forward_returns(df, price_col).to_numpy(dtype=np.float32, copy=False)
+        feat_mat = df[candidates].to_numpy(dtype=np.float32, copy=False)
+        corr_arr = np.array([corr.get(c, 0.0) for c in candidates], dtype=np.float32)
+
+        # Clean NaNs
+        valid_mask = np.isfinite(fwd)
+        feat_mat = feat_mat[valid_mask]
+        fwd = fwd[valid_mask]
+        feat_mat = np.nan_to_num(feat_mat, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if feat_mat.shape[0] < 1000 or feat_mat.shape[1] < 2:
+            return list(candidates)
+
+        splits = self._walk_forward_indices(feat_mat.shape[0])
+        baseline_dds: List[float] = []
+        for a, b in splits:
+            r = self._portfolio_returns(feat_mat[a:b], corr_arr, fwd[a:b])
+            equity = np.cumprod(1.0 + r)
+            baseline_dds.append(self._max_drawdown(equity))
+        baseline_dd = float(np.mean(baseline_dds)) if baseline_dds else 0.0
+
+        # Remove features that worsen drawdown
+        kept = []
+        for j, feat in enumerate(candidates):
+            if feat_mat.shape[1] <= 1:
+                kept.append(feat)
+                continue
+            mat_minus = np.delete(feat_mat, j, axis=1)
+            corr_minus = np.delete(corr_arr, j)
+            dd_list = []
+            for a, b in splits:
+                r = self._portfolio_returns(mat_minus[a:b], corr_minus, fwd[a:b])
+                equity = np.cumprod(1.0 + r)
+                dd_list.append(self._max_drawdown(equity))
+            dd_minus = float(np.mean(dd_list)) if dd_list else 0.0
+            if dd_minus + self.drawdown_tolerance < baseline_dd:
+                # Removing this feature improves drawdown => feature increases drawdown
+                continue
+            kept.append(feat)
+
+        # Rank by correlation
+        kept_sorted = sorted(kept, key=lambda f: abs(corr.get(f, 0.0)), reverse=True)
+        return kept_sorted
+
+
+def align_feature_columns(meta_feature_cols: Optional[List[str]], *, expected_size: Optional[int] = None) -> List[str]:
+    """
+    Strict alignment: require metadata features to match expected_size.
+    """
+    expected = expected_size if (expected_size is not None and expected_size > 0) else len(FEATURE_COLUMNS_PROFITABLE)
+    meta_feature_cols = list(meta_feature_cols or [])
+    if len(meta_feature_cols) != expected:
+        raise ValueError(
+            "Feature count mismatch. Retrain required — delete old checkpoint and retrain."
+        )
+    return meta_feature_cols
 
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     """Feature engineering using only OHLCV.
 
-    Outputs a compact, high-signal set that aligns with FEATURE_COLUMNS (single source of truth).
+    Outputs a compact, high-signal set that aligns with FEATURE_COLUMNS_PROFITABLE (single source of truth).
     Keeps the original OHLCV columns; adds engineered columns; fills early NaNs.
     """
 
@@ -368,6 +523,19 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df["atr_14"] = true_range.rolling(14, min_periods=1).mean()
     df["atrp_14"] = df["atr_14"] / df["close"].replace(0, 1e-12)
     df["ret_std_30"] = df["return_1"].rolling(30, min_periods=1).std().fillna(0.0)
+    # Wilder-style ADX (falls back to exponentially weighted smoothing)
+    adx_period = 14
+    eps = 1e-12
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+    alpha = 1.0 / adx_period
+    tr_smooth = true_range.replace(np.nan, 0.0).ewm(alpha=alpha, adjust=False).mean()
+    plus_di = 100.0 * plus_dm.replace(np.nan, 0.0).ewm(alpha=alpha, adjust=False).mean() / (tr_smooth + eps)
+    minus_di = 100.0 * minus_dm.replace(np.nan, 0.0).ewm(alpha=alpha, adjust=False).mean() / (tr_smooth + eps)
+    dx = (plus_di - minus_di).abs() / ((plus_di + minus_di).abs() + eps) * 100.0
+    df["adx"] = dx.replace(np.nan, 0.0).ewm(alpha=alpha, adjust=False).mean().fillna(0.0)
 
     # ---------- Bollinger / bands ----------
     bb_mid = df["close"].rolling(20, min_periods=1).mean()
@@ -576,18 +744,18 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     # NOTE: avoid backfilling (bfill) because it can leak future info into the past.
     df.ffill(inplace=True)
 
-    # Ensure all FEATURE_COLUMNS exist. For OHLCV-only inputs, many optional
+    # Ensure all FEATURE_COLUMNS_PROFITABLE exist. For OHLCV-only inputs, many optional
     # microstructure columns will be missing — default them to 0.0 to prevent NaNs.
-    for col in FEATURE_COLUMNS:
+    for col in FEATURE_COLUMNS_PROFITABLE:
         if col not in df.columns:
             df[col] = 0.0
 
-    missing_after = [c for c in FEATURE_COLUMNS if c not in df.columns]
+    missing_after = [c for c in FEATURE_COLUMNS_PROFITABLE if c not in df.columns]
     if missing_after:
         raise ValueError(f"compute_features missing engineered columns: {missing_after}")
 
     # Final safety: eliminate any NaN/Inf in model features (prevents NaN losses).
-    df = df[FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    df = df[FEATURE_COLUMNS_PROFITABLE].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     return df
 
@@ -657,6 +825,79 @@ def load_meta(model_dir_or_path: str) -> Dict:
         return json.load(f)
 
 
+def update_strategy_registry(model_dir: Path, profitability_score: float, *, min_score: float = 2.0) -> None:
+    registry_path = model_dir / "strategy_registry.json"
+    try:
+        registry = json.loads(registry_path.read_text()) if registry_path.exists() else {"strategies": []}
+    except Exception:
+        registry = {"strategies": []}
+    strategies = registry.get("strategies", []) if isinstance(registry, dict) else []
+    strategies = [s for s in strategies if isinstance(s, dict)]
+
+    if profitability_score <= min_score:
+        registry["strategies"] = [s for s in strategies if s.get("model_dir") != str(model_dir)]
+    else:
+        strategies = [s for s in strategies if s.get("model_dir") != str(model_dir)]
+        strategies.append({
+            "model_dir": str(model_dir),
+            "profitability_score": float(profitability_score),
+            "updated": datetime.utcnow().isoformat(),
+        })
+        registry["strategies"] = strategies
+
+    tmp_path = registry_path.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(registry, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, registry_path)
+
+
+def load_model_with_metadata(model_dir: Path):
+    meta_path = model_dir / "model_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"model_meta.json not found in {model_dir}")
+
+    meta_obj = _load_meta_model(str(meta_path))
+    meta = meta_obj.to_dict() if hasattr(meta_obj, "to_dict") else dict(meta_obj)
+
+    weights_path = _resolve_path(str(model_dir), meta.get("model_state_path", "model.pt"))
+    state_dict, ckpt_meta = _load_checkpoint_state(weights_path)
+
+    feature_count = int(ckpt_meta.get("feature_count", 0))
+    feature_names = list(ckpt_meta.get("feature_names") or [])
+    version = str(ckpt_meta.get("version", "")).strip()
+    train_date = ckpt_meta.get("train_date")
+    if not feature_count or not feature_names:
+        raise ValueError("Checkpoint metadata invalid. Retrain required — delete old checkpoint and retrain.")
+    if version != _PROFIT_MODEL_VERSION:
+        raise ValueError(
+            f"Model version mismatch (checkpoint={version or 'unknown'}, expected={_PROFIT_MODEL_VERSION}). "
+            "Retrain required — delete old checkpoint and retrain."
+        )
+
+    meta["feature_count"] = feature_count
+    meta["feature_names"] = feature_names
+    meta["version"] = version
+    meta["train_date"] = train_date
+
+    meta["input_size"] = feature_count
+    meta["feature_cols"] = list(feature_names)
+
+    model = _build_model_from_meta(meta)
+    incompatible = _load_state_dict_flexible(model, state_dict)
+    missing_keys = list(getattr(incompatible, "missing_keys", []))
+    unexpected_keys = list(getattr(incompatible, "unexpected_keys", []))
+    ok_keys = [k for k in state_dict.keys() if k not in unexpected_keys]
+    logging.info(
+        "Loaded state_dict from %s with %d keys (%d OK, %d missing, %d unexpected).",
+        weights_path,
+        len(state_dict),
+        len(ok_keys),
+        len(missing_keys),
+        len(unexpected_keys),
+    )
+    return model, meta, feature_count
+
+
 def load_model_bundle(model_dir: str):
     """
     Loads a complete model bundle (model, scaler, meta) using helpers from models.py.
@@ -667,33 +908,20 @@ def load_model_bundle(model_dir: str):
     if not meta_path.exists():
         raise FileNotFoundError(f"model_meta.json not found in {model_dir}")
 
-    meta = _load_meta_model(str(meta_path))
-    # Build model architecture from metadata
-    model = _build_model_from_meta(meta)
-    # Load the trained weights into the model (with graceful fallback)
-    weights_path = _resolve_path(model_dir, getattr(meta, 'model_state_path', 'model.pt'))
-    try:
-        _load_model_state(model, weights_path)
-    except RuntimeError as e:
-        # Dimension mismatch is the common case; try fallback checkpoint if provided
-        fallback_name = getattr(meta, 'last_model_state_path', None) or 'model_last.pt'
-        fallback_path = _resolve_path(model_dir, fallback_name)
-        try:
-            _load_model_state(model, fallback_path)
-            logging.warning(
-                "Primary weights '%s' incompatible with model (likely meta mismatch). "
-                "Loaded fallback '%s' instead.",
-                weights_path,
-                fallback_path,
-            )
-        except Exception:
-            raise
+    model, meta, _ = load_model_with_metadata(model_dir_path)
     # Load the scaler if one is specified
     scaler = None
-    if getattr(meta, 'feature_scaling', True) and getattr(meta, 'scaler_path', None):
-        scaler_path = _resolve_path(model_dir, meta.scaler_path)
+    if meta.get("feature_scaling", True) and meta.get("scaler_path", None):
+        scaler_path = _resolve_path(model_dir, meta["scaler_path"])
         scaler = _load_scaler(scaler_path)
-    return model.eval(), scaler, meta.to_dict()
+        feature_cols = list(meta.get("feature_cols") or FEATURE_COLUMNS_PROFITABLE)
+        if hasattr(scaler, "n_features_in_") and scaler.n_features_in_ != len(feature_cols):
+            raise ValueError(
+                "Scaler feature count mismatch. Retrain required — delete old checkpoint and retrain."
+            )
+        if scaler is not None:
+            scaler.feature_names_in_ = list(feature_cols)
+    return model.eval(), scaler, meta
 
 
 # ---------------------------
@@ -747,13 +975,13 @@ class SignalGenerator:
     def _ensure_feature_cols(self, engineered_df: pd.DataFrame) -> List[str]:
         """Pick an ordered feature list aligned with training.
 
-        Uses FEATURE_COLUMNS as the canonical list.
+        Uses FEATURE_COLUMNS_PROFITABLE as the canonical list.
         """
         if self._feature_cols is not None:
             return self._feature_cols
 
         available = set(engineered_df.columns.tolist())
-        cols = [c for c in FEATURE_COLUMNS if c in available]
+        cols = [c for c in FEATURE_COLUMNS_PROFITABLE if c in available]
         if not cols:
             # As a last resort, take numeric columns (best effort)
             cols = engineered_df.select_dtypes(include=[np.number]).columns.tolist()
@@ -817,8 +1045,10 @@ class SignalGenerator:
 
 __all__ = [
     # defaults
-    "DEFAULT_SEQ_LENS", "DEFAULT_SEQ_LEN", "FEATURE_COLUMNS",
+    "DEFAULT_SEQ_LENS", "DEFAULT_SEQ_LEN", "FEATURE_COLUMNS_PROFITABLE",
+    "align_feature_columns",
     "PRICE_CANDIDATES",
+    "ProfitOptimizedFeatureEngineer",
     # env / device / seed
     "load_dotenv", "set_seed", "get_device_str",
     # csv utils

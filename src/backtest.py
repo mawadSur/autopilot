@@ -35,8 +35,16 @@ from utils import (
     compute_features,
     load_model_bundle,
     normalize_headers,
-    FEATURE_COLUMNS,
+    FEATURE_COLUMNS_PROFITABLE,
     DEFAULT_SEQ_LEN,
+    update_strategy_registry,
+)
+from profitability import (
+    compute_profitability_metrics,
+    monte_carlo_permutation_test,
+    kelly_fraction,
+    vol_target_leverage,
+    profitability_report,
 )
 try:
     from simulator import (
@@ -103,151 +111,235 @@ class ConsensusFilter:
 # =========================
 # Online portfolio simulator
 # =========================
-def _run_backtest_for_files(files: List[Path], model_dir: str, *, print_report: bool = True) -> Dict:
-    model, scaler, meta = load_model_bundle(model_dir)
-    feature_cols = list(meta.get("feature_cols", FEATURE_COLUMNS))
-    if feature_cols != FEATURE_COLUMNS:
-        raise ValueError(f"Feature list mismatch: meta has {feature_cols}, expected {FEATURE_COLUMNS}")
+class ProfitOptimizedBacktester:
+    def __init__(self, model_dir: str, files: List[Path]) -> None:
+        self.model_dir = model_dir
+        self.files = files
 
-    window_size = int(cfg.window_size or meta.get("window_size", DEFAULT_SEQ_LEN))
-    fee_pct = float(meta.get("tx_cost", cfg.fee_pct))
-    tp_pct = float(meta.get("tp_pct", cfg.tp_pct))
-    sl_pct = float(meta.get("sl_pct", cfg.sl_pct))
+    def _load_and_validate(self):
+        model, scaler, meta = load_model_bundle(self.model_dir)
+        feature_cols = list(meta.get("feature_names") or meta.get("feature_cols") or FEATURE_COLUMNS_PROFITABLE)
+        if int(meta.get("feature_count") or 0) != len(feature_cols): raise ValueError("Model retrain required for profitability — delete old checkpoint in seq_dir and retrain.")
+        return model, scaler, meta
 
-    task = str(meta.get("task", "")).lower()
-    is_regression = bool(task == "regression" or int(meta.get("num_classes", 3)) == 1)
-    temperature = float(meta.get("temperature", 1.0))
+    def _run_stream(self, model, scaler, meta, *, leverage: float = 1.0) -> Dict:
+        feature_cols = list(meta.get("feature_names") or meta.get("feature_cols") or FEATURE_COLUMNS_PROFITABLE)
 
-    # Device
-    device = torch.device(cfg.device if cfg.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = model.to(device).eval()
+        window_size = int(cfg.window_size or meta.get("window_size", DEFAULT_SEQ_LEN))
+        fee_pct = 0.00075
+        tp_pct = float(meta.get("tp_pct", cfg.tp_pct))
+        sl_pct = float(meta.get("sl_pct", cfg.sl_pct))
 
-    overlap_rows = max(window_size + 5, 2000)
+        task = str(meta.get("task", "")).lower()
+        is_regression = bool(task == "regression" or int(meta.get("num_classes", 3)) == 1)
+        temperature = float(meta.get("temperature", 1.0))
 
-    print(f"[load] Files: {len(files)}")
-    print(f"[load] Streaming chunksize={cfg.chunksize:,} overlap={overlap_rows:,}")
-    print(f"[meta] window={window_size} features={len(feature_cols)} task={'regression' if is_regression else 'classification'}")
+        device = torch.device(cfg.device if cfg.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
+        model = model.to(device).eval()
 
-    sim_cfg = SimulationConfig(
-        start_capital=float(cfg.capital),
-        fee_pct=fee_pct,
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
-        cooldown=int(cfg.cooldown),
-        slippage_pct=float(cfg.slippage_pct),
-        use_atr_stops=bool(cfg.use_atr_stops),
-        atr_tp_mult=float(cfg.atr_tp_mult),
-        atr_sl_mult=float(cfg.atr_sl_mult),
-        use_regime_filter=bool(cfg.use_regime_filter),
-        min_atr_pct=float(cfg.min_atr_pct),
-        allow_shorts=True,
-    )
-    sim = PortfolioSimulator(sim_cfg)
+        overlap_rows = max(window_size + 5, 2000)
 
-    consensus_filter = ConsensusFilter(int(cfg.consensus))
+        sim_cfg = SimulationConfig(
+            start_capital=float(cfg.capital),
+            fee_pct=fee_pct,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+            cooldown=int(cfg.cooldown),
+            slippage_pct=0.0,
+            use_atr_stops=bool(cfg.use_atr_stops),
+            atr_tp_mult=float(cfg.atr_tp_mult),
+            atr_sl_mult=float(cfg.atr_sl_mult),
+            use_regime_filter=bool(cfg.use_regime_filter),
+            min_atr_pct=float(cfg.min_atr_pct),
+            allow_shorts=True,
+            leverage=float(leverage),
+        )
+        sim = PortfolioSimulator(sim_cfg)
+        consensus_filter = ConsensusFilter(int(cfg.consensus))
 
-    X_batch: List[np.ndarray] = []
-    bar_batch: List[Bar] = []
+        X_batch: List[np.ndarray] = []
+        bar_batch: List[Bar] = []
+        total_pred = 0
+        last_close_for_end = None
 
-    total_pred = 0
-    last_close_for_end = None
+        streamer = KlineStreamer(
+            cfg.data_dir,
+            window_size=window_size,
+            feature_cols=feature_cols,
+            chunksize=int(cfg.chunksize),
+            overlap_rows=int(overlap_rows),
+        )
 
-    streamer = KlineStreamer(
-        cfg.data_dir,
-        window_size=window_size,
-        feature_cols=feature_cols,
-        chunksize=int(cfg.chunksize),
-        overlap_rows=int(overlap_rows),
-    )
+        def _flush_batch():
+            nonlocal total_pred
+            if not X_batch:
+                return
 
-    def _flush_batch():
-        nonlocal total_pred
-        if not X_batch:
-            return
+            X = np.stack(X_batch, axis=0).astype(np.float32)
+            if scaler is not None:
+                if hasattr(scaler, "feature_names_in_"):
+                    assert list(scaler.feature_names_in_) == feature_cols
+                B, T, F = X.shape
+                try:
+                    X = scaler.transform(X.reshape(B * T, F)).reshape(B, T, F).astype(np.float32, copy=False)
+                except Exception:
+                    pass
 
-        X = np.stack(X_batch, axis=0).astype(np.float32)
+            xb = torch.from_numpy(X).to(device)
+            with torch.no_grad():
+                out = model(xb)
 
-        if scaler is not None:
-            if hasattr(scaler, "feature_names_in_"):
-                assert list(scaler.feature_names_in_) == feature_cols
-            B, T, F = X.shape
-            X = scaler.transform(X.reshape(B * T, F)).reshape(B, T, F).astype(np.float32, copy=False)
+            if is_regression:
+                preds = out.squeeze(-1).detach().cpu().numpy()
+                for k, bar in enumerate(bar_batch):
+                    ret = (float(preds[k]) / max(1e-12, float(bar.close))) - 1.0
+                    sig = 2 if ret >= float(cfg.up_thr) else (0 if ret <= -float(cfg.down_thr) else 1)
+                    atr = float(bar.atr) if bar.atr is not None and np.isfinite(bar.atr) else None
+                    sim.config.slippage_pct = (0.5 * atr / max(1e-12, float(bar.close))) if atr is not None else 0.0
+                    sim.step(bar, signal=sig)
+                    total_pred += 1
+            else:
+                logits = out / temperature if abs(temperature - 1.0) > 1e-6 else out
+                probs = F.softmax(logits, dim=-1).detach().cpu().numpy()
+                for k, bar in enumerate(bar_batch):
+                    raw_sig = _raw_signal_from_probs(probs[k], float(cfg.thr_long), float(cfg.thr_short), float(cfg.margin))
+                    sig = consensus_filter.step(raw_sig)
+                    atr = float(bar.atr) if bar.atr is not None and np.isfinite(bar.atr) else None
+                    sim.config.slippage_pct = (0.5 * atr / max(1e-12, float(bar.close))) if atr is not None else 0.0
+                    sim.step(bar, signal=sig)
+                    total_pred += 1
 
-        xb = torch.from_numpy(X).to(device)
+            X_batch.clear()
+            bar_batch.clear()
 
-        with torch.no_grad():
-            out = model(xb)
+        for window, _label, meta_row in streamer:
+            last_close_for_end = float(meta_row.get("close", np.nan))
+            o = float(meta_row.get("open", np.nan))
+            h = float(meta_row.get("high", np.nan))
+            l = float(meta_row.get("low", np.nan))
+            c = float(meta_row.get("close", np.nan))
+            atr_prev = meta_row.get("atr")
+            ema50 = float(window[-1, feature_cols.index("ema_50")]) if "ema_50" in feature_cols else np.nan
+            ema200 = float(window[-1, feature_cols.index("ema_200")]) if "ema_200" in feature_cols else np.nan
+            regime = None
+            if cfg.use_regime_filter and np.isfinite(ema50) and np.isfinite(ema200):
+                regime = 1 if ema50 > ema200 * 1.0005 else (-1 if ema50 < ema200 * 0.9995 else 0)
 
-        if is_regression:
-            preds = out.squeeze(-1).detach().cpu().numpy()
-            for k, bar in enumerate(bar_batch):
-                ret = (float(preds[k]) / max(1e-12, float(bar.close))) - 1.0
-                sig = 2 if ret >= float(cfg.up_thr) else (0 if ret <= -float(cfg.down_thr) else 1)
-                sim.step(bar, signal=sig)
-                total_pred += 1
+            X_batch.append(window)
+            bar_batch.append(Bar(open=o, high=h, low=l, close=c, atr=atr_prev, ema_fast=ema50, ema_slow=ema200, regime=regime, timestamp=meta_row.get("timestamp")))
+            if len(X_batch) >= int(cfg.batch_size):
+                _flush_batch()
+
+        _flush_batch()
+        if last_close_for_end is not None:
+            sim.finalize(last_close_for_end)
+
+        report = sim.report()
+        equity_curve = sim.equity_curve()
+        metrics = compute_profitability_metrics(report, equity_curve, sim.trade_log)
+        return {
+            "report": report,
+            "metrics": metrics,
+            "equity_curve": equity_curve,
+            "trade_log": sim.trade_log,
+        }
+
+    def run(self) -> Dict:
+        model, scaler, meta = self._load_and_validate()
+        # Walk-forward windows (6 months in, 3 months out) driven by timestamps
+        all_df = normalize_headers(pd.concat([pd.read_csv(p) for p in self.files], ignore_index=True))
+        if "timestamp" not in all_df.columns:
+            raise ValueError("timestamp column is required for walk-forward optimization")
+        all_df["timestamp"] = pd.to_datetime(all_df["timestamp"], errors="coerce", utc=True)
+        all_df = all_df.dropna(subset=["timestamp"]).sort_values("timestamp")
+
+        months = all_df["timestamp"].dt.to_period("M").unique()
+        if len(months) < 9:
+            raise ValueError("Not enough data for 6+3 month walk-forward")
+
+        results = []
+        for i in range(0, len(months) - 8):
+            in_months = months[i:i+6]
+            out_months = months[i+6:i+9]
+
+            in_df = all_df[all_df["timestamp"].dt.to_period("M").isin(in_months)]
+            out_df = all_df[all_df["timestamp"].dt.to_period("M").isin(out_months)]
+
+            in_files = [Path("__in_memory__.csv")]
+            out_files = [Path("__in_memory__.csv")]
+
+            in_df.to_csv(in_files[0], index=False)
+            out_df.to_csv(out_files[0], index=False)
+
+            tmp_cfg_data_dir = cfg.data_dir
+            cfg.data_dir = str(in_files[0])
+            in_run = self._run_stream(model, scaler, meta, leverage=1.0)
+            cfg.data_dir = str(out_files[0])
+
+            kelly = kelly_fraction(in_run["metrics"]["trade_returns"])
+            lev_kelly = float(np.clip(kelly, 0.1, 3.0))
+            lev_vol = vol_target_leverage(in_run["equity_curve"])
+            leverage = lev_kelly if lev_kelly >= lev_vol else lev_vol
+
+            out_run = self._run_stream(model, scaler, meta, leverage=leverage)
+            cfg.data_dir = tmp_cfg_data_dir
+
+            results.append(out_run)
+
+        # Aggregate OOS metrics
+        all_trade_returns = np.concatenate([r["metrics"]["trade_returns"] for r in results if r["metrics"]["trade_returns"].size])
+        if all_trade_returns.size == 0:
+            raise ValueError("No out-of-sample trades produced")
+
+        final_metrics = compute_profitability_metrics(
+            results[-1]["report"],
+            results[-1]["equity_curve"],
+            results[-1]["trade_log"],
+        )
+        mc = monte_carlo_permutation_test(all_trade_returns, runs=500)
+        print(profitability_report(final_metrics, mc))
+        ev = float(final_metrics.get("expectancy", 0.0))
+        pf = float(final_metrics.get("profit_factor", 0.0))
+        max_dd = float(final_metrics.get("max_drawdown_pct", 0.0))
+        sharpe = float(final_metrics.get("sharpe_annualized", 0.0))
+        trade_returns = final_metrics.get("trade_returns", np.zeros(0, dtype=float))
+        win_rate = float(np.mean(trade_returns > 0.0) * 100.0) if trade_returns is not None and len(trade_returns) else 0.0
+        print(
+            f"EV per trade: {ev:.6f} | Profit Factor: {pf:.2f} | Max Drawdown: {max_dd:.2f}% | "
+            f"Sharpe: {sharpe:.2f} | Win Rate: {win_rate:.2f}%"
+        )
+        if ev < 0.0005 or pf < 1.4:
+            print("\033[91mRETRAIN WITH PROFIT MODE — current model is not profitable enough\033[0m")
+        report = {
+            "ev_per_trade": ev,
+            "expectancy": ev,
+            "profit_factor": pf,
+            "max_drawdown_pct": max_dd,
+            "sharpe": sharpe,
+            "win_rate_pct": win_rate,
+            "recommendation": "Retrain recommended" if ev < 0.0005 else "Hold model",
+        }
+        report_path = Path(self.model_dir) / "profit_report.json"
+        report_path.write_text(json.dumps(report, indent=2))
+
+        if final_metrics["profit_factor"] < 1.8 or final_metrics["max_drawdown_pct"] > 10.0:
+            print("UNPROFITABLE - REJECTED")
         else:
-            logits = out / temperature if abs(temperature - 1.0) > 1e-6 else out
-            probs = F.softmax(logits, dim=-1).detach().cpu().numpy()
+            update_strategy_registry(Path(self.model_dir), final_metrics.get("recovery_factor", 0.0))
 
-            for k, bar in enumerate(bar_batch):
-                raw_sig = _raw_signal_from_probs(probs[k], float(cfg.thr_long), float(cfg.thr_short), float(cfg.margin))
-                sig = consensus_filter.step(raw_sig)
-                sim.step(bar, signal=sig)
-                total_pred += 1
-
-        X_batch.clear()
-        bar_batch.clear()
-
-    print("[stream] Starting ...")
-    for window, _label, meta in streamer:
-        last_close_for_end = float(meta.get("close", np.nan))
-
-        o = float(meta.get("open", np.nan))
-        h = float(meta.get("high", np.nan))
-        l = float(meta.get("low", np.nan))
-        c = float(meta.get("close", np.nan))
-        atr_prev = meta.get("atr")
-        ema50 = float(window[-1, feature_cols.index("ema_50")]) if "ema_50" in feature_cols else np.nan
-        ema200 = float(window[-1, feature_cols.index("ema_200")]) if "ema_200" in feature_cols else np.nan
-
-        regime = None
-        if cfg.use_regime_filter and np.isfinite(ema50) and np.isfinite(ema200):
-            regime = 1 if ema50 > ema200 * 1.0005 else (-1 if ema50 < ema200 * 0.9995 else 0)
-
-        X_batch.append(window)
-        bar_batch.append(Bar(open=o, high=h, low=l, close=c, atr=atr_prev, ema_fast=ema50, ema_slow=ema200, regime=regime, timestamp=meta.get("timestamp")))
-
-        if len(X_batch) >= int(cfg.batch_size):
-            _flush_batch()
-
-        if total_pred and total_pred % 200_000 == 0:
-            print(f"[stream] predictions={total_pred:,} equity={fmt_money(sim.last_equity)} mdd={fmt_pct(sim.max_drawdown)}")
-
-    _flush_batch()
-    if last_close_for_end is not None:
-        sim.finalize(last_close_for_end)
-
-    report = sim.report()
-    if print_report:
-        print_portfolio_report(report, currency="$")
-
-    return {
-        "report": report,
-        "meta": meta,
-        "total_pred": int(total_pred),
-        "last_close": last_close_for_end,
-    }
-
-
-    return {
-        "report": report,
-        "meta": meta,
-        "total_pred": int(total_pred),
-        "last_close": last_close_for_end,
-    }
-
+        return {"metrics": final_metrics, "monte_carlo": mc}
 
 if __name__ == "__main__":
     setup_logging()
     files = _list_csvs(cfg.data_dir)
-    _run_backtest_for_files(files, cfg.model_dir, print_report=True)
+    model_root = Path(cfg.model_dir)
+    meta_path = model_root / "model_meta.json"
+    if meta_path.exists():
+        ProfitOptimizedBacktester(str(model_root), files).run()
+    else:
+        seq_dirs = sorted([p for p in model_root.glob("seq_*") if (p / "model_meta.json").exists()])
+        if not seq_dirs:
+            raise FileNotFoundError(f"model_meta.json not found in {cfg.model_dir} or any seq_* subdir")
+        for seq_dir in seq_dirs:
+            print(f"\n[seq] Running backtest for {seq_dir.name} ...")
+            ProfitOptimizedBacktester(str(seq_dir), files).run()

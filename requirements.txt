@@ -1,5 +1,7 @@
 # Core ML & Backtesting
 backtrader
+protobuf==5.28.3
+tensorflow
 torch
 scikit-learn>=1.8.0
 pandas
@@ -8,7 +10,7 @@ joblib
 matplotlib
 seaborn
 tqdm
-pandas-ta
+# pandas-ta
 TA-Lib
 
 # AWS & API
