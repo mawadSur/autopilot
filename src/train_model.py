@@ -177,13 +177,13 @@ def get_device(preferred: Optional[str] = None, force_cpu_on_mac: bool = True) -
     pref = (preferred or "").strip().lower()
     is_mac = platform.system() == "Darwin"
 
-    if pref:
-        if pref == "cuda":
-            return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        if pref == "mps":
-            if is_mac and force_cpu_on_mac:
-                return torch.device("cpu")
-            return torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+    if pref == "cpu":
+        return torch.device("cpu")
+    if pref == "gpu":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available() and not (is_mac and force_cpu_on_mac):
+            return torch.device("mps")
         return torch.device("cpu")
 
     if torch.cuda.is_available():
@@ -2711,6 +2711,42 @@ def env_default_bool(key: str, fallback: bool) -> bool:
     return str(v).strip().lower() in ("1", "true", "t", "yes", "y")
 
 
+def log_tf_device_info(device_choice: str) -> None:
+    if device_choice == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+    try:
+        import tensorflow as tf
+    except Exception as exc:
+        print("TensorFlow import failed:", exc)
+        return
+
+    print("TensorFlow version:", tf.__version__)
+    print("All physical devices:", tf.config.list_physical_devices())
+    print("Built with CUDA:", tf.test.is_built_with_cuda())
+
+    try:
+        gpus = tf.config.list_physical_devices("GPU")
+    except Exception as exc:
+        print("CUDA init failed while listing GPUs.")
+        print("Error:", exc)
+        print("Hints:")
+        print("- Ensure you are running under WSL2 (not WSL1) if using WSL.")
+        print("- Verify the NVIDIA Windows driver is WSL-compatible and up to date.")
+        print("- Check that /dev/dxg exists in WSL (GPU bridge).")
+        print("- Confirm your TensorFlow build supports your OS/driver combo.")
+        gpus = []
+
+    print("GPU backend available:", bool(gpus))
+
+    if device_choice in ("auto", "gpu") and gpus:
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except Exception as exc:
+                print(f"Could not set memory growth on {gpu}: {exc}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Memory-safe streaming trainer for LSTM classifier (meta-aware).")
     p.add_argument("--data-path", type=str, default=env_default("SM_CHANNEL_TRAIN", "eth_1m_data"))
@@ -2741,7 +2777,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--chunksize", type=int, default=500_000)
     p.add_argument("--price-col", type=str, default="close")
-    p.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
+    p.add_argument("--device", choices=["auto", "cpu", "gpu"], default="auto")
     p.add_argument("--force-cpu-on-mac", type=str2bool, default=True)
     p.add_argument("--grad-clip-norm", type=float, default=1.0, help="Gradient clipping norm (default 1.0)")
     p.add_argument("--detect-anomaly", type=str2bool, default=False, help="Enable autograd anomaly detection for debug runs")
@@ -2788,6 +2824,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     print("🚀 Training with clean profitability feature set (119 features) for maximum EV per trade...")
     args = build_parser().parse_args()
+    log_tf_device_info(args.device)
 
     def _parse_seq_lens(val):
         if val is None:
