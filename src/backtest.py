@@ -179,9 +179,9 @@ class ProfitOptimizedBacktester:
             if scaler is not None:
                 if hasattr(scaler, "feature_names_in_"):
                     assert list(scaler.feature_names_in_) == feature_cols
-                B, T, F = X.shape
+                B, T, n_features = X.shape
                 try:
-                    X = scaler.transform(X.reshape(B * T, F)).reshape(B, T, F).astype(np.float32, copy=False)
+                    X = scaler.transform(X.reshape(B * T, n_features)).reshape(B, T, n_features).astype(np.float32, copy=False)
                 except Exception:
                     pass
 

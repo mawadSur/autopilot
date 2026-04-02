@@ -243,6 +243,57 @@ ROLL_WINDOW = 20
 DEFAULT_SEQ_LENS = [60, 90, 120]
 DEFAULT_SEQ_LEN = 90
 
+REQUIRED_RAW_COLUMNS = ["open", "high", "low", "close", "volume"]
+
+OPTIONAL_MICROSTRUCTURE_RAW_COLUMNS = [
+    "best_bid", "best_ask", "bid_size_l1", "ask_size_l1",
+    "bid_depth_5", "ask_depth_5", "bid_depth_10", "ask_depth_10", "bid_depth_20", "ask_depth_20",
+    "vwap_bid_5", "vwap_ask_5", "vwap_bid_10", "vwap_ask_10", "vwap_bid_20", "vwap_ask_20",
+    "trade_count", "buy_count", "sell_count",
+    "taker_buy_volume_base", "taker_sell_volume_base",
+    "taker_buy_volume_quote", "taker_sell_volume_quote",
+    "volume_quote",
+]
+
+OPTIONAL_MICROSTRUCTURE_SIZE_COLUMNS = [
+    "bid_size_l1", "ask_size_l1",
+    "bid_depth_5", "ask_depth_5", "bid_depth_10", "ask_depth_10", "bid_depth_20", "ask_depth_20",
+    "taker_buy_volume_base", "taker_sell_volume_base",
+    "taker_buy_volume_quote", "taker_sell_volume_quote",
+    "trade_count", "buy_count", "sell_count",
+    "volume_quote",
+]
+
+OPTIONAL_MICROSTRUCTURE_PRICE_COLUMNS = [
+    "best_bid", "best_ask",
+    "vwap_bid_5", "vwap_ask_5", "vwap_bid_10", "vwap_ask_10", "vwap_bid_20", "vwap_ask_20",
+]
+
+
+def ensure_optional_microstructure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure optional bucket-2 raw columns exist with stable defaults."""
+    for col in OPTIONAL_MICROSTRUCTURE_RAW_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    for col in OPTIONAL_MICROSTRUCTURE_SIZE_COLUMNS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    for col in OPTIONAL_MICROSTRUCTURE_PRICE_COLUMNS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+        if ts.notna().any():
+            day = ts.dt.date
+            for col in OPTIONAL_MICROSTRUCTURE_PRICE_COLUMNS:
+                if col in df.columns:
+                    df[col] = df[col].groupby(day).ffill()
+    return df
+
+
 FEATURE_COLUMNS_PROFITABLE = [
     "open", "high", "low", "close", "volume",
     "return_1", "return_5", "return_15",
@@ -445,12 +496,12 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     Keeps the original OHLCV columns; adds engineered columns; fills early NaNs.
     """
 
-    required = ["open", "high", "low", "close", "volume"]
-    for col in required:
+    for col in REQUIRED_RAW_COLUMNS:
         if col not in df.columns:
             raise ValueError(f"Missing required column '{col}'")
 
     df = df.copy()
+    df = ensure_optional_microstructure_columns(df)
 
     # ---------- Price / return ----------
     df["return_1"] = df["close"].pct_change().fillna(0.0)
@@ -657,44 +708,6 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # ---------- Bucket 2 microstructure (optional inputs) ----------
     eps = 1e-12
-    bucket2_raw = [
-        "best_bid", "best_ask", "bid_size_l1", "ask_size_l1",
-        "bid_depth_5", "ask_depth_5", "bid_depth_10", "ask_depth_10", "bid_depth_20", "ask_depth_20",
-        "vwap_bid_5", "vwap_ask_5", "vwap_bid_10", "vwap_ask_10", "vwap_bid_20", "vwap_ask_20",
-        "trade_count", "buy_count", "sell_count",
-        "taker_buy_volume_base", "taker_sell_volume_base",
-        "taker_buy_volume_quote", "taker_sell_volume_quote",
-        "volume_quote",
-    ]
-    for c in bucket2_raw:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    # Fill sizes/volumes/counts with 0.0 when missing
-    size_like = [
-        "bid_size_l1", "ask_size_l1",
-        "bid_depth_5", "ask_depth_5", "bid_depth_10", "ask_depth_10", "bid_depth_20", "ask_depth_20",
-        "taker_buy_volume_base", "taker_sell_volume_base",
-        "taker_buy_volume_quote", "taker_sell_volume_quote",
-        "trade_count", "buy_count", "sell_count",
-        "volume_quote",
-    ]
-    for c in size_like:
-        if c in df.columns:
-            df[c] = df[c].fillna(0.0)
-
-    # Forward-fill price-like columns within the same day if timestamp exists
-    price_like = [
-        "best_bid", "best_ask",
-        "vwap_bid_5", "vwap_ask_5", "vwap_bid_10", "vwap_ask_10", "vwap_bid_20", "vwap_ask_20",
-    ]
-    if "timestamp" in df.columns:
-        ts = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-        if ts.notna().any():
-            day = ts.dt.date
-            for c in price_like:
-                if c in df.columns:
-                    df[c] = df[c].groupby(day).ffill()
 
     # Derived top-of-book features (if available)
     if "best_bid" in df.columns and "best_ask" in df.columns:
@@ -1046,6 +1059,11 @@ class SignalGenerator:
 __all__ = [
     # defaults
     "DEFAULT_SEQ_LENS", "DEFAULT_SEQ_LEN", "FEATURE_COLUMNS_PROFITABLE",
+    "REQUIRED_RAW_COLUMNS",
+    "OPTIONAL_MICROSTRUCTURE_RAW_COLUMNS",
+    "OPTIONAL_MICROSTRUCTURE_SIZE_COLUMNS",
+    "OPTIONAL_MICROSTRUCTURE_PRICE_COLUMNS",
+    "ensure_optional_microstructure_columns",
     "align_feature_columns",
     "PRICE_CANDIDATES",
     "ProfitOptimizedFeatureEngineer",
