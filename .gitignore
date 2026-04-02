@@ -19,3 +19,7 @@ eth_1s_data
 src/.env
 .venv\*
 .env
+model/
+*.pt
+model/
+model/
