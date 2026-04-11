@@ -25,15 +25,35 @@ class Bar:
     ema_fast: Optional[float] = None
     ema_slow: Optional[float] = None
     regime: Optional[int] = None  # +1 up, -1 down, 0 flat
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    bid_depth_5: Optional[float] = None
+    ask_depth_5: Optional[float] = None
+    bid_depth_10: Optional[float] = None
+    ask_depth_10: Optional[float] = None
+    bid_depth_20: Optional[float] = None
+    ask_depth_20: Optional[float] = None
+    vwap_bid_5: Optional[float] = None
+    vwap_ask_5: Optional[float] = None
+    vwap_bid_10: Optional[float] = None
+    vwap_ask_10: Optional[float] = None
+    vwap_bid_20: Optional[float] = None
+    vwap_ask_20: Optional[float] = None
 
 
 @dataclass
 class SimulationConfig:
     start_capital: float = 10_000.0
     fee_pct: float = 0.0008
+    maker_fee_pct: Optional[float] = None
     tp_pct: float = 0.005
     sl_pct: float = 0.0025
     slippage_pct: float = 0.0
+    use_market_depth: bool = True
+    use_hard_gating: bool = True
+    post_only_entries: bool = False
+    fallback_to_market_on_missing_book: bool = True
+    fallback_to_market_on_post_only_miss: bool = False
     cooldown: int = 0
     use_atr_stops: bool = False
     atr_tp_mult: float = 1.8
@@ -73,10 +93,14 @@ def print_portfolio_report(report: dict, currency: str = "$") -> None:
     avg_win_pct = p.get("avg_win_pct", None)
     avg_loss_pct = p.get("avg_loss_pct", None)
     exposure = p.get("exposure", None)
+    maker_fills = int(p.get("maker_fills", 0))
+    taker_fills = int(p.get("taker_fills", 0))
+    missed_entries = int(p.get("missed_entries", 0))
     multiple = float(end) / float(start) if start not in (None, 0) and end is not None else None
     print("\n=== PORTFOLIO MODE — SUMMARY ===")
     print(f"Bars processed : {n:,}")
     print(f"Trades         : {trades:,}  (wins {wins}, losses {losses}, win rate {wins/max(1,trades):.2%})")
+    print(f"Fills          : maker {maker_fills}, taker {taker_fills}, missed entries {missed_entries}")
     print(f"Start capital  : {fmt_money(start, currency)}")
     print(f"End equity     : {fmt_money(end, currency)}")
     if multiple is not None and np.isfinite(multiple):
@@ -143,6 +167,9 @@ class PortfolioSimulator:
         self.trades = 0
         self.wins = 0
         self.losses = 0
+        self.maker_fills = 0
+        self.taker_fills = 0
+        self.missed_entries = 0
         self.hold_bars_sum = 0.0
         self.hold_bars_count = 0
         self.gross_profit = 0.0
@@ -244,6 +271,9 @@ class PortfolioSimulator:
                 "trades": int(self.trades),
                 "wins": int(self.wins),
                 "losses": int(self.losses),
+                "maker_fills": int(self.maker_fills),
+                "taker_fills": int(self.taker_fills),
+                "missed_entries": int(self.missed_entries),
                 "avg_hold_bars": float(avg_hold),
                 "trades_per_day": float(trades_per_day),
                 "profit_factor": float(profit_factor),
@@ -262,6 +292,134 @@ class PortfolioSimulator:
         })
 
     # Internal helpers ------------------------------------------------
+    @staticmethod
+    def _opt_float(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            out = float(value)
+        except Exception:
+            return None
+        return out if np.isfinite(out) else None
+
+    def _maker_fee_pct(self) -> float:
+        if self.config.maker_fee_pct is None:
+            return float(self.config.fee_pct)
+        return float(self.config.maker_fee_pct)
+
+    def _book_available(self, bar: Bar) -> bool:
+        bid = self._opt_float(bar.best_bid)
+        ask = self._opt_float(bar.best_ask)
+        return bool(bid is not None and ask is not None and bid > 0.0 and ask >= bid)
+
+    def _book_spread(self, bar: Bar, reference_price: float) -> float:
+        if self._book_available(bar):
+            return max(0.0, float(bar.best_ask) - float(bar.best_bid))
+        return max(0.0, abs(reference_price) * float(self.config.slippage_pct) * 2.0)
+
+    def _fee_pct_for_role(self, liquidity_role: str) -> float:
+        return self._maker_fee_pct() if liquidity_role == "maker" else float(self.config.fee_pct)
+
+    def _fallback_market_fill(self, order_side: int, reference_price: float) -> float:
+        if order_side > 0:
+            return float(reference_price) * (1.0 + float(self.config.slippage_pct))
+        return float(reference_price) * (1.0 - float(self.config.slippage_pct))
+
+    def _book_curve(self, order_side: int, bar: Bar) -> Tuple[Optional[float], List[Tuple[float, float]]]:
+        if order_side > 0:
+            best = self._opt_float(bar.best_ask)
+            levels = [
+                (self._opt_float(bar.ask_depth_5), self._opt_float(bar.vwap_ask_5)),
+                (self._opt_float(bar.ask_depth_10), self._opt_float(bar.vwap_ask_10)),
+                (self._opt_float(bar.ask_depth_20), self._opt_float(bar.vwap_ask_20)),
+            ]
+        else:
+            best = self._opt_float(bar.best_bid)
+            levels = [
+                (self._opt_float(bar.bid_depth_5), self._opt_float(bar.vwap_bid_5)),
+                (self._opt_float(bar.bid_depth_10), self._opt_float(bar.vwap_bid_10)),
+                (self._opt_float(bar.bid_depth_20), self._opt_float(bar.vwap_bid_20)),
+            ]
+        out: List[Tuple[float, float]] = []
+        prev_depth = 0.0
+        for depth, avg in levels:
+            if depth is None or avg is None or depth <= prev_depth or depth <= 0.0 or avg <= 0.0:
+                continue
+            out.append((depth, avg))
+            prev_depth = depth
+        return best, out
+
+    def _depth_fill_price(
+        self,
+        order_side: int,
+        bar: Bar,
+        quantity_base: float,
+        reference_price: float,
+    ) -> Optional[float]:
+        if not self.config.use_market_depth:
+            return None
+
+        best, curve = self._book_curve(order_side, bar)
+        if best is None or best <= 0.0:
+            return None
+        if quantity_base <= 0.0:
+            return best
+        if not curve:
+            return best
+
+        prev_depth = 0.0
+        prev_price = best
+        prev_prev_depth = 0.0
+        prev_prev_price = best
+
+        for depth, avg_price in curve:
+            if quantity_base <= depth:
+                frac = (quantity_base - prev_depth) / max(depth - prev_depth, 1e-12)
+                return prev_price + frac * (avg_price - prev_price)
+            prev_prev_depth, prev_prev_price = prev_depth, prev_price
+            prev_depth, prev_price = depth, avg_price
+
+        slope = abs(prev_price - prev_prev_price) / max(prev_depth - prev_prev_depth, 1e-12)
+        if slope <= 0.0:
+            spread = self._book_spread(bar, reference_price)
+            slope = max(spread / max(prev_depth, 1e-12), abs(reference_price) * float(self.config.slippage_pct) / max(prev_depth, 1e-12))
+        extra_qty = quantity_base - prev_depth
+        direction = 1.0 if order_side > 0 else -1.0
+        return prev_price + direction * slope * extra_qty
+
+    def _market_fill_price(
+        self,
+        order_side: int,
+        bar: Bar,
+        reference_price: float,
+        quantity_base: float,
+    ) -> float:
+        depth_fill = self._depth_fill_price(order_side, bar, quantity_base, reference_price)
+        if depth_fill is not None:
+            return float(depth_fill)
+        return self._fallback_market_fill(order_side, reference_price)
+
+    def _post_only_limit_price(self, order_side: int, bar: Bar) -> Optional[float]:
+        if not self._book_available(bar):
+            return None
+        return float(bar.best_bid) if order_side > 0 else float(bar.best_ask)
+
+    def _post_only_filled(self, order_side: int, limit_price: float, bar: Bar) -> bool:
+        if order_side > 0:
+            return float(bar.low) <= float(limit_price)
+        return float(bar.high) >= float(limit_price)
+
+    def _record_missed_entry(self, side: int, bar: Bar, reason: str, limit_price: Optional[float]) -> None:
+        self.missed_entries += 1
+        if self.config.record_trades:
+            self.trade_log.append({
+                "timestamp": bar.timestamp,
+                "side": "long" if side > 0 else "short",
+                "action": "missed_entry",
+                "reason": reason,
+                "limit_price": limit_price,
+            })
+
     def _normalize_signal(self, sig: Optional[int]) -> int:
         if sig is None:
             return 0
@@ -311,10 +469,21 @@ class PortfolioSimulator:
         if sig == 0:
             return
 
-        if sig > 0:
-            self._enter_position(+1, bar)
-        elif sig < 0:
-            self._enter_position(-1, bar)
+        side = +1 if sig > 0 else -1
+        if self.config.post_only_entries:
+            limit_price = self._post_only_limit_price(side, bar)
+            if limit_price is None:
+                if not self.config.fallback_to_market_on_missing_book:
+                    self._record_missed_entry(side, bar, "missing_book", None)
+                    return
+            elif self._post_only_filled(side, limit_price, bar):
+                self._enter_position(side, bar, fill_price=limit_price, liquidity_role="maker", order_type="post_only")
+                return
+            elif not self.config.fallback_to_market_on_post_only_miss:
+                self._record_missed_entry(side, bar, "post_only_miss", limit_price)
+                return
+
+        self._enter_position(side, bar, liquidity_role="taker", order_type="market")
 
     def _handle_open(self, sig: int, bar: Bar) -> None:
         exit_price: Optional[float] = None
@@ -365,7 +534,9 @@ class PortfolioSimulator:
                     reason = "reverse"
 
         if exit_price is not None:
-            self._exit_position(exit_price, bar, reason)
+            liquidity_role = "maker" if reason == "target" else "taker"
+            order_type = "limit" if reason == "target" else "market"
+            self._exit_position(exit_price, bar, reason, liquidity_role=liquidity_role, order_type=order_type)
             return
 
         # Still in trade — update trailing reference and continue
@@ -374,16 +545,28 @@ class PortfolioSimulator:
         else:
             self.trail_price = min(self.trail_price or np.inf, bar.low, bar.close)
 
-    def _enter_position(self, side: int, bar: Bar) -> None:
+    def _enter_position(
+        self,
+        side: int,
+        bar: Bar,
+        *,
+        fill_price: Optional[float] = None,
+        liquidity_role: str = "taker",
+        order_type: str = "market",
+    ) -> None:
         price = float(bar.open)
-        if side > 0:
-            entry = price * (1.0 + self.config.slippage_pct)
+        provisional_tp, provisional_sl = self._compute_targets(price, bar.atr, side)
+        position_notional = self._compute_position_notional(price, provisional_sl)
+        quantity_base = position_notional / max(1e-12, price)
+
+        if fill_price is None:
+            entry = self._market_fill_price(side, bar, price, quantity_base)
         else:
-            entry = price * (1.0 - self.config.slippage_pct)
+            entry = float(fill_price)
 
         tp, sl = self._compute_targets(entry, bar.atr, side)
         position_notional = self._compute_position_notional(entry, sl)
-        fee_in = self.config.fee_pct * position_notional * self.config.leverage
+        fee_in = self._fee_pct_for_role(liquidity_role) * position_notional * self.config.leverage
         self.cash -= fee_in
 
         self.pos = side
@@ -394,6 +577,10 @@ class PortfolioSimulator:
         self.trail_price = entry
         self.entry_index = self.bar_index
         self.trades += 1
+        if liquidity_role == "maker":
+            self.maker_fills += 1
+        else:
+            self.taker_fills += 1
 
         if self.config.record_trades:
             self.trade_log.append({
@@ -403,24 +590,43 @@ class PortfolioSimulator:
                 "price": entry,
                 "tp": tp,
                 "sl": sl,
+                "liquidity_role": liquidity_role,
+                "order_type": order_type,
             })
 
-    def _exit_position(self, exit_price: float, bar: Bar, reason: str) -> None:
+    def _exit_position(
+        self,
+        exit_price: float,
+        bar: Bar,
+        reason: str,
+        *,
+        liquidity_role: str = "taker",
+        order_type: str = "market",
+    ) -> None:
         if self.entry_price is None:
             return
 
+        qty_base = self.position_size / max(1e-12, float(self.entry_price))
+        if liquidity_role == "maker":
+            exit_exec = float(exit_price)
+        else:
+            order_side = -1 if self.pos > 0 else +1
+            exit_exec = self._market_fill_price(order_side, bar, float(exit_price), qty_base)
+
         if self.pos > 0:
-            exit_exec = exit_price * (1.0 - self.config.slippage_pct)
             ret = (exit_exec / self.entry_price) - 1.0
         else:
-            exit_exec = exit_price * (1.0 + self.config.slippage_pct)
             ret = (self.entry_price / exit_exec) - 1.0
 
         pnl = ret * self.position_size * self.config.leverage
         cash_before = self.cash
         self.cash += pnl
-        fee_out = self.config.fee_pct * self.position_size * self.config.leverage
+        fee_out = self._fee_pct_for_role(liquidity_role) * self.position_size * self.config.leverage
         self.cash -= fee_out
+        if liquidity_role == "maker":
+            self.maker_fills += 1
+        else:
+            self.taker_fills += 1
 
         hold_bars = (self.bar_index - (self.entry_index or self.bar_index) + 1)
         self.hold_bars_sum += hold_bars
@@ -446,6 +652,8 @@ class PortfolioSimulator:
                 "ret": ret,
                 "win": bool(win),
                 "reason": reason,
+                "liquidity_role": liquidity_role,
+                "order_type": order_type,
                 "bars_held": hold_bars,
                 "equity": self.cash,
             })

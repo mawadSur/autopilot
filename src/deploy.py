@@ -49,6 +49,7 @@ _RAW_SCHEMA_COLUMNS = [
     "best_bid", "best_ask", "bid_size_l1", "ask_size_l1",
     "bid_depth_5", "ask_depth_5", "bid_depth_10", "ask_depth_10", "bid_depth_20", "ask_depth_20",
     "vwap_bid_5", "vwap_ask_5", "vwap_bid_10", "vwap_ask_10", "vwap_bid_20", "vwap_ask_20",
+    "book_poc", "book_va_low", "book_va_high",
     "trade_count", "buy_count", "sell_count",
     "taker_buy_volume_base", "taker_sell_volume_base",
     "taker_buy_volume_quote", "taker_sell_volume_quote",
@@ -104,6 +105,9 @@ def _drop_features_for_missing_raw(
         "vwap_ask_10": {"vwap_ask_10"},
         "vwap_bid_20": {"vwap_bid_20"},
         "vwap_ask_20": {"vwap_ask_20"},
+        "book_poc": {"book_poc"},
+        "book_va_low": {"book_va_low"},
+        "book_va_high": {"book_va_high"},
         "trade_count": {"trade_count"},
         "buy_count": {"buy_count"},
         "sell_count": {"sell_count"},
@@ -134,6 +138,12 @@ def _drop_features_for_missing_raw(
         "avg_trade_size_quote": {"trade_count", "volume_quote"},
         "ofi_over_depth_10": {"taker_buy_volume_base", "taker_sell_volume_base", "bid_depth_10", "ask_depth_10"},
         "spread_times_imbalance": {"best_bid", "best_ask", "bid_size_l1", "ask_size_l1"},
+        "close_over_book_poc": {"book_poc"},
+        "book_poc_distance_atr": {"book_poc"},
+        "book_value_area_width": {"book_va_low", "book_va_high"},
+        "book_in_value_area": {"book_va_low", "book_va_high"},
+        "book_above_va": {"book_va_high"},
+        "book_below_va": {"book_va_low"},
     }
 
     dropped = [f for f in desired_features if f in deps and not deps[f].isdisjoint(missing_set)]

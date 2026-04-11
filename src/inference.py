@@ -32,6 +32,7 @@ except Exception:
 # Project utils/models
 from utils import load_meta, build_windows
 from models import build_model_from_meta, load_checkpoint_state, load_state_dict_flexible
+from strategy_gate import StrategyGate
 from config import cfg
 
 
@@ -128,7 +129,7 @@ def input_fn(request_body: str, content_type: str):
 def predict_fn(input_object: Dict[str, Any], model_bundle):
     """
     Build windows and predict class probabilities.
-    Output dict includes probs and hard labels using thresholds + margin gating.
+    Output dict includes probs and hard labels using thresholds + optional hard gating.
     """
     model, scaler, meta = model_bundle
     feature_cols: List[str] = list(meta["feature_cols"])  # strict: must exist
@@ -147,10 +148,17 @@ def predict_fn(input_object: Dict[str, Any], model_bundle):
 
     if X_flat.shape[0] < window_size:
         # Not enough rows to form a single window
-        return {"probs": [], "labels": [], "thresholds": {"long": thr_long, "short": thr_short}, "p_margin": p_margin}
+        return {
+            "probs": [],
+            "labels": [],
+            "thresholds": {"long": thr_long, "short": thr_short},
+            "p_margin": p_margin,
+            "use_hard_gating": bool(meta.get("use_hard_gating", getattr(cfg, "use_hard_gating", True))),
+        }
 
     # Build windows and scale
-    X = build_windows(X_flat, window_size)  # [W, T, F]
+    X_raw = build_windows(X_flat, window_size)  # [W, T, F]
+    X = X_raw.copy()
     if scaler is not None:
         W, T, F = X.shape
         X = scaler.transform(X.reshape(W * T, F)).reshape(W, T, F)
@@ -163,34 +171,24 @@ def predict_fn(input_object: Dict[str, Any], model_bundle):
         logits = model(xb)
         probs = F.softmax(logits, dim=-1).detach().cpu().numpy()
 
-    # Margin-gated signals
+    strategy_gate = StrategyGate(
+        thr_long=thr_long,
+        thr_short=thr_short,
+        margin=p_margin,
+        feature_cols=feature_cols,
+        use_hard_gating=bool(meta.get("use_hard_gating", getattr(cfg, "use_hard_gating", True))),
+    )
+
+    # Margin-gated signals with optional hard gate on the long side
     signals: List[int] = []
-    for row in probs:
-        row = np.asarray(row).flatten()
-        if row.size >= 3:
-            p_short, p_hold, p_long = row[:3]
-            max_prob = max(p_long, p_short)
-            top_two = np.sort(row[:3])[-2:]
-            gap = float(top_two[-1] - top_two[-2]) if len(top_two) == 2 else 0.0
-            if p_long >= p_short and p_long >= thr_long and gap >= p_margin:
-                signals.append(1)
-            elif p_short > p_long and p_short >= thr_short and gap >= p_margin:
-                signals.append(-1)
-            else:
-                signals.append(0)
-        elif row.size == 2:
-            p_short, p_long = float(row[0]), float(row[1])
-            max_prob = max(p_long, p_short)
-            gap = abs(p_long - p_short)
-            if p_long >= p_short and p_long >= thr_long and gap >= p_margin:
-                signals.append(1)
-            elif p_short > p_long and p_short >= thr_short and gap >= p_margin:
-                signals.append(-1)
-            else:
-                signals.append(0)
+    for idx, row in enumerate(probs):
+        raw_sig = strategy_gate.signal_from_probs(row, window=X_raw[idx])
+        if raw_sig == 2:
+            signals.append(1)
+        elif raw_sig == 0:
+            signals.append(-1)
         else:
-            p_long = float(row[0])
-            signals.append(1 if p_long >= thr_long else 0)
+            signals.append(0)
 
     # Preserve old behavior: if binary, expose class-1 probs; else full probs
     probs_out = probs[:, 1].tolist() if probs.shape[1] == 2 else probs.tolist()
@@ -199,6 +197,7 @@ def predict_fn(input_object: Dict[str, Any], model_bundle):
         "signals": signals,
         "thresholds": {"long": thr_long, "short": thr_short},
         "p_margin": p_margin,
+        "use_hard_gating": strategy_gate.use_hard_gating,
     }
 
 

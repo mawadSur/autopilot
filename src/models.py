@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional, Union, List, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 try:
     # Prefer joblib (faster, more common for sklearn objects)
@@ -32,7 +33,7 @@ except Exception:  # pragma: no cover
 import warnings
 warnings.filterwarnings("ignore")
 
-PROFIT_MODEL_VERSION = "profit_v2"
+PROFIT_MODEL_VERSION = "profit_v3"
 
 # ----------------------------
 # Model definition
@@ -84,6 +85,57 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+def _normalize_transformer_pooling(pooling: Optional[str], *, default: str = "cls") -> str:
+    pooling = str(pooling or default).strip().lower()
+    aliases = {
+        "last_attention": "weighted_last",
+        "last_step_attention": "weighted_last",
+        "weighted_last_step": "weighted_last",
+    }
+    pooling = aliases.get(pooling, pooling)
+    supported = {"cls", "weighted_last"}
+    if pooling not in supported:
+        raise ValueError(
+            f"Unsupported transformer pooling '{pooling}'. Expected one of {sorted(supported)}."
+        )
+    return pooling
+
+
+class WeightedLastStepAttention(nn.Module):
+    """Recency-biased last-step attention over encoded transformer states."""
+
+    def __init__(self, input_dim: int, *, init_decay: float = 0.35) -> None:
+        super().__init__()
+        self.query_proj = nn.Linear(input_dim, input_dim, bias=False)
+        self.key_proj = nn.Linear(input_dim, input_dim, bias=False)
+        self.gate_proj = nn.Linear(input_dim * 2, input_dim, bias=True)
+        self.recency_decay = nn.Parameter(torch.tensor(float(init_decay), dtype=torch.float32))
+        self.last_attention_weights: Optional[torch.Tensor] = None
+
+    def forward(self, H: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if H.ndim != 3:
+            raise ValueError(f"Expected [B, T, E] hidden states, got shape {tuple(H.shape)}")
+        if H.size(1) == 0:
+            raise ValueError("WeightedLastStepAttention requires at least one time step")
+
+        last_hidden = H[:, -1:, :]
+        query = self.query_proj(last_hidden)
+        keys = self.key_proj(H)
+        scores = torch.matmul(query, keys.transpose(1, 2)).squeeze(1) / math.sqrt(H.size(-1))
+
+        distances = torch.arange(H.size(1) - 1, -1, -1, device=H.device, dtype=H.dtype)
+        decay = F.softplus(self.recency_decay).to(device=H.device, dtype=H.dtype)
+        scores = scores - decay * distances.unsqueeze(0)
+
+        weights = torch.softmax(scores, dim=-1)
+        context = torch.bmm(weights.unsqueeze(1), H).squeeze(1)
+        last_step = last_hidden.squeeze(1)
+        gate = torch.sigmoid(self.gate_proj(torch.cat([last_step, context], dim=-1)))
+        pooled = gate * last_step + (1.0 - gate) * context
+        self.last_attention_weights = weights.detach()
+        return pooled, weights
+
+
 class TransformerClassifier(nn.Module):
     """Transformer encoder classifier that consumes [B, T, F] windows."""
 
@@ -99,8 +151,10 @@ class TransformerClassifier(nn.Module):
         feedforward_dim: Optional[int] = None,
         activation: str = "gelu",
         max_len: int = 10000,
+        pooling: str = "cls",
     ) -> None:
         super().__init__()
+        pooling = _normalize_transformer_pooling(pooling, default="cls")
         self.save_hyperparameters = {
             "input_size": input_size,
             "hidden_size": hidden_size,
@@ -111,10 +165,17 @@ class TransformerClassifier(nn.Module):
             "feedforward_dim": feedforward_dim,
             "activation": activation,
             "max_len": max_len,
+            "pooling": pooling,
         }
 
         self.input_proj = nn.Linear(input_size, hidden_size)
-        self.pos_encoder = PositionalEncoding(hidden_size, dropout=dropout, max_len=max_len)
+        if pooling == "cls":
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        else:
+            self.register_parameter("cls_token", None)
+        self.last_step_pool = WeightedLastStepAttention(hidden_size) if pooling == "weighted_last" else None
+        pos_max_len = max_len + 1 if pooling == "cls" else max_len
+        self.pos_encoder = PositionalEncoding(hidden_size, dropout=dropout, max_len=pos_max_len)
         ff_dim = feedforward_dim if feedforward_dim is not None else hidden_size * 4
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_size,
@@ -125,8 +186,7 @@ class TransformerClassifier(nn.Module):
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        
+        self.pooling = pooling
         self.norm = nn.LayerNorm(hidden_size)
         self.head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
@@ -134,20 +194,24 @@ class TransformerClassifier(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size // 2, num_classes)
         )
-        #self.head = nn.Linear(hidden_size, num_classes)
+        if self.cls_token is not None:
+            nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, F]
         x = self.input_proj(x)
-        x = self.pos_encoder(x)
-        x = self.encoder(x)
-        pooled = torch.mean(x, dim=1)  # [B, hidden_size]
+        if self.pooling == "cls":
+            cls = self.cls_token.expand(x.size(0), -1, -1).to(dtype=x.dtype)
+            x = torch.cat([cls, x], dim=1)
+            x = self.pos_encoder(x)
+            x = self.encoder(x)
+            pooled = x[:, 0, :]  # learned [CLS] summary
+        else:
+            x = self.pos_encoder(x)
+            x = self.encoder(x)
+            pooled, _weights = self.last_step_pool(x)
         pooled = self.norm(pooled)
-        return self.head(pooled)  # [B]
-
-        # last_step = x[:, -1, :]
-        # last_step = self.norm(last_step)
-        # return self.head(last_step)
+        return self.head(pooled)
 
 
 class Attention(nn.Module):
@@ -319,6 +383,7 @@ class ModelMeta:
     bidirectional: bool = False
     num_classes: int = 3
     task: str = "classification"
+    transformer_pooling: str = "weighted_last"
 
     # Artifacts (relative to model dir unless absolute)
     model_state_path: str = "model.pt"
@@ -340,6 +405,7 @@ class ModelMeta:
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "ModelMeta":
         # Accept flexible keys and sensible fallbacks
+        pooling = d.get("transformer_pooling", d.get("pooling", "cls"))
         return ModelMeta(
             input_size=int(d.get("input_size") or d.get("n_features") or d["features"]),
             hidden_size=int(d.get("hidden_size", 128)),
@@ -349,6 +415,7 @@ class ModelMeta:
             bidirectional=bool(d.get("bidirectional", False)),
             num_classes=int(d.get("num_classes", d.get("classes", 3))),
             task=str(d.get("task", "classification")),
+            transformer_pooling=_normalize_transformer_pooling(pooling, default="cls"),
             model_state_path=str(d.get("model_state_path", d.get("weights", "model.pt"))),
             scaler_path=d.get("scaler_path", d.get("scaler", "scaler.joblib")),
             feature_scaling=bool(d.get("feature_scaling", d.get("scale_features", True))),
@@ -385,6 +452,7 @@ def build_model_from_meta(meta: Union[ModelMeta, Dict[str, Any]]) -> nn.Module:
             num_heads=int(num_heads),
             dropout=meta.dropout,
             num_classes=meta.num_classes,
+            pooling=str(getattr(meta, "transformer_pooling", "cls")),
         )
     if model_type in {"lstm_attention", "lstm_attention_classifier", "lstm_classifier"}:
         return LSTMAttentionClassifier(

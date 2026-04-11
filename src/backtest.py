@@ -28,6 +28,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from logging_utils import setup_logging, logger
+from strategy_gate import StrategyGate
 
 from utils import (
     fmt_money,
@@ -53,7 +54,10 @@ try:
         PortfolioSimulator,
         print_portfolio_report,
     )
-    from streamer import KlineStreamer
+    try:
+        from src.streamer import KlineStreamer
+    except ModuleNotFoundError:
+        from streamer import KlineStreamer
 except ModuleNotFoundError:
     import sys
     ROOT = Path(__file__).resolve().parent.parent
@@ -65,7 +69,10 @@ except ModuleNotFoundError:
         PortfolioSimulator,
         print_portfolio_report,
     )
-    from streamer import KlineStreamer
+    try:
+        from src.streamer import KlineStreamer
+    except ModuleNotFoundError:
+        from streamer import KlineStreamer
 from config import cfg
 
 # -------------------------
@@ -74,20 +81,78 @@ from config import cfg
 def _list_csvs(path: str) -> List[Path]:
     return KlineStreamer._list_csvs(Path(path))
 
+
+def _opt_float(value: object) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    return out if np.isfinite(out) else None
+
+
+def _side_has_usable_l2_depth(meta_row: Dict[str, object], side: str) -> bool:
+    best_key = f"best_{side}"
+    best = _opt_float(meta_row.get(best_key))
+    if best is None or best <= 0.0:
+        return False
+
+    depth_keys = (
+        (f"{side}_depth_5", f"vwap_{side}_5"),
+        (f"{side}_depth_10", f"vwap_{side}_10"),
+        (f"{side}_depth_20", f"vwap_{side}_20"),
+    )
+    for depth_key, vwap_key in depth_keys:
+        depth = _opt_float(meta_row.get(depth_key))
+        vwap = _opt_float(meta_row.get(vwap_key))
+        if depth is not None and depth > 0.0 and vwap is not None and vwap > 0.0:
+            return True
+    return False
+
+
+def _bar_has_usable_l2_depth(meta_row: Dict[str, object]) -> bool:
+    return _side_has_usable_l2_depth(meta_row, "bid") and _side_has_usable_l2_depth(meta_row, "ask")
+
+
+def _warn_on_sparse_l2_depth(total_bars: int, missing_bars: int, *, threshold: float = 0.10) -> None:
+    total_bars = int(max(0, total_bars))
+    missing_bars = int(max(0, missing_bars))
+    if total_bars <= 0:
+        return
+
+    missing_ratio = float(missing_bars) / float(total_bars)
+    if missing_ratio <= float(threshold):
+        return
+
+    logger.warning(
+        "[backtest] L2 depth data missing on %.2f%% (%d/%d) of bars. "
+        "Depth-aware execution will fall back to top-of-book or ATR slippage heuristics more often.",
+        missing_ratio * 100.0,
+        missing_bars,
+        total_bars,
+    )
+
 # =========================
 # Gating (online)
 # =========================
-def _raw_signal_from_probs(p: np.ndarray, thr_long: float, thr_short: float, margin: float) -> int:
+def _raw_signal_from_probs(
+    p: np.ndarray,
+    thr_long: float,
+    thr_short: float,
+    margin: float,
+    feature_row: Optional[Dict[str, float]] = None,
+    window: Optional[np.ndarray] = None,
+    strategy_gate: Optional[StrategyGate] = None,
+) -> int:
     """
     p: [3] probabilities
     returns class: 0=short, 1=hold, 2=long
     """
-    p0, p1, p2 = float(p[0]), float(p[1]), float(p[2])
-    if (p2 >= thr_long) and (p2 - max(p0, p1) >= margin):
-        return 2
-    if (p0 >= thr_short) and (p0 - max(p2, p1) >= margin):
-        return 0
-    return 1
+    gate = strategy_gate or StrategyGate(
+        thr_long=thr_long,
+        thr_short=thr_short,
+        margin=margin,
+    )
+    return gate.signal_from_probs(p, window=window, feature_row=feature_row)
 
 class ConsensusFilter:
     """Require N consecutive identical non-hold signals before outputting them."""
@@ -146,6 +211,11 @@ class ProfitOptimizedBacktester:
             sl_pct=sl_pct,
             cooldown=int(cfg.cooldown),
             slippage_pct=0.0,
+            use_market_depth=True,
+            use_hard_gating=bool(getattr(cfg, "use_hard_gating", True)),
+            post_only_entries=True,
+            fallback_to_market_on_missing_book=True,
+            fallback_to_market_on_post_only_miss=False,
             use_atr_stops=bool(cfg.use_atr_stops),
             atr_tp_mult=float(cfg.atr_tp_mult),
             atr_sl_mult=float(cfg.atr_sl_mult),
@@ -156,11 +226,21 @@ class ProfitOptimizedBacktester:
         )
         sim = PortfolioSimulator(sim_cfg)
         consensus_filter = ConsensusFilter(int(cfg.consensus))
+        strategy_gate = StrategyGate(
+            thr_long=float(cfg.thr_long),
+            thr_short=float(cfg.thr_short),
+            margin=float(cfg.margin),
+            feature_cols=feature_cols,
+            use_hard_gating=bool(sim_cfg.use_hard_gating),
+        )
 
         X_batch: List[np.ndarray] = []
         bar_batch: List[Bar] = []
+        feature_meta_batch: List[Dict[str, float]] = []
         total_pred = 0
         last_close_for_end = None
+        total_bars = 0
+        missing_l2_bars = 0
 
         streamer = KlineStreamer(
             cfg.data_dir,
@@ -202,7 +282,15 @@ class ProfitOptimizedBacktester:
                 logits = out / temperature if abs(temperature - 1.0) > 1e-6 else out
                 probs = F.softmax(logits, dim=-1).detach().cpu().numpy()
                 for k, bar in enumerate(bar_batch):
-                    raw_sig = _raw_signal_from_probs(probs[k], float(cfg.thr_long), float(cfg.thr_short), float(cfg.margin))
+                    raw_sig = _raw_signal_from_probs(
+                        probs[k],
+                        float(cfg.thr_long),
+                        float(cfg.thr_short),
+                        float(cfg.margin),
+                        feature_meta_batch[k],
+                        window=X_batch[k],
+                        strategy_gate=strategy_gate,
+                    )
                     sig = consensus_filter.step(raw_sig)
                     atr = float(bar.atr) if bar.atr is not None and np.isfinite(bar.atr) else None
                     sim.config.slippage_pct = (0.5 * atr / max(1e-12, float(bar.close))) if atr is not None else 0.0
@@ -211,8 +299,12 @@ class ProfitOptimizedBacktester:
 
             X_batch.clear()
             bar_batch.clear()
+            feature_meta_batch.clear()
 
         for window, _label, meta_row in streamer:
+            total_bars += 1
+            if sim_cfg.use_market_depth and not _bar_has_usable_l2_depth(meta_row):
+                missing_l2_bars += 1
             last_close_for_end = float(meta_row.get("close", np.nan))
             o = float(meta_row.get("open", np.nan))
             h = float(meta_row.get("high", np.nan))
@@ -226,13 +318,39 @@ class ProfitOptimizedBacktester:
                 regime = 1 if ema50 > ema200 * 1.0005 else (-1 if ema50 < ema200 * 0.9995 else 0)
 
             X_batch.append(window)
-            bar_batch.append(Bar(open=o, high=h, low=l, close=c, atr=atr_prev, ema_fast=ema50, ema_slow=ema200, regime=regime, timestamp=meta_row.get("timestamp")))
+            feature_meta_batch.append(dict(meta_row))
+            bar_batch.append(Bar(
+                open=o,
+                high=h,
+                low=l,
+                close=c,
+                atr=atr_prev,
+                ema_fast=ema50,
+                ema_slow=ema200,
+                regime=regime,
+                timestamp=meta_row.get("timestamp"),
+                best_bid=meta_row.get("best_bid"),
+                best_ask=meta_row.get("best_ask"),
+                bid_depth_5=meta_row.get("bid_depth_5"),
+                ask_depth_5=meta_row.get("ask_depth_5"),
+                bid_depth_10=meta_row.get("bid_depth_10"),
+                ask_depth_10=meta_row.get("ask_depth_10"),
+                bid_depth_20=meta_row.get("bid_depth_20"),
+                ask_depth_20=meta_row.get("ask_depth_20"),
+                vwap_bid_5=meta_row.get("vwap_bid_5"),
+                vwap_ask_5=meta_row.get("vwap_ask_5"),
+                vwap_bid_10=meta_row.get("vwap_bid_10"),
+                vwap_ask_10=meta_row.get("vwap_ask_10"),
+                vwap_bid_20=meta_row.get("vwap_bid_20"),
+                vwap_ask_20=meta_row.get("vwap_ask_20"),
+            ))
             if len(X_batch) >= int(cfg.batch_size):
                 _flush_batch()
 
         _flush_batch()
         if last_close_for_end is not None:
             sim.finalize(last_close_for_end)
+        _warn_on_sparse_l2_depth(total_bars, missing_l2_bars)
 
         report = sim.report()
         equity_curve = sim.equity_curve()

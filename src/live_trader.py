@@ -41,7 +41,14 @@ try:
 except Exception:  # pragma: no cover - ccxt optional
     ccxt = None
 
-from utils import compute_features, load_model_bundle, fmt_money, FEATURE_COLUMNS_PROFITABLE, align_feature_columns
+from utils import (
+    apply_confluence_filter,
+    compute_features,
+    load_model_bundle,
+    fmt_money,
+    FEATURE_COLUMNS_PROFITABLE,
+    align_feature_columns,
+)
 from config import cfg
 try:
     from simulator import SimulationConfig, PortfolioSimulator, Bar
@@ -147,7 +154,7 @@ def regime_filter(df: pd.DataFrame) -> int:
     return 0
 
 
-def decide_direction(probs: np.ndarray, gating: GatingCfg) -> int:
+def decide_direction(probs: np.ndarray, gating: GatingCfg, feature_row: Optional[pd.Series] = None) -> int:
     """Return -1 (short), 0 (flat), or +1 (long) from class probabilities."""
     probs = np.asarray(probs).flatten()
     if probs.size >= 3:
@@ -157,22 +164,24 @@ def decide_direction(probs: np.ndarray, gating: GatingCfg) -> int:
         second_max = float(top_two[-2]) if len(top_two) == 2 else 0.0
         gap = float(max_prob - second_max)
         if p_long >= p_short and max_prob >= gating.thr_long and gap >= gating.margin:
-            return +1
+            return +1 if apply_confluence_filter(2, feature_row) == 2 else 0
         if p_short > p_long and max_prob >= gating.thr_short and gap >= gating.margin:
-            return -1
+            return -1 if apply_confluence_filter(0, feature_row) == 0 else 0
         return 0
     if probs.size == 2:
         # Treat final element as long probability, first as short/hold fallback.
         p_short = float(probs[0])
         p_long = float(probs[1])
         if p_long >= gating.thr_long and (p_long - p_short) >= gating.margin:
-            return +1
+            return +1 if apply_confluence_filter(2, feature_row) == 2 else 0
         if p_short >= gating.thr_short and (p_short - p_long) >= gating.margin:
-            return -1
+            return -1 if apply_confluence_filter(0, feature_row) == 0 else 0
         return 0
     if probs.size == 1:
         p_long = float(probs[0])
-        return +1 if p_long >= gating.thr_long else 0
+        if p_long < gating.thr_long:
+            return 0
+        return +1 if apply_confluence_filter(2, feature_row) == 2 else 0
     raise ValueError("Unsupported probability vector shape")
 
 
@@ -327,7 +336,8 @@ def run_loop() -> None:
         if probs.ndim == 0:
             probs = np.array([float(probs)])
 
-        direction = decide_direction(probs, gating)
+        last_row = feats.iloc[-1]
+        direction = decide_direction(probs, gating, last_row)
         consensus.push(direction)
 
         signal = 0
@@ -337,7 +347,6 @@ def run_loop() -> None:
             signal = -1
 
         # Build bar for simulator (executes previous pending signal)
-        last_row = feats.iloc[-1]
         bar = Bar(
             open=float(last_row["open"]),
             high=float(last_row["high"]),
@@ -346,6 +355,20 @@ def run_loop() -> None:
             atr=last_atr,
             regime=regime,
             timestamp=last_row.get("timestamp"),
+            best_bid=last_row.get("best_bid"),
+            best_ask=last_row.get("best_ask"),
+            bid_depth_5=last_row.get("bid_depth_5"),
+            ask_depth_5=last_row.get("ask_depth_5"),
+            bid_depth_10=last_row.get("bid_depth_10"),
+            ask_depth_10=last_row.get("ask_depth_10"),
+            bid_depth_20=last_row.get("bid_depth_20"),
+            ask_depth_20=last_row.get("ask_depth_20"),
+            vwap_bid_5=last_row.get("vwap_bid_5"),
+            vwap_ask_5=last_row.get("vwap_ask_5"),
+            vwap_bid_10=last_row.get("vwap_bid_10"),
+            vwap_ask_10=last_row.get("vwap_ask_10"),
+            vwap_bid_20=last_row.get("vwap_bid_20"),
+            vwap_ask_20=last_row.get("vwap_ask_20"),
         )
         sim.step(bar, signal=signal)
 

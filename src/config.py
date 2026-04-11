@@ -49,6 +49,7 @@ class TradingConfig(BaseSettings):
     thr_short: float = Field(0.75, env="THR_SHORT")
     margin: float = Field(0.25, env="MARGIN")
     consensus: int = Field(2, env="CONSENSUS")
+    use_hard_gating: bool = Field(True, env="USE_HARD_GATING")
 
     # Profit mode
     profit_mode: bool = Field(True, env="PROFIT_MODE")

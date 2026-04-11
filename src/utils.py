@@ -21,7 +21,7 @@ import math
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
 from collections import deque
 
 import matplotlib.pyplot as plt
@@ -58,6 +58,13 @@ try:
     import joblib
 except Exception:
     joblib = None
+
+try:
+    from sklearn.ensemble import GradientBoostingRegressor
+    from sklearn.feature_selection import mutual_info_regression
+except Exception:  # pragma: no cover
+    GradientBoostingRegressor = None
+    mutual_info_regression = None
 
 # Optional dotenv
 try:
@@ -249,6 +256,7 @@ OPTIONAL_MICROSTRUCTURE_RAW_COLUMNS = [
     "best_bid", "best_ask", "bid_size_l1", "ask_size_l1",
     "bid_depth_5", "ask_depth_5", "bid_depth_10", "ask_depth_10", "bid_depth_20", "ask_depth_20",
     "vwap_bid_5", "vwap_ask_5", "vwap_bid_10", "vwap_ask_10", "vwap_bid_20", "vwap_ask_20",
+    "book_poc", "book_va_low", "book_va_high",
     "trade_count", "buy_count", "sell_count",
     "taker_buy_volume_base", "taker_sell_volume_base",
     "taker_buy_volume_quote", "taker_sell_volume_quote",
@@ -267,6 +275,7 @@ OPTIONAL_MICROSTRUCTURE_SIZE_COLUMNS = [
 OPTIONAL_MICROSTRUCTURE_PRICE_COLUMNS = [
     "best_bid", "best_ask",
     "vwap_bid_5", "vwap_ask_5", "vwap_bid_10", "vwap_ask_10", "vwap_bid_20", "vwap_ask_20",
+    "book_poc", "book_va_low", "book_va_high",
 ]
 
 
@@ -306,10 +315,16 @@ FEATURE_COLUMNS_PROFITABLE = [
     "bb_mid_20", "bb_upper_20", "bb_lower_20", "bb_width_20", "bb_pctb_20",
     "vol_log", "vol_ma_20", "vol_z_20",
     "price_pos_donchian20", "vwap_roll_50",
+    "liq_sweep_high", "liq_sweep_low", "liq_sweep_high_strength", "liq_sweep_low_strength",
+    "avwap_spike", "avwap_cycle",
+    "close_over_avwap_spike", "close_over_avwap_cycle",
+    "avwap_spike_age", "avwap_cycle_age",
+    "in_golden_pocket", "dist_to_golden_pocket",
     # Bucket 2 raw microstructure inputs (optional)
     "best_bid", "best_ask", "bid_size_l1", "ask_size_l1",
     "bid_depth_5", "ask_depth_5", "bid_depth_10", "ask_depth_10", "bid_depth_20", "ask_depth_20",
     "vwap_bid_5", "vwap_ask_5", "vwap_bid_10", "vwap_ask_10", "vwap_bid_20", "vwap_ask_20",
+    "book_poc", "book_va_low", "book_va_high",
     "trade_count", "buy_count", "sell_count",
     "taker_buy_volume_base", "taker_sell_volume_base",
     "taker_buy_volume_quote", "taker_sell_volume_quote",
@@ -321,6 +336,8 @@ FEATURE_COLUMNS_PROFITABLE = [
     "total_taker_vol_base", "ofi_base", "ofi_ratio", "buy_sell_count_imb",
     "avg_trade_size_base", "avg_trade_size_quote",
     "ofi_over_depth_10", "spread_times_imbalance",
+    "close_over_book_poc", "book_poc_distance_atr",
+    "book_value_area_width", "book_in_value_area", "book_above_va", "book_below_va",
     # Time-of-day features
     "minute_of_day", "tod_sin", "tod_cos",
     "day_of_week", "dow_sin", "dow_cos",
@@ -338,27 +355,375 @@ FEATURE_COLUMNS_PROFITABLE = [
     "adx",
 ]
 
+FEATURE_COLUMNS = FEATURE_COLUMNS_PROFITABLE
+
+
+class LiquidityEngineer:
+    """Derive sweep, anchored VWAP, and order-book profile context."""
+
+    def __init__(
+        self,
+        *,
+        sweep_lookback: int = 20,
+        volume_anchor_window: int = 50,
+        volume_anchor_z: float = 2.0,
+        cycle_lookback: int = 50,
+        golden_pocket_lookback: int = 120,
+        value_area_pct: float = 0.70,
+    ) -> None:
+        self.sweep_lookback = int(max(3, sweep_lookback))
+        self.volume_anchor_window = int(max(10, volume_anchor_window))
+        self.volume_anchor_z = float(volume_anchor_z)
+        self.cycle_lookback = int(max(10, cycle_lookback))
+        self.golden_pocket_lookback = int(max(20, golden_pocket_lookback))
+        self.value_area_pct = float(min(max(value_area_pct, 0.50), 0.95))
+
+    @staticmethod
+    def _zscore(series: pd.Series, window: int) -> pd.Series:
+        mean = series.rolling(window, min_periods=1).mean()
+        std = series.rolling(window, min_periods=1).std().replace(0.0, np.nan)
+        return ((series - mean) / std).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    @staticmethod
+    def _bars_since(mask: pd.Series) -> pd.Series:
+        values = mask.fillna(False).astype(bool).to_numpy()
+        out = np.zeros(len(values), dtype=np.float64)
+        last_hit = 0
+        seen = False
+        for i, hit in enumerate(values):
+            if hit:
+                last_hit = i
+                seen = True
+                out[i] = 0.0
+            elif seen:
+                out[i] = float(i - last_hit)
+            else:
+                out[i] = float(i)
+        return pd.Series(out, index=mask.index)
+
+    @staticmethod
+    def _rolling_extrema_with_index(
+        series: pd.Series,
+        window: int,
+        *,
+        mode: str,
+    ) -> Tuple[pd.Series, pd.Series]:
+        values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+        n = len(values)
+        out_values = np.full(n, np.nan, dtype=np.float64)
+        out_indices = np.full(n, -1, dtype=np.int64)
+        dq: deque[int] = deque()
+        is_max = mode == "max"
+        if mode not in {"max", "min"}:
+            raise ValueError(f"Unsupported rolling extrema mode: {mode}")
+
+        fill_value = -np.inf if is_max else np.inf
+        clean = np.where(np.isfinite(values), values, fill_value)
+
+        for i in range(n):
+            start = i - window + 1
+            while dq and dq[0] < start:
+                dq.popleft()
+            if is_max:
+                while dq and clean[i] >= clean[dq[-1]]:
+                    dq.pop()
+            else:
+                while dq and clean[i] <= clean[dq[-1]]:
+                    dq.pop()
+            dq.append(i)
+            best_idx = dq[0]
+            out_indices[i] = best_idx
+            out_values[i] = clean[best_idx]
+
+        out_values = np.where(np.isfinite(out_values), out_values, np.nan)
+        return pd.Series(out_values, index=series.index), pd.Series(out_indices, index=series.index, dtype=np.int64)
+
+    @staticmethod
+    def _anchored_vwap(price: pd.Series, volume: pd.Series, anchor_mask: pd.Series) -> pd.Series:
+        px = pd.to_numeric(price, errors="coerce").ffill().fillna(0.0).to_numpy(dtype=np.float64, copy=False)
+        vol = pd.to_numeric(volume, errors="coerce").fillna(0.0).clip(lower=0.0).to_numpy(dtype=np.float64, copy=False)
+        anchors = anchor_mask.fillna(False).astype(bool).to_numpy(copy=True)
+        out = np.zeros(len(px), dtype=np.float64)
+        if len(px) == 0:
+            return pd.Series(dtype=np.float64)
+        anchors[0] = True
+
+        cum_pv = np.cumsum(px * vol)
+        cum_v = np.cumsum(vol)
+        anchor_idx = 0
+
+        for i in range(len(px)):
+            if anchors[i]:
+                anchor_idx = i
+            prev = anchor_idx - 1
+            base_pv = cum_pv[prev] if prev >= 0 else 0.0
+            base_v = cum_v[prev] if prev >= 0 else 0.0
+            denom = cum_v[i] - base_v
+            out[i] = (cum_pv[i] - base_pv) / max(denom, 1e-12)
+
+        return pd.Series(out, index=price.index)
+
+    @staticmethod
+    def _parse_book_level(level: Any) -> Optional[Tuple[float, float]]:
+        price = size = None
+        if isinstance(level, dict):
+            price = level.get("price", level.get("p", level.get("rate", level.get("px"))))
+            size = level.get("size", level.get("s", level.get("qty", level.get("q", level.get("amount", level.get("volume"))))))
+        elif isinstance(level, Sequence) and not isinstance(level, (str, bytes, bytearray)) and len(level) >= 2:
+            price, size = level[0], level[1]
+        if price is None or size is None:
+            return None
+        try:
+            price_f = float(price)
+            size_f = float(size)
+        except Exception:
+            return None
+        if not math.isfinite(price_f) or not math.isfinite(size_f) or size_f <= 0.0:
+            return None
+        return price_f, size_f
+
+    @classmethod
+    def _levels(cls, levels: Any, side: str) -> List[Tuple[float, float]]:
+        parsed: List[Tuple[float, float]] = []
+        if isinstance(levels, Sequence) and not isinstance(levels, (str, bytes, bytearray)):
+            for level in levels:
+                value = cls._parse_book_level(level)
+                if value is not None:
+                    parsed.append(value)
+        parsed.sort(key=lambda x: x[0], reverse=(side == "bid"))
+        return parsed
+
+    def _profile_from_levels(
+        self,
+        bids: Sequence[Tuple[float, float]],
+        asks: Sequence[Tuple[float, float]],
+    ) -> Dict[str, float]:
+        book: Dict[float, float] = {}
+        for price, size in list(bids) + list(asks):
+            if size <= 0.0:
+                continue
+            book[float(price)] = book.get(float(price), 0.0) + float(size)
+
+        if not book:
+            return {"book_poc": np.nan, "book_va_low": np.nan, "book_va_high": np.nan}
+
+        prices = np.array(sorted(book.keys()), dtype=np.float64)
+        sizes = np.array([book[p] for p in prices], dtype=np.float64)
+        total = float(sizes.sum())
+        if total <= 0.0:
+            return {"book_poc": np.nan, "book_va_low": np.nan, "book_va_high": np.nan}
+
+        poc_idx = int(np.argmax(sizes))
+        left = right = poc_idx
+        covered = float(sizes[poc_idx])
+        target = total * self.value_area_pct
+
+        while covered < target and (left > 0 or right < len(prices) - 1):
+            left_size = sizes[left - 1] if left > 0 else -1.0
+            right_size = sizes[right + 1] if right < len(prices) - 1 else -1.0
+            if right_size > left_size and right < len(prices) - 1:
+                right += 1
+                covered += float(sizes[right])
+            elif left > 0:
+                left -= 1
+                covered += float(sizes[left])
+            elif right < len(prices) - 1:
+                right += 1
+                covered += float(sizes[right])
+            else:
+                break
+
+        return {
+            "book_poc": float(prices[poc_idx]),
+            "book_va_low": float(prices[left]),
+            "book_va_high": float(prices[right]),
+        }
+
+    def add_liquidated_sweeps(self, df: pd.DataFrame) -> None:
+        eps = 1e-12
+        high = pd.to_numeric(df["high"], errors="coerce")
+        low = pd.to_numeric(df["low"], errors="coerce")
+        open_ = pd.to_numeric(df["open"], errors="coerce")
+        close = pd.to_numeric(df["close"], errors="coerce")
+        atr = pd.to_numeric(df.get("atr_14", (high - low).rolling(14, min_periods=1).mean()), errors="coerce").fillna(0.0)
+
+        prior_high = high.rolling(self.sweep_lookback, min_periods=2).max().shift(1)
+        prior_low = low.rolling(self.sweep_lookback, min_periods=2).min().shift(1)
+        candle_range = (high - low).abs().replace(0.0, eps)
+        upper_wick = (high - pd.concat([open_, close], axis=1).max(axis=1)).clip(lower=0.0)
+        lower_wick = (pd.concat([open_, close], axis=1).min(axis=1) - low).clip(lower=0.0)
+
+        sweep_high = (high > prior_high) & (close < prior_high)
+        sweep_low = (low < prior_low) & (close > prior_low)
+
+        high_extension = (high - prior_high).clip(lower=0.0)
+        low_extension = (prior_low - low).clip(lower=0.0)
+        high_reclaim = (prior_high - close).clip(lower=0.0)
+        low_reclaim = (close - prior_low).clip(lower=0.0)
+
+        df["liq_sweep_high"] = sweep_high.astype(float)
+        df["liq_sweep_low"] = sweep_low.astype(float)
+        df["liq_sweep_high_strength"] = np.where(
+            sweep_high,
+            (high_extension + high_reclaim + upper_wick) / (atr + candle_range + eps),
+            0.0,
+        )
+        df["liq_sweep_low_strength"] = np.where(
+            sweep_low,
+            (low_extension + low_reclaim + lower_wick) / (atr + candle_range + eps),
+            0.0,
+        )
+
+    def add_anchored_vwap(self, df: pd.DataFrame) -> None:
+        eps = 1e-12
+        close = pd.to_numeric(df["close"], errors="coerce").ffill().fillna(0.0)
+        high = pd.to_numeric(df["high"], errors="coerce").ffill().fillna(close)
+        low = pd.to_numeric(df["low"], errors="coerce").ffill().fillna(close)
+        hlc3 = pd.to_numeric(df.get("hlc3", (high + low + close) / 3.0), errors="coerce").ffill().fillna(close)
+        volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+        vol_z = self._zscore(volume, self.volume_anchor_window)
+        prev_spike_high = volume.rolling(self.volume_anchor_window, min_periods=2).max().shift(1)
+        spike_anchor = (vol_z >= self.volume_anchor_z) & (volume >= prev_spike_high.fillna(0.0))
+
+        prior_cycle_high = high.rolling(self.cycle_lookback, min_periods=2).max().shift(1)
+        prior_cycle_low = low.rolling(self.cycle_lookback, min_periods=2).min().shift(1)
+        cycle_anchor = (high > prior_cycle_high) | (low < prior_cycle_low)
+
+        spike_anchor = spike_anchor.fillna(False)
+        cycle_anchor = cycle_anchor.fillna(False)
+
+        df["avwap_spike"] = self._anchored_vwap(hlc3, volume, spike_anchor)
+        df["avwap_cycle"] = self._anchored_vwap(hlc3, volume, cycle_anchor)
+        df["close_over_avwap_spike"] = (close / df["avwap_spike"].replace(0.0, eps)) - 1.0
+        df["close_over_avwap_cycle"] = (close / df["avwap_cycle"].replace(0.0, eps)) - 1.0
+        df["avwap_spike_age"] = self._bars_since(spike_anchor | pd.Series(np.arange(len(df)) == 0, index=df.index))
+        df["avwap_cycle_age"] = self._bars_since(cycle_anchor | pd.Series(np.arange(len(df)) == 0, index=df.index))
+
+    def add_fibonacci_golden_pocket(self, df: pd.DataFrame) -> None:
+        eps = 1e-12
+        close = pd.to_numeric(df["close"], errors="coerce").ffill().fillna(0.0)
+        high = pd.to_numeric(df["high"], errors="coerce").ffill().fillna(close)
+        low = pd.to_numeric(df["low"], errors="coerce").ffill().fillna(close)
+        atr = pd.to_numeric(df.get("atr_14", (high - low).rolling(14, min_periods=1).mean()), errors="coerce").fillna(0.0)
+
+        swing_high, swing_high_idx = self._rolling_extrema_with_index(
+            high,
+            self.golden_pocket_lookback,
+            mode="max",
+        )
+        swing_low, swing_low_idx = self._rolling_extrema_with_index(
+            low,
+            self.golden_pocket_lookback,
+            mode="min",
+        )
+        swing_range = (swing_high - swing_low).clip(lower=0.0)
+        valid_range = swing_range > eps
+
+        long_gp_low = swing_high - (0.66 * swing_range)
+        long_gp_high = swing_high - (0.618 * swing_range)
+        short_gp_low = swing_low + (0.618 * swing_range)
+        short_gp_high = swing_low + (0.66 * swing_range)
+
+        upswing_active = valid_range & (swing_high_idx > swing_low_idx)
+        downswing_active = valid_range & (swing_low_idx > swing_high_idx)
+
+        gp_low = pd.Series(np.nan, index=df.index, dtype=np.float64)
+        gp_high = pd.Series(np.nan, index=df.index, dtype=np.float64)
+        gp_low = gp_low.mask(upswing_active, long_gp_low)
+        gp_high = gp_high.mask(upswing_active, long_gp_high)
+        gp_low = gp_low.mask(downswing_active, short_gp_low)
+        gp_high = gp_high.mask(downswing_active, short_gp_high)
+
+        in_pocket = valid_range & gp_low.notna() & gp_high.notna() & (close >= gp_low) & (close <= gp_high)
+        gap_below = (gp_low - close).clip(lower=0.0)
+        gap_above = (close - gp_high).clip(lower=0.0)
+        dist = (gap_below + gap_above).where(~in_pocket, 0.0)
+        dist = dist.where(valid_range & gp_low.notna() & gp_high.notna(), 0.0)
+
+        df["in_golden_pocket"] = in_pocket.astype(float)
+        df["dist_to_golden_pocket"] = dist / (atr + eps)
+
+    def add_volume_profile_context(self, df: pd.DataFrame) -> None:
+        eps = 1e-12
+        profile_cols = ("book_poc", "book_va_low", "book_va_high")
+        if "bids" in df.columns and "asks" in df.columns:
+            profiles = []
+            for _, row in df.iterrows():
+                bids = self._levels(row.get("bids", []), "bid")
+                asks = self._levels(row.get("asks", []), "ask")
+                profiles.append(self._profile_from_levels(bids, asks))
+            profile_df = pd.DataFrame(profiles, index=df.index)
+            for col in profile_cols:
+                existing = pd.to_numeric(df[col], errors="coerce") if col in df.columns else pd.Series(np.nan, index=df.index)
+                df[col] = existing.where(existing.notna(), profile_df[col])
+        else:
+            for col in profile_cols:
+                if col not in df.columns:
+                    df[col] = np.nan
+
+        close = pd.to_numeric(df["close"], errors="coerce").ffill().fillna(0.0)
+        atr = pd.to_numeric(df.get("atr_14", 0.0), errors="coerce").fillna(0.0)
+        poc = pd.to_numeric(df["book_poc"], errors="coerce")
+        va_low = pd.to_numeric(df["book_va_low"], errors="coerce")
+        va_high = pd.to_numeric(df["book_va_high"], errors="coerce")
+        va_width = (va_high - va_low).clip(lower=0.0)
+
+        df["close_over_book_poc"] = (close / poc.replace(0.0, eps)) - 1.0
+        df["book_poc_distance_atr"] = (close - poc) / (atr + eps)
+        df["book_value_area_width"] = va_width / close.replace(0.0, eps)
+        df["book_in_value_area"] = ((close >= va_low) & (close <= va_high)).astype(float)
+        df["book_above_va"] = (close > va_high).astype(float)
+        df["book_below_va"] = (close < va_low).astype(float)
+
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        self.add_liquidated_sweeps(df)
+        self.add_anchored_vwap(df)
+        self.add_fibonacci_golden_pocket(df)
+        self.add_volume_profile_context(df)
+        return df
+
 class ProfitOptimizedFeatureEngineer:
     """
     Profit-obsessed feature selector.
 
     - Computes forward returns
-    - Ranks features by correlation to 5-min forward return
-    - Drops low-corr features and those that increase walk-forward drawdown
+    - Ranks features with nonlinear dependency scores
+    - Uses mutual information plus gradient-boosted tree importance
+    - Drops weak-signal features and those that increase walk-forward drawdown
     """
 
     def __init__(
         self,
         *,
         horizon_bars: int = 5,
-        min_abs_corr: float = 0.02,
+        min_score: float = 0.02,
+        min_abs_corr: Optional[float] = None,
         walk_folds: int = 3,
         drawdown_tolerance: float = 1e-6,
+        mi_neighbors: int = 5,
+        tree_sample_rows: int = 25_000,
+        tree_estimators: int = 125,
+        random_state: int = 42,
+        ranking_method: str = "combined",
     ) -> None:
         self.horizon_bars = int(max(1, horizon_bars))
-        self.min_abs_corr = float(min_abs_corr)
+        if min_abs_corr is not None:
+            min_score = float(min_abs_corr)
+        self.min_score = float(max(0.0, min_score))
         self.walk_folds = int(max(2, walk_folds))
         self.drawdown_tolerance = float(drawdown_tolerance)
+        self.mi_neighbors = int(max(1, mi_neighbors))
+        self.tree_sample_rows = int(max(1_000, tree_sample_rows))
+        self.tree_estimators = int(max(25, tree_estimators))
+        self.random_state = int(random_state)
+        ranking_method = str(ranking_method or "combined").strip().lower()
+        if ranking_method in {"mi", "mutual_info"}:
+            ranking_method = "mutual_information"
+        if ranking_method not in {"combined", "mutual_information", "tree_importance"}:
+            raise ValueError(f"Unsupported ranking_method: {ranking_method}")
+        self.ranking_method = ranking_method
+        self.selection_summary_: Dict[str, Any] = {}
 
     @staticmethod
     def _max_drawdown(equity: np.ndarray) -> float:
@@ -375,23 +740,176 @@ class ProfitOptimizedFeatureEngineer:
         fwd = prices.pct_change(self.horizon_bars).shift(-self.horizon_bars)
         return fwd
 
-    def rank_by_correlation(
+    def _prepare_selection_arrays(
+        self,
+        df: pd.DataFrame,
+        feature_cols: List[str],
+        price_col: str,
+    ) -> Tuple[List[str], np.ndarray, np.ndarray]:
+        available = [c for c in feature_cols if c in df.columns]
+        if not available:
+            return [], np.empty((0, 0), dtype=np.float32), np.empty((0,), dtype=np.float32)
+
+        feat_df = df[available].apply(pd.to_numeric, errors="coerce")
+        fwd = self.compute_forward_returns(df, price_col).to_numpy(dtype=np.float32, copy=False)
+        feat_mat = feat_df.to_numpy(dtype=np.float32, copy=False)
+        valid_mask = np.isfinite(fwd)
+        if feat_mat.size:
+            valid_mask &= np.any(np.isfinite(feat_mat), axis=1)
+        feat_mat = feat_mat[valid_mask]
+        fwd = fwd[valid_mask]
+        feat_mat = np.nan_to_num(feat_mat, nan=0.0, posinf=0.0, neginf=0.0)
+        return available, feat_mat, fwd
+
+    @staticmethod
+    def _normalize_scores(scores: Dict[str, float], ordered_features: List[str]) -> Dict[str, float]:
+        if not scores:
+            return {}
+        vals = np.array([max(0.0, float(scores.get(f, 0.0))) for f in ordered_features], dtype=np.float32)
+        peak = float(np.max(vals)) if vals.size else 0.0
+        if peak <= 0.0:
+            return {f: 0.0 for f in ordered_features}
+        return {f: float(max(0.0, scores.get(f, 0.0)) / peak) for f in ordered_features}
+
+    @staticmethod
+    def _discrete_feature_mask(feat_mat: np.ndarray) -> np.ndarray:
+        if feat_mat.ndim != 2 or feat_mat.shape[1] == 0:
+            return np.zeros((0,), dtype=bool)
+        out = np.zeros(feat_mat.shape[1], dtype=bool)
+        for j in range(feat_mat.shape[1]):
+            col = feat_mat[:, j]
+            col = col[np.isfinite(col)]
+            if col.size == 0:
+                continue
+            uniques = np.unique(col)
+            if uniques.size <= 12 and np.all(np.isclose(uniques, np.round(uniques), atol=1e-6)):
+                out[j] = True
+        return out
+
+    def rank_by_mutual_information(
         self,
         df: pd.DataFrame,
         feature_cols: List[str],
         price_col: str,
     ) -> Dict[str, float]:
-        fwd = self.compute_forward_returns(df, price_col)
-        corr = {}
-        for c in feature_cols:
-            if c not in df.columns:
-                continue
-            v = pd.to_numeric(df[c], errors="coerce")
-            corr_val = v.corr(fwd)
-            if corr_val is None or not np.isfinite(corr_val):
-                continue
-            corr[c] = float(corr_val)
-        return corr
+        if mutual_info_regression is None:
+            return {}
+
+        available, feat_mat, fwd = self._prepare_selection_arrays(df, feature_cols, price_col)
+        if not available or feat_mat.shape[0] < 32:
+            return {}
+
+        discrete_mask = self._discrete_feature_mask(feat_mat)
+        n_neighbors = min(self.mi_neighbors, max(1, feat_mat.shape[0] - 1))
+        scores = mutual_info_regression(
+            feat_mat,
+            fwd,
+            discrete_features=discrete_mask,
+            n_neighbors=n_neighbors,
+            random_state=self.random_state,
+            n_jobs=-1,
+        )
+        return {
+            feature: float(max(0.0, score))
+            for feature, score in zip(available, scores)
+            if np.isfinite(score)
+        }
+
+    def rank_by_tree_importance(
+        self,
+        df: pd.DataFrame,
+        feature_cols: List[str],
+        price_col: str,
+    ) -> Dict[str, float]:
+        if GradientBoostingRegressor is None:
+            return {}
+
+        available, feat_mat, fwd = self._prepare_selection_arrays(df, feature_cols, price_col)
+        if not available or feat_mat.shape[0] < 256:
+            return {}
+
+        if feat_mat.shape[0] > self.tree_sample_rows:
+            rng = np.random.default_rng(self.random_state)
+            idx = np.sort(rng.choice(feat_mat.shape[0], size=self.tree_sample_rows, replace=False))
+            feat_mat = feat_mat[idx]
+            fwd = fwd[idx]
+
+        model = GradientBoostingRegressor(
+            loss="squared_error",
+            learning_rate=0.05,
+            n_estimators=self.tree_estimators,
+            max_depth=3,
+            subsample=0.7,
+            random_state=self.random_state,
+        )
+        model.fit(feat_mat, fwd)
+        scores = np.asarray(getattr(model, "feature_importances_", np.zeros(len(available))), dtype=np.float32)
+        return {
+            feature: float(max(0.0, score))
+            for feature, score in zip(available, scores)
+            if np.isfinite(score)
+        }
+
+    def rank_features(
+        self,
+        df: pd.DataFrame,
+        feature_cols: List[str],
+        price_col: str,
+    ) -> Dict[str, float]:
+        mi_scores = self.rank_by_mutual_information(df, feature_cols, price_col)
+        tree_scores = self.rank_by_tree_importance(df, feature_cols, price_col)
+        ordered = [c for c in feature_cols if c in df.columns]
+        if not ordered:
+            return {}
+
+        mi_norm = self._normalize_scores(mi_scores, ordered)
+        tree_norm = self._normalize_scores(tree_scores, ordered)
+        use_tree = any(v > 0.0 for v in tree_norm.values())
+        scores: Dict[str, float] = {}
+        ranking_label = self.ranking_method
+        if self.ranking_method == "mutual_information":
+            scores = {feature: mi_norm.get(feature, 0.0) for feature in ordered}
+        elif self.ranking_method == "tree_importance":
+            if use_tree:
+                scores = {feature: tree_norm.get(feature, 0.0) for feature in ordered}
+            else:
+                scores = {feature: mi_norm.get(feature, 0.0) for feature in ordered}
+                ranking_label = "tree_importance_fallback_mutual_information"
+        else:
+            ranking_label = "mutual_information+gradient_boosting_importance"
+            for feature in ordered:
+                mi_score = mi_norm.get(feature, 0.0)
+                if use_tree:
+                    scores[feature] = 0.65 * mi_score + 0.35 * tree_norm.get(feature, 0.0)
+                else:
+                    scores[feature] = mi_score
+
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        self.selection_summary_ = {
+            "ranking_method": ranking_label,
+            "combined_top": ranked[:10],
+            "mi_top": sorted(mi_scores.items(), key=lambda item: item[1], reverse=True)[:10],
+            "tree_top": sorted(tree_scores.items(), key=lambda item: item[1], reverse=True)[:10],
+        }
+        return scores
+
+    @staticmethod
+    def _feature_direction(values: np.ndarray, fwd: np.ndarray) -> float:
+        if values.size < 32 or fwd.size != values.size:
+            return 0.0
+
+        lo_q, hi_q = np.quantile(values, [0.2, 0.8])
+        lo_mask = values <= lo_q
+        hi_mask = values >= hi_q
+        if int(lo_mask.sum()) >= 8 and int(hi_mask.sum()) >= 8:
+            edge = float(np.nanmean(fwd[hi_mask]) - np.nanmean(fwd[lo_mask]))
+            if np.isfinite(edge) and abs(edge) > 1e-12:
+                return float(np.sign(edge))
+
+        corr = np.corrcoef(values, fwd)[0, 1] if values.size >= 2 else np.nan
+        if np.isfinite(corr) and abs(corr) > 1e-12:
+            return float(np.sign(corr))
+        return 0.0
 
     def _walk_forward_indices(self, n: int) -> List[Tuple[int, int]]:
         fold = max(1, n // self.walk_folds)
@@ -407,10 +925,17 @@ class ProfitOptimizedFeatureEngineer:
     def _portfolio_returns(
         self,
         features: np.ndarray,
-        corrs: np.ndarray,
+        directions: np.ndarray,
         fwd: np.ndarray,
     ) -> np.ndarray:
-        pos = np.sign(features * corrs.reshape(1, -1))
+        if features.size == 0 or directions.size == 0:
+            return np.zeros_like(fwd)
+        medians = np.nanmedian(features, axis=0, keepdims=True)
+        centered = features - medians
+        active = np.abs(directions) > 0.0
+        if not np.any(active):
+            return np.zeros_like(fwd)
+        pos = np.sign(centered[:, active] * directions[active].reshape(1, -1))
         avg_pos = np.nanmean(pos, axis=1)
         return avg_pos * fwd
 
@@ -421,33 +946,29 @@ class ProfitOptimizedFeatureEngineer:
         *,
         price_col: str = "close",
     ) -> List[str]:
-        corr = self.rank_by_correlation(df, feature_cols, price_col)
-        if not corr:
+        scores = self.rank_features(df, feature_cols, price_col)
+        if not scores:
             return list(feature_cols)
 
-        ranked = sorted(corr.items(), key=lambda x: abs(x[1]), reverse=True)
-        candidates = [f for f, c in ranked if abs(c) >= self.min_abs_corr]
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        candidates = [f for f, score in ranked if score >= self.min_score]
         if not candidates:
-            # Keep top 20 by correlation if all are below threshold
             candidates = [f for f, _ in ranked[:20]]
 
-        fwd = self.compute_forward_returns(df, price_col).to_numpy(dtype=np.float32, copy=False)
-        feat_mat = df[candidates].to_numpy(dtype=np.float32, copy=False)
-        corr_arr = np.array([corr.get(c, 0.0) for c in candidates], dtype=np.float32)
-
-        # Clean NaNs
-        valid_mask = np.isfinite(fwd)
-        feat_mat = feat_mat[valid_mask]
-        fwd = fwd[valid_mask]
-        feat_mat = np.nan_to_num(feat_mat, nan=0.0, posinf=0.0, neginf=0.0)
+        _, feat_mat, fwd = self._prepare_selection_arrays(df, candidates, price_col)
 
         if feat_mat.shape[0] < 1000 or feat_mat.shape[1] < 2:
+            self.selection_summary_["selected_features"] = list(candidates)
             return list(candidates)
 
+        directions = np.array(
+            [self._feature_direction(feat_mat[:, j], fwd) for j in range(feat_mat.shape[1])],
+            dtype=np.float32,
+        )
         splits = self._walk_forward_indices(feat_mat.shape[0])
         baseline_dds: List[float] = []
         for a, b in splits:
-            r = self._portfolio_returns(feat_mat[a:b], corr_arr, fwd[a:b])
+            r = self._portfolio_returns(feat_mat[a:b], directions, fwd[a:b])
             equity = np.cumprod(1.0 + r)
             baseline_dds.append(self._max_drawdown(equity))
         baseline_dd = float(np.mean(baseline_dds)) if baseline_dds else 0.0
@@ -459,20 +980,19 @@ class ProfitOptimizedFeatureEngineer:
                 kept.append(feat)
                 continue
             mat_minus = np.delete(feat_mat, j, axis=1)
-            corr_minus = np.delete(corr_arr, j)
+            dir_minus = np.delete(directions, j)
             dd_list = []
             for a, b in splits:
-                r = self._portfolio_returns(mat_minus[a:b], corr_minus, fwd[a:b])
+                r = self._portfolio_returns(mat_minus[a:b], dir_minus, fwd[a:b])
                 equity = np.cumprod(1.0 + r)
                 dd_list.append(self._max_drawdown(equity))
             dd_minus = float(np.mean(dd_list)) if dd_list else 0.0
             if dd_minus + self.drawdown_tolerance < baseline_dd:
-                # Removing this feature improves drawdown => feature increases drawdown
                 continue
             kept.append(feat)
 
-        # Rank by correlation
-        kept_sorted = sorted(kept, key=lambda f: abs(corr.get(f, 0.0)), reverse=True)
+        kept_sorted = sorted(kept, key=lambda f: scores.get(f, 0.0), reverse=True)
+        self.selection_summary_["selected_features"] = list(kept_sorted)
         return kept_sorted
 
 
@@ -487,6 +1007,47 @@ def align_feature_columns(meta_feature_cols: Optional[List[str]], *, expected_si
             "Feature count mismatch. Retrain required — delete old checkpoint and retrain."
         )
     return meta_feature_cols
+
+
+def _feature_row_value(feature_row: Optional[Any], key: str, default: float = np.nan) -> float:
+    if feature_row is None:
+        return float(default)
+    value: Any = default
+    if hasattr(feature_row, "get"):
+        value = feature_row.get(key, default)
+    else:
+        try:
+            value = feature_row[key]
+        except Exception:
+            value = default
+    try:
+        out = float(value)
+    except Exception:
+        return float(default)
+    return out if np.isfinite(out) else float(default)
+
+
+def apply_confluence_filter(sig: int, feature_row: Optional[Any], *, avwap_cycle_band: float = 0.001) -> int:
+    """
+    Hard-gate class signals with liquidity / AVWAP confluence.
+
+    Signal convention: 0=short, 1=hold, 2=long.
+    """
+    sig = int(sig)
+    if sig not in (0, 2) or feature_row is None:
+        return sig
+
+    close_over_avwap_cycle = _feature_row_value(feature_row, "close_over_avwap_cycle", np.nan)
+    near_cycle_avwap = bool(
+        np.isfinite(close_over_avwap_cycle) and abs(close_over_avwap_cycle) <= float(avwap_cycle_band)
+    )
+
+    if sig == 2:
+        liq_sweep_low = _feature_row_value(feature_row, "liq_sweep_low", 0.0) > 0.5
+        return 2 if (liq_sweep_low or near_cycle_avwap) else 1
+
+    liq_sweep_high = _feature_row_value(feature_row, "liq_sweep_high", 0.0) > 0.5
+    return 0 if (liq_sweep_high or near_cycle_avwap) else 1
 
 
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -616,6 +1177,9 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     v = df["volume"].rolling(50, min_periods=1).sum().replace(0, 1e-12)
     df["vwap_roll_50"] = pv / v
     df["close_over_vwap_50"] = (df["close"] / df["vwap_roll_50"].replace(0, 1e-12)) - 1.0
+
+    # ---------- Liquidity context ----------
+    LiquidityEngineer().transform(df)
 
     # Price z-scores (log price)
     log_close = np.log(df["close"].replace(0, 1e-12))
@@ -1058,14 +1622,16 @@ class SignalGenerator:
 
 __all__ = [
     # defaults
-    "DEFAULT_SEQ_LENS", "DEFAULT_SEQ_LEN", "FEATURE_COLUMNS_PROFITABLE",
+    "DEFAULT_SEQ_LENS", "DEFAULT_SEQ_LEN", "FEATURE_COLUMNS", "FEATURE_COLUMNS_PROFITABLE",
     "REQUIRED_RAW_COLUMNS",
     "OPTIONAL_MICROSTRUCTURE_RAW_COLUMNS",
     "OPTIONAL_MICROSTRUCTURE_SIZE_COLUMNS",
     "OPTIONAL_MICROSTRUCTURE_PRICE_COLUMNS",
     "ensure_optional_microstructure_columns",
     "align_feature_columns",
+    "apply_confluence_filter",
     "PRICE_CANDIDATES",
+    "LiquidityEngineer",
     "ProfitOptimizedFeatureEngineer",
     # env / device / seed
     "load_dotenv", "set_seed", "get_device_str",

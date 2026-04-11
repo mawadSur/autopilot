@@ -38,6 +38,7 @@ L2_FEATURE_COLUMNS: List[str] = [
     "bid_depth_5", "ask_depth_5", "vwap_bid_5", "vwap_ask_5",
     "bid_depth_10", "ask_depth_10", "vwap_bid_10", "vwap_ask_10",
     "bid_depth_20", "ask_depth_20", "vwap_bid_20", "vwap_ask_20",
+    "book_poc", "book_va_low", "book_va_high",
 ]
 
 TRADE_AGG_COLUMNS: List[str] = [
@@ -318,6 +319,50 @@ def _levels(levels, side: str) -> List[Tuple[float, float]]:
     return parsed
 
 
+def _book_profile(
+    bids: Sequence[Tuple[float, float]],
+    asks: Sequence[Tuple[float, float]],
+    *,
+    value_area_pct: float = 0.70,
+) -> Tuple[float, float, float]:
+    book = {}
+    for price, size in list(bids) + list(asks):
+        if size <= 0.0:
+            continue
+        book[float(price)] = book.get(float(price), 0.0) + float(size)
+
+    if not book:
+        return np.nan, np.nan, np.nan
+
+    prices = np.array(sorted(book.keys()), dtype=float)
+    sizes = np.array([book[p] for p in prices], dtype=float)
+    total = float(sizes.sum())
+    if total <= 0.0:
+        return np.nan, np.nan, np.nan
+
+    poc_idx = int(np.argmax(sizes))
+    left = right = poc_idx
+    covered = float(sizes[poc_idx])
+    target = total * float(value_area_pct)
+
+    while covered < target and (left > 0 or right < len(prices) - 1):
+        left_size = sizes[left - 1] if left > 0 else -1.0
+        right_size = sizes[right + 1] if right < len(prices) - 1 else -1.0
+        if right_size > left_size and right < len(prices) - 1:
+            right += 1
+            covered += float(sizes[right])
+        elif left > 0:
+            left -= 1
+            covered += float(sizes[left])
+        elif right < len(prices) - 1:
+            right += 1
+            covered += float(sizes[right])
+        else:
+            break
+
+    return float(prices[poc_idx]), float(prices[left]), float(prices[right])
+
+
 def l2_snapshots_to_minute_features(df_snap: pd.DataFrame) -> pd.DataFrame:
     """Convert raw L2 snapshots into minute-level top-of-book/depth/vwap features."""
     if df_snap.empty:
@@ -327,6 +372,7 @@ def l2_snapshots_to_minute_features(df_snap: pd.DataFrame) -> pd.DataFrame:
     for _, row in df_snap.iterrows():
         bids = _levels(row.get("bids", []), "bid")
         asks = _levels(row.get("asks", []), "ask")
+        book_poc, book_va_low, book_va_high = _book_profile(bids, asks)
 
         rec = {
             "timestamp": row["timestamp"],
@@ -334,6 +380,9 @@ def l2_snapshots_to_minute_features(df_snap: pd.DataFrame) -> pd.DataFrame:
             "best_ask": asks[0][0] if asks else np.nan,
             "bid_size_l1": bids[0][1] if bids else 0.0,
             "ask_size_l1": asks[0][1] if asks else 0.0,
+            "book_poc": book_poc,
+            "book_va_low": book_va_low,
+            "book_va_high": book_va_high,
         }
 
         for n in (5, 10, 20):
@@ -600,7 +649,11 @@ def main() -> None:
                 l2_min = l2_snapshots_to_minute_features(l2_snap)
                 out = out.merge(l2_min, on="timestamp", how="left")
 
-                price_like = ["best_bid", "best_ask", "vwap_bid_5", "vwap_ask_5", "vwap_bid_10", "vwap_ask_10", "vwap_bid_20", "vwap_ask_20"]
+                price_like = [
+                    "best_bid", "best_ask",
+                    "vwap_bid_5", "vwap_ask_5", "vwap_bid_10", "vwap_ask_10", "vwap_bid_20", "vwap_ask_20",
+                    "book_poc", "book_va_low", "book_va_high",
+                ]
                 size_like = [c for c in L2_FEATURE_COLUMNS if c not in price_like]
                 present_price_like = [c for c in price_like if c in out.columns]
                 present_size_like = [c for c in size_like if c in out.columns]
