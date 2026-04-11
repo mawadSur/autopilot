@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from utils import compute_features, FEATURE_COLUMNS
+from utils import compute_features, FEATURE_COLUMNS, normalize_headers
 from history_coindesk import l2_snapshots_to_minute_features
 
 
@@ -151,6 +151,54 @@ def test_compute_features_handles_flat_golden_pocket_range():
 
     assert feats.loc[130, "in_golden_pocket"] == 0.0
     assert float(feats.loc[130, "dist_to_golden_pocket"]) == 0.0
+
+
+def test_normalize_headers_does_not_inject_legacy_multi_timeframe_features():
+    raw = pd.DataFrame(
+        [
+            [pd.Timestamp("2024-01-01T00:00:00Z"), 100.0, 101.0, 99.0, 100.5, 10.0],
+            [pd.Timestamp("2024-01-01T00:01:00Z"), 100.5, 101.5, 100.0, 101.0, 12.0],
+        ],
+        columns=[0, 1, 2, 3, 4, 5],
+    )
+
+    normalized = normalize_headers(raw)
+
+    assert list(normalized.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+    assert "ema_1h" not in normalized.columns
+    assert "price_vs_ema1h" not in normalized.columns
+
+
+def test_compute_features_multi_timeframe_columns_are_prefix_stable():
+    n = 180
+    ts = pd.date_range("2024-01-01", periods=n, freq="min", tz="UTC")
+    base = np.linspace(100.0, 103.0, n)
+    raw = pd.DataFrame({
+        "timestamp": ts,
+        "open": base,
+        "high": base + 0.2,
+        "low": base - 0.2,
+        "close": base + 0.05,
+        "volume": np.linspace(10.0, 20.0, n),
+    })
+
+    prefix_n = 130
+    future_shocked = raw.copy()
+    future_shocked.loc[prefix_n:, "open"] += 50.0
+    future_shocked.loc[prefix_n:, "high"] += 55.0
+    future_shocked.loc[prefix_n:, "low"] += 45.0
+    future_shocked.loc[prefix_n:, "close"] += 50.0
+    future_shocked.loc[prefix_n:, "volume"] *= 8.0
+
+    prefix_feats = compute_features(raw.iloc[:prefix_n].copy())
+    full_feats = compute_features(future_shocked.copy()).iloc[:prefix_n].reset_index(drop=True)
+
+    tf_cols = [c for c in FEATURE_COLUMNS if c.startswith("tf5_") or c.startswith("tf15_") or c.startswith("tf60_")]
+    np.testing.assert_allclose(
+        prefix_feats[tf_cols].to_numpy(dtype=float),
+        full_feats[tf_cols].to_numpy(dtype=float),
+        atol=1e-12,
+    )
 
 
 def test_l2_snapshot_profile_emits_poc_and_value_area():

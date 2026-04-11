@@ -18,6 +18,7 @@ from simulator import Bar, SimulationConfig, PortfolioSimulator
 from models import ModelMeta, WeightedLastStepAttention, build_model_from_meta, load_model_state
 from backtest import _bar_has_usable_l2_depth, _raw_signal_from_probs, _warn_on_sparse_l2_depth
 from strategy_gate import StrategyGate
+from train_model import apply_triple_barrier_labels_dynamic
 
 
 # Fixtures
@@ -230,6 +231,54 @@ def test_strategy_gate_allows_long_near_avwap_or_in_golden_pocket():
     assert gate.signal_from_probs(np.array([0.05, 0.10, 0.85], dtype=np.float32), window=golden_pocket_window) == 2
 
 
+def test_strategy_gate_allows_long_after_recent_avwap_or_golden_pocket_confluence():
+    gate = StrategyGate(
+        thr_long=0.70,
+        thr_short=0.70,
+        margin=0.15,
+        feature_cols=["liq_sweep_low", "close_over_avwap_cycle", "close_over_avwap_spike", "in_golden_pocket"],
+        use_hard_gating=True,
+        sweep_lookback_bars=5,
+    )
+    recent_spike_window = np.array([
+        [0.0, 0.0100, 0.0060, 0.0],
+        [0.0, 0.0100, 0.0014, 0.0],
+        [0.0, 0.0100, 0.0040, 0.0],
+        [0.0, 0.0100, 0.0050, 0.0],
+        [0.0, 0.0100, 0.0060, 0.0],
+    ], dtype=np.float32)
+    recent_golden_pocket_window = np.array([
+        [0.0, 0.0100, 0.0100, 0.0],
+        [0.0, 0.0100, 0.0100, 1.0],
+        [0.0, 0.0100, 0.0100, 0.0],
+        [0.0, 0.0100, 0.0100, 0.0],
+        [0.0, 0.0100, 0.0100, 0.0],
+    ], dtype=np.float32)
+
+    assert gate.signal_from_probs(np.array([0.05, 0.10, 0.85], dtype=np.float32), window=recent_spike_window) == 2
+    assert gate.signal_from_probs(np.array([0.05, 0.10, 0.85], dtype=np.float32), window=recent_golden_pocket_window) == 2
+
+
+def test_strategy_gate_rejects_stale_confluence_outside_lookback():
+    gate = StrategyGate(
+        thr_long=0.70,
+        thr_short=0.70,
+        margin=0.15,
+        feature_cols=["liq_sweep_low", "close_over_avwap_cycle", "close_over_avwap_spike", "in_golden_pocket"],
+        use_hard_gating=True,
+        sweep_lookback_bars=3,
+    )
+    stale_window = np.array([
+        [0.0, 0.0100, 0.0014, 1.0],
+        [0.0, 0.0100, 0.0060, 0.0],
+        [0.0, 0.0100, 0.0060, 0.0],
+        [0.0, 0.0100, 0.0060, 0.0],
+        [0.0, 0.0100, 0.0060, 0.0],
+    ], dtype=np.float32)
+
+    assert gate.signal_from_probs(np.array([0.05, 0.10, 0.85], dtype=np.float32), window=stale_window) == 1
+
+
 def test_strategy_gate_downgrades_long_without_any_confluence():
     gate = StrategyGate(
         thr_long=0.70,
@@ -248,6 +297,29 @@ def test_strategy_gate_downgrades_long_without_any_confluence():
 
     sig = gate.signal_from_probs(np.array([0.05, 0.10, 0.85], dtype=np.float32), window=window)
     assert sig == 1
+
+
+def test_triple_barrier_labels_scale_with_atr():
+    df = pd.DataFrame({
+        "close": [100.0, 100.0, 100.0],
+        "high": [100.1, 101.2, 101.2],
+        "low": [99.9, 99.8, 99.8],
+        "atr_14": [0.5, 2.0, 2.0],
+    })
+
+    labels = apply_triple_barrier_labels_dynamic(
+        df,
+        price_col="close",
+        atr_col="atr_14",
+        fee_pct=0.0,
+        slippage_pct=0.0,
+        cost_mult=0.0,
+        k_tp=2.0,
+        k_sl=1.0,
+        time_limit=1,
+    )
+
+    assert labels.tolist() == [1, 0, 0]
 
 
 def test_bar_has_usable_l2_depth_requires_bid_and_ask_curves():

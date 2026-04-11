@@ -17,6 +17,7 @@ class StrategyGate:
         feature_cols: Optional[Sequence[str]] = None,
         use_hard_gating: bool = True,
         sweep_lookback_bars: int = 5,
+        confluence_lookback_bars: Optional[int] = None,
         avwap_proximity_pct: float = 0.0015,
     ) -> None:
         self.thr_long = float(thr_long)
@@ -25,6 +26,9 @@ class StrategyGate:
         self.feature_index = {str(name): idx for idx, name in enumerate(feature_cols or [])}
         self.use_hard_gating = bool(use_hard_gating)
         self.sweep_lookback_bars = int(max(1, sweep_lookback_bars))
+        self.confluence_lookback_bars = int(
+            max(1, confluence_lookback_bars or self.sweep_lookback_bars)
+        )
         self.avwap_proximity_pct = float(max(0.0, avwap_proximity_pct))
 
     @staticmethod
@@ -82,26 +86,30 @@ class StrategyGate:
         current = self._current_feature_value(name, feature_row=feature_row, default=0.0)
         return bool(np.isfinite(current) and current > float(threshold))
 
+    def _recent_feature_abs_leq(
+        self,
+        name: str,
+        *,
+        window: Optional[np.ndarray] = None,
+        feature_row: Optional[Mapping[str, Any]] = None,
+        lookback: Optional[int] = None,
+        threshold: float,
+    ) -> bool:
+        values = self._window_feature_values(window, name)
+        if values is not None and values.size:
+            tail = values[-int(max(1, lookback or self.confluence_lookback_bars)) :]
+            valid = tail[np.isfinite(tail)]
+            return bool(valid.size and np.any(np.abs(valid) <= float(threshold)))
+        current = self._current_feature_value(name, feature_row=feature_row, default=np.nan)
+        return bool(np.isfinite(current) and abs(current) <= float(threshold))
+
     def long_confluences(
         self,
         *,
         window: Optional[np.ndarray] = None,
         feature_row: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, bool]:
-        near_cycle = abs(
-            self._current_feature_value(
-                "close_over_avwap_cycle",
-                window=window,
-                feature_row=feature_row,
-            )
-        ) <= self.avwap_proximity_pct
-        near_spike = abs(
-            self._current_feature_value(
-                "close_over_avwap_spike",
-                window=window,
-                feature_row=feature_row,
-            )
-        ) <= self.avwap_proximity_pct
+        lookback = self.confluence_lookback_bars
         return {
             "recent_liq_sweep_low": self._recent_feature_true(
                 "liq_sweep_low",
@@ -109,14 +117,26 @@ class StrategyGate:
                 feature_row=feature_row,
                 lookback=self.sweep_lookback_bars,
             ),
-            "near_avwap_cycle": bool(np.isfinite(near_cycle) and near_cycle),
-            "near_avwap_spike": bool(np.isfinite(near_spike) and near_spike),
-            "in_golden_pocket": self._current_feature_value(
+            "near_avwap_cycle": self._recent_feature_abs_leq(
+                "close_over_avwap_cycle",
+                window=window,
+                feature_row=feature_row,
+                lookback=lookback,
+                threshold=self.avwap_proximity_pct,
+            ),
+            "near_avwap_spike": self._recent_feature_abs_leq(
+                "close_over_avwap_spike",
+                window=window,
+                feature_row=feature_row,
+                lookback=lookback,
+                threshold=self.avwap_proximity_pct,
+            ),
+            "in_golden_pocket": self._recent_feature_true(
                 "in_golden_pocket",
                 window=window,
                 feature_row=feature_row,
-                default=0.0,
-            ) > 0.5,
+                lookback=lookback,
+            ),
         }
 
     def apply_hard_gate(
