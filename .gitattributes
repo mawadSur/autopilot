@@ -1,0 +1,3 @@
+*.pt !text !filter !merge !diff
+*.h5 !text !filter !merge !diff
+*.zip !text !filter !merge !diff
