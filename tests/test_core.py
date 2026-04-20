@@ -1,4 +1,6 @@
+import pickle
 import tempfile
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -18,7 +20,14 @@ from simulator import Bar, SimulationConfig, PortfolioSimulator
 from models import ModelMeta, WeightedLastStepAttention, build_model_from_meta, load_model_state
 from backtest import _bar_has_usable_l2_depth, _raw_signal_from_probs, _warn_on_sparse_l2_depth
 from strategy_gate import StrategyGate
-from train_model import apply_triple_barrier_labels_dynamic
+from train_model import (
+    CollateSamplerContext,
+    apply_triple_barrier_labels_dynamic,
+    collate_batch,
+    seed_worker,
+    _resolve_repo_path as resolve_train_repo_path,
+)
+from src.streamer import KlineStreamer, _resolve_repo_path as resolve_streamer_repo_path
 
 
 # Fixtures
@@ -95,6 +104,70 @@ def test_build_windows_edge_cases(features_df):
     arr_exact = features_df[FEATURE_COLUMNS].to_numpy(dtype=np.float32, copy=False)[:10]
     windows2 = build_windows_from_flat(arr_exact, seq_len=10)
     assert windows2.shape == (1, 10, arr_exact.shape[1])
+
+
+def test_repo_prefixed_relative_paths_resolve_to_repo_root():
+    repo_root = Path(__file__).resolve().parents[1]
+    rel_path = Path(repo_root.name) / "tests"
+    expected = (repo_root / "tests").resolve()
+
+    assert resolve_train_repo_path(rel_path) == expected
+    assert resolve_streamer_repo_path(rel_path) == expected
+
+
+def test_simple_relative_output_paths_resolve_under_repo_root():
+    repo_root = Path(__file__).resolve().parents[1]
+    expected = (repo_root / "model").resolve()
+
+    assert resolve_train_repo_path("model") == expected
+    assert resolve_streamer_repo_path("model") == expected
+
+
+def test_train_model_loader_helpers_are_picklable():
+    ctx = CollateSamplerContext(weighted_sampler_enabled=True, sampler_seed=123)
+    ctx.set_weights([1.0, 2.0, 3.0])
+
+    pickle.dumps(ctx)
+    pickle.dumps(partial(collate_batch, collate_context=ctx))
+    pickle.dumps(partial(seed_worker, base_seed=7, fold_idx=2))
+
+
+def test_train_model_collate_batch_uses_sampler_context():
+    ctx = CollateSamplerContext(weighted_sampler_enabled=True, sampler_seed=123)
+    ctx.set_weights([1.0, 2.0, 3.0])
+    batch = [
+        (torch.ones(4, 3), torch.tensor(0)),
+        (torch.zeros(4, 3), torch.tensor(2)),
+        (torch.full((4, 3), 2.0), torch.tensor(1)),
+    ]
+
+    xb, yb = collate_batch(batch, collate_context=ctx)
+
+    assert xb.shape == (3, 4, 3)
+    assert yb.shape == (3,)
+
+
+def test_streamer_list_csvs_accepts_existing_directory(tmp_path):
+    csv_path = tmp_path / "sample.csv"
+    csv_path.write_text("timestamp,open,high,low,close,volume\n2024-01-01T00:00:00Z,1,1,1,1,1\n")
+    (tmp_path / "ignore.txt").write_text("noop\n")
+
+    files = KlineStreamer._list_csvs(tmp_path)
+
+    assert files == [csv_path.resolve()]
+
+
+def test_streamer_list_csvs_expands_user_home_directory():
+    with tempfile.TemporaryDirectory(dir=Path.home()) as tmpdir:
+        tmp_path = Path(tmpdir)
+        csv_path = tmp_path / "home_sample.csv"
+        csv_path.write_text("timestamp,open,high,low,close,volume\n2024-01-01T00:00:00Z,1,1,1,1,1\n")
+
+        rel_to_home = tmp_path.relative_to(Path.home())
+        tilde_path = str(Path("~") / rel_to_home)
+        files = KlineStreamer._list_csvs(tilde_path)
+
+        assert files == [csv_path.resolve()]
 
 
 def test_profit_feature_engineer_ranks_nonlinear_signal_above_noise():

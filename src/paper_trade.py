@@ -100,6 +100,9 @@ def main():
         n, t, f = X.shape
         X = scaler.transform(X.reshape(n*t, f)).reshape(n, t, f)
 
+    dashboard = DashboardClient()
+    print("[INFO] Running inference and dashboard telemetry...")
+
     # Predict signals (classification prob or regression return)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
@@ -127,6 +130,21 @@ def main():
                 long_probs = probs_batch[:, long_idx]
                 scores[start:end] = long_probs.astype(np.float32, copy=False)
                 long_flags[start:end] = long_probs >= buy_threshold
+
+            # Throttled dashboard update (only every 10th batch to avoid overload)
+            if (start // BS) % 10 == 0:
+                try:
+                    p_vec = probs_batch[-1] if 'probs_batch' in locals() else np.array([0.0, 1.0, 0.0])
+                    dashboard.send(
+                        timestamp=times.iloc[end-1],
+                        price=float(closes[end-1]),
+                        equity=cfg.capital, # Estimate for batch
+                        probs=p_vec,
+                        signal=int(long_flags[end-1]),
+                        position=0
+                    )
+                except Exception:
+                    pass
 
     # Build class signals: 2=long, 1=hold (no shorts here)
     classes = np.ones(len(long_flags), dtype=int)

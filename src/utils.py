@@ -1597,6 +1597,60 @@ class SignalGenerator:
         return {"probability": prob, "confidence": prob, "signal": signal, "threshold": threshold}
 
 
+# ---------------------------
+# Dashboard Client
+# ---------------------------
+
+class DashboardClient:
+    """Non-blocking client to send telemetry to the dashboard server."""
+    def __init__(self, url: str = "http://localhost:8000/api/telemetry"):
+        self.url = url
+        self.enabled = True
+        try:
+            import requests
+            self.session = requests.Session()
+        except ImportError:
+            self.enabled = False
+
+    def send(
+        self,
+        timestamp: Any,
+        price: float,
+        equity: float,
+        probs: np.ndarray,
+        signal: int,
+        position: int,
+        recent_trades: List[Dict[str, Any]] = None
+    ) -> None:
+        if not self.enabled:
+            return
+
+        # probabilities: [short, hold, long]
+        p_list = [float(x) for x in probs.flatten().tolist()]
+        p_short = p_list[0] if len(p_list) >= 1 else 0.0
+        p_hold = p_list[1] if len(p_list) >= 2 else 0.0
+        p_long = p_list[2] if len(p_list) >= 3 else (p_list[1] if len(p_list) == 2 else 0.0)
+
+        payload = {
+            "timestamp": str(timestamp),
+            "price": float(price),
+            "equity": float(equity),
+            "p_short": p_short,
+            "p_hold": p_hold,
+            "p_long": p_long,
+            "signal": int(signal),
+            "position": int(position),
+            "recent_trades": recent_trades or []
+        }
+
+        try:
+            # Short timeout to avoid blocking the trading loop
+            self.session.post(self.url, json=payload, timeout=0.05)
+        except Exception:
+            # Silent fail if dashboard server is down
+            pass
+
+
 __all__ = [
     # defaults
     "DEFAULT_SEQ_LENS", "DEFAULT_SEQ_LEN", "FEATURE_COLUMNS", "FEATURE_COLUMNS_PROFITABLE",
@@ -1624,4 +1678,5 @@ __all__ = [
     "load_meta", "load_model_bundle", "SignalGenerator",
     # labels
     "binary_label_next_bar_up",
+    "DashboardClient",
 ]

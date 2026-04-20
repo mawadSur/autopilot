@@ -15,6 +15,7 @@ import json
 import os
 import random
 import time
+from functools import partial
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,39 @@ from models import (
     build_model_from_meta as build_model_from_meta_core,
 )
 from utils import FEATURE_COLUMNS_PROFITABLE, DEFAULT_SEQ_LENS, ProfitOptimizedFeatureEngineer
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _resolve_repo_path(path: Union[str, Path]) -> Path:
+    raw = Path(path).expanduser()
+    if raw.is_absolute():
+        return raw.resolve()
+
+    candidates: List[Path] = []
+    if raw.parts and raw.parts[0] == REPO_ROOT.name:
+        candidates.append(REPO_ROOT.parent / raw)
+        if len(raw.parts) > 1:
+            candidates.append(REPO_ROOT / Path(*raw.parts[1:]))
+        else:
+            candidates.append(REPO_ROOT)
+    else:
+        candidates.append(REPO_ROOT / raw)
+    candidates.append(raw.resolve())
+
+    seen: set[Path] = set()
+    unique_candidates: List[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_candidates.append(resolved)
+
+    for candidate in unique_candidates:
+        if candidate.exists():
+            return candidate
+    return unique_candidates[0]
+
 try:
     try:
         from src.streamer import KlineStreamer
@@ -46,9 +80,8 @@ try:
         from streamer import KlineStreamer
 except ModuleNotFoundError:  # when executed from src/ without repo root on sys.path
     import sys
-    ROOT = Path(__file__).resolve().parent.parent
-    if str(ROOT) not in sys.path:
-        sys.path.append(str(ROOT))
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.append(str(REPO_ROOT))
     try:
         from src.streamer import KlineStreamer
     except ModuleNotFoundError:
@@ -60,12 +93,83 @@ FEATURE_SELECTION_METHOD = "all_features"
 
 # Simple CSV lister reused from KlineStreamer
 def _list_csvs(path: str) -> List[Path]:
-    p = Path(path)
-    if not p.exists():
-        alt = Path(__file__).resolve().parent.parent / path
-        if alt.exists():
-            p = alt
+    p = _resolve_repo_path(path)
     return KlineStreamer._list_csvs(p)
+
+
+def _default_collate_sampler_state() -> Dict[str, torch.Tensor]:
+    return {"weights": torch.ones(3, dtype=torch.float32)}
+
+
+@dataclass
+class CollateSamplerContext:
+    weighted_sampler_enabled: bool
+    sampler_seed: int
+    sampler_state: Dict[str, torch.Tensor] = field(default_factory=_default_collate_sampler_state)
+    _worker_generators: Dict[int, torch.Generator] = field(default_factory=dict, init=False, repr=False)
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_worker_generators"] = {}
+        return state
+
+    def set_weights(self, weights: Union[torch.Tensor, Sequence[float]]) -> None:
+        tensor = torch.as_tensor(weights, dtype=torch.float32).detach().cpu().clone()
+        self.sampler_state["weights"] = tensor
+
+    def get_weights(self) -> Optional[torch.Tensor]:
+        weights = self.sampler_state.get("weights")
+        if weights is None:
+            return None
+        if isinstance(weights, torch.Tensor):
+            return weights
+        return torch.as_tensor(weights, dtype=torch.float32)
+
+    def generator_for_current_worker(self) -> torch.Generator:
+        worker_info = get_worker_info()
+        worker_id = int(worker_info.id) if worker_info is not None else 0
+        generator = self._worker_generators.get(worker_id)
+        if generator is None:
+            generator = torch.Generator()
+            generator.manual_seed(int(self.sampler_seed) + worker_id)
+            self._worker_generators[worker_id] = generator
+        return generator
+
+
+def seed_worker(worker_id: int, *, base_seed: int, fold_idx: int) -> None:
+    seed = int(base_seed) + int(worker_id) + (int(fold_idx) * 1000)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def collate_batch(
+    batch: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+    *,
+    collate_context: CollateSamplerContext,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    xb, yb = zip(*batch)  # xb: [B,T,F]
+    xb = torch.stack(list(xb), dim=0)
+    if isinstance(yb[0], torch.Tensor):
+        yb = torch.stack(list(yb), dim=0)
+    else:
+        yb = torch.tensor(yb)
+    if collate_context.weighted_sampler_enabled and yb.numel() > 1:
+        weights_lookup = collate_context.get_weights()
+        if isinstance(weights_lookup, torch.Tensor) and weights_lookup.numel() == 3:
+            y_cpu = yb.detach().cpu().long().view(-1)
+            sample_weights = weights_lookup[y_cpu]
+            if torch.isfinite(sample_weights).all() and float(sample_weights.sum()) > 0:
+                sampler = WeightedRandomSampler(
+                    weights=sample_weights.double(),
+                    num_samples=len(sample_weights),
+                    replacement=True,
+                    generator=collate_context.generator_for_current_worker(),
+                )
+                indices = torch.tensor(list(sampler), dtype=torch.long)
+                xb = xb[indices]
+                yb = yb[indices]
+    return xb, yb
 
 
 _RAW_SCHEMA_COLUMNS = [
@@ -1435,45 +1539,18 @@ def train(cfg: TrainConfig):
         best_epoch_for_fold = 0
         collapse_state = CollapseCheckState(fold_idx=fold_idx, total_folds=len(folds))
 
-        def seed_worker(worker_id: int):
-            seed = int(cfg.seed) + int(worker_id) + (int(fold_idx) * 1000)
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-
         g = torch.Generator()
         g.manual_seed(int(cfg.seed) + int(fold_idx))
 
-        sampler_state = {"weights": torch.ones(3, dtype=torch.float32)}
-        sampler_generator = torch.Generator()
-        sampler_generator.manual_seed(int(cfg.seed) + int(fold_idx) + 1337)
         weighted_sampler_enabled = bool(
             getattr(cfg, "task", "classification") != "regression" and getattr(cfg, "weighted_sampling", True)
         )
-
-        def collate_batch(batch):
-            xb, yb = zip(*batch)  # xb: [B,T,F]
-            xb = torch.stack(list(xb), dim=0)
-            if isinstance(yb[0], torch.Tensor):
-                yb = torch.stack(list(yb), dim=0)
-            else:
-                yb = torch.tensor(yb)
-            if weighted_sampler_enabled and yb.numel() > 1:
-                weights_lookup = sampler_state.get("weights")
-                if isinstance(weights_lookup, torch.Tensor) and weights_lookup.numel() == 3:
-                    y_cpu = yb.detach().cpu().long().view(-1)
-                    sample_weights = weights_lookup[y_cpu]
-                    if torch.isfinite(sample_weights).all() and float(sample_weights.sum()) > 0:
-                        sampler = WeightedRandomSampler(
-                            weights=sample_weights.double(),
-                            num_samples=len(sample_weights),
-                            replacement=True,
-                            generator=sampler_generator,
-                        )
-                        indices = torch.tensor(list(sampler), dtype=torch.long)
-                        xb = xb[indices]
-                        yb = yb[indices]
-            return xb, yb
+        collate_context = CollateSamplerContext(
+            weighted_sampler_enabled=weighted_sampler_enabled,
+            sampler_seed=int(cfg.seed) + int(fold_idx) + 1337,
+        )
+        collate_fn = partial(collate_batch, collate_context=collate_context)
+        worker_init = partial(seed_worker, base_seed=int(cfg.seed), fold_idx=int(fold_idx))
 
         assert isinstance(feature_cols, list) and len(feature_cols) > 0, "feature_cols must be a non-empty list"
         if getattr(cfg, 'task', 'classification') == 'regression':
@@ -1513,13 +1590,13 @@ def train(cfg: TrainConfig):
 
         train_loader = DataLoader(
             train_ds, batch_size=cfg.batch_size, num_workers=cfg.workers,
-            pin_memory=(device.type == "cuda"), collate_fn=collate_batch,
-            worker_init_fn=seed_worker, generator=g,
+            pin_memory=(device.type == "cuda"), collate_fn=collate_fn,
+            worker_init_fn=worker_init, generator=g,
         )
         val_loader = DataLoader(
             val_ds, batch_size=cfg.batch_size, num_workers=max(0, cfg.workers // 2),
-            pin_memory=(device.type == "cuda"), collate_fn=collate_batch,
-            worker_init_fn=seed_worker, generator=g,
+            pin_memory=(device.type == "cuda"), collate_fn=collate_fn,
+            worker_init_fn=worker_init, generator=g,
         )
         train_counts_est = np.ones(3, dtype=np.int64)
         train_pct_est = np.ones(3, dtype=np.float32) / 3.0
@@ -1659,7 +1736,7 @@ def train(cfg: TrainConfig):
                     class_weight_tensor = None
                 ev_vec = _compute_ev_multipliers(class_ev_history)
                 ev_multiplier_tensor = torch.tensor(ev_vec, dtype=torch.float32, device=device)
-                sampler_state["weights"] = torch.tensor(weight_vec, dtype=torch.float32)
+                collate_context.set_weights(weight_vec)
             else:
                 class_weight_tensor = None
 
@@ -2994,19 +3071,24 @@ def main():
         else:
             seq_lens = list(DEFAULT_SEQ_LENS)
 
+    data_path = _resolve_repo_path(args.data_path)
+    base_out_dir = _resolve_repo_path(args.output_dir)
+
     for seq_len in seq_lens:
-        out_dir = Path(args.output_dir)
+        out_dir = base_out_dir
         if len(seq_lens) > 1:
-            out_dir = out_dir / f"seq_{seq_len}"
+            out_dir = (out_dir / f"seq_{seq_len}").resolve()
 
         # If meta-path is inside output dir, ensure parent exists
-        mp = Path(args.meta_path)
-        if not mp.is_absolute():
-            mp = out_dir / mp
+        mp = Path(args.meta_path).expanduser()
+        if mp.is_absolute():
+            mp = mp.resolve()
+        else:
+            mp = (out_dir / mp).resolve()
         mp.parent.mkdir(parents=True, exist_ok=True)
 
         cfg = TrainConfig(
-            data_path=args.data_path,
+            data_path=str(data_path),
             output_dir=str(out_dir),
             meta_path=str(mp),
             window_size=int(seq_len),
