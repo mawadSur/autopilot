@@ -36,3 +36,4 @@ typing-extensions>=4.7.0
 loguru
 streamlit
 plotly
+openai

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional, ClassVar
 
 try:
@@ -19,6 +20,11 @@ except Exception:
 # before importing `cfg`, e.g. `TRADING_CAPITAL=20000 python src/backtest.py`.
 
 FEATURE_VERSION = "v2026-02-119"
+_CONFIG_DIR = Path(__file__).resolve().parent
+_ENV_FILES = (
+    str(_CONFIG_DIR.parent / ".env"),
+    str(_CONFIG_DIR / ".env"),
+)
 
 
 class TradingConfig(BaseSettings):
@@ -84,16 +90,22 @@ class TradingConfig(BaseSettings):
     coindesk_market: str = Field("coinbase", env="COINDESK_WS_MARKET")
     coindesk_instrument: str = Field("ETH-USDT", env="COINDESK_WS_INSTRUMENT")
     coindesk_api_key: Optional[str] = Field(None, env="COINDESK_API_KEY")
+    gemini_api_key: Optional[str] = Field(None, env="GEMINI_API_KEY")
+    gemini_model: str = Field("gemini-2.5-flash", env="GEMINI_MODEL")
+    gemini_timeout_s: int = Field(30, env="GEMINI_TIMEOUT_S")
+    gemini_use_search_grounding: bool = Field(True, env="GEMINI_USE_SEARCH_GROUNDING")
 
     if _USE_PYDANTIC_SETTINGS and SettingsConfigDict is not None:
         model_config = SettingsConfigDict(
-            env_file=".env",
+            env_file=_ENV_FILES,
             env_file_encoding="utf-8",
+            extra="ignore",
         )
     else:
         class Config:
-            env_file = ".env"
+            env_file = _ENV_FILES
             env_file_encoding = "utf-8"
+            extra = "ignore"
 
 
 def load_config() -> TradingConfig:
