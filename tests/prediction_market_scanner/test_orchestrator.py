@@ -11,9 +11,11 @@ from orchestrator import (
     build_news_search_query,
     build_reddit_search_query,
     print_alpha_assessment_table,
+    run_final_risk_gate,
 )
 from pydantic import BaseModel
 from reddit_research_agent.models import RedditResearchReport
+from risk_management_agent.risk_engine import RiskCalculator
 
 
 class FakeNewsResearchReport(BaseModel):
@@ -331,6 +333,46 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Market Beta", rendered)
         self.assertIn("\033[1m\033[32m", rendered)
         self.assertIn(rendered, output)
+
+    async def test_run_final_risk_gate_writes_execution_log_and_assessment(self):
+        market = self._markets()[1]
+        calibration = CalibrationReport(
+            xgboost_prob=0.58,
+            llm_adjustment_pct_points=2.5,
+            calibrated_true_prob=0.62,
+            confidence_score=84,
+            key_drivers=["Signal"],
+            key_uncertainties=["Uncertainty"],
+            edge_vs_market=0.10,
+            action="paper-trade candidate",
+            reasoning="Strong setup.",
+        )
+        scanner_row = {
+            "market_id": market.market_id,
+            "title": market.title,
+            "category": market.category,
+            "implied_prob": market.implied_prob,
+            "research_priority": 99,
+        }
+
+        execution = run_final_risk_gate(
+            calibration=calibration,
+            market=market,
+            scanner_row=scanner_row,
+            reddit_report={"summary": "Bullish sentiment"},
+            news_report={"summary": "Supportive headlines"},
+            bankroll=10_000.0,
+            risk_calculator=RiskCalculator(),
+        )
+
+        self.assertIn("risk_assessment", execution)
+        self.assertIn("risk_metrics", execution)
+        self.assertTrue(execution["log_path"].exists())
+        self.assertIn("scanner", execution["event_payload"])
+        self.assertIn("research", execution["event_payload"])
+        self.assertIn("calibration", execution["event_payload"])
+        self.assertIn("risk", execution["event_payload"])
+        execution["log_path"].unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
