@@ -1,226 +1,192 @@
-# 🤖 AI Crypto Trading Bot
+# Autopilot
 
-An end‑to‑end crypto trading system focused on **1‑minute ETH/USDT** data. It includes:
-- data ingestion (Binance or CoinDesk),
-- feature engineering + labeling,
-- model training (local or SageMaker),
-- backtesting,
-- live inference + optional paper/real execution.
+Autopilot is currently a Python research and trading workspace, not a dedicated Codex app scaffold.
 
-This README explains **how to get started** and **how the system works**.
+The repo has three active surfaces:
 
-## Table of Contents
-- [Project Overview](#project-overview)
-- [Architecture](#architecture)
-- [Features](#features)
-- [Project Structure](#project-structure)
-- [Setup and Installation](#setup-and-installation)
-- [Workflow](#workflow)
-- [API Endpoints](#api-endpoints)
-- [Disclaimer](#disclaimer)
+- `main.py`: a CLI scanner for active Polymarket markets.
+- `src/orchestrator.py`: a multi-agent research and calibration pipeline for the top-ranked markets.
+- `social-narrative-agent/`: a separate OpenAI-powered CLI for Reddit/social narrative analysis.
 
-## Project Overview
+The older crypto trading stack is still present under `src/`, but the previous README described the repo as a single FastAPI trading app and no longer matched the code.
 
-The core of this project is a predictive model that analyzes 1‑minute OHLCV (and optionally microstructure) data for ETH/USDT. It learns short‑term patterns and outputs a **3‑class signal**:
-- **short_win** (-1),
-- **timeout/hold** (0),
-- **long_win** (+1).
+## Codex App Status
 
-The project is designed with a clear separation of concerns:
-1.  **Data Engineering**: Scripts to fetch and prepare large datasets.
-2.  **ML Training**: A robust training and deployment pipeline using AWS SageMaker.
-3.  **Inference**: A real-time API built with FastAPI to serve live predictions and stream data.
+If you were looking for a Codex/OpenAI app setup, none is wired here yet.
 
-## Architecture
+- No `.codex-plugin` manifest was found.
+- No `package.json` or frontend app scaffold was found.
+- The repo is Python-first and currently organized around CLIs, services, and research agents.
 
-The project follows a standard MLOps workflow:
+If you want, this repo can be turned into a Codex app later, but that would be a new scaffold rather than documenting something that already exists.
 
-1.  **📥 Data Ingestion**
-    - Binance OHLCV: `history.py`
-    - CoinDesk data via reusable client: `coindesk_client.py`
-2.  **🛠️ Feature Engineering + Labeling**
-    - `utils.compute_features` builds the full feature set.
-    - `train_model.py` applies dynamic triple‑barrier labels (cost‑aware, ATR‑aware).
-3.  **🧠 Model Training**
-    - Local: `python src/train_model.py`
-    - SageMaker: `python src/launch_sagemaker_job.py`
-4.  **📊 Backtesting**
-    - `python src/backtest.py --model-dir model/seq_90`
-5.  **📡 Live / Paper Trading**
-    - CoinDesk live collector + inference: `python src/live_coindesk_collector.py --paper`
+## What Lives Here
 
-## Features
+### 1. Market Scanner
 
-- **Automated Data Fetching**: Pulls years of 1-minute ETH/USDT data from Binance or CoinDesk.
-- **Advanced Feature Engineering**: Robust bucketed features (OHLCV + stationarity + microstructure).
-- **Cloud-Based Training**: Leverages AWS SageMaker for scalable, powerful GPU-based model training.
-- **Real-time Inference API**: A non-blocking API built with FastAPI to deliver signals with low latency.
-- **Live Signal Streaming**: A WebSocket endpoint streams predictions every 5 seconds, perfect for a live dashboard.
-- **Paper Trading Simulation**: Endpoints to run and monitor a simulated trading strategy in the background.
-- **Backtesting Support**: `backtest.py` evaluates full-history strategies.
+`main.py` fetches active Polymarket markets, filters low-quality setups, runs an LLM-based clarity check, scores research priority, prints a ranked table, and exports JSON to `output/scan_*.json`.
 
-## Project Structure
+Data sources and logic:
 
+- Polymarket Gamma API via `src/fetcher.py`
+- market heuristics via `src/analyzer.py`
+- ranking via `src/ranker.py`
+- Gemini-based clarity and narrative scoring via `src/llm_judge.py`
+
+### 2. Multi-Agent Orchestrator
+
+`src/orchestrator.py` takes the top scanner results and adds deeper research:
+
+- Reddit discussion context via `src/reddit_research_agent/`
+- Google News RSS context via `src/news_research_agent/`
+- Gemini-based Reddit/news/calibration agents under `src/*_agent/`
+- an ML baseline from `src/calibration_agent/ml_baseline.py`
+
+The output is a calibrated probability plus an action such as `paper-trade candidate` or `monitor`.
+
+### 3. Social Narrative Agent
+
+`social-narrative-agent/main.py` is a separate CLI that:
+
+- pulls Reddit posts and comments with `requests`
+- uses the OpenAI API for structured claim extraction and narrative analysis
+- compares the crowd narrative with current market odds
+
+### 4. Legacy Trading Stack
+
+The original crypto-trading code still exists and appears to be maintained separately from the newer prediction-market flow:
+
+- `src/main.py`: FastAPI control API
+- `src/dashboard_server.py`: telemetry/state server
+- `src/dashboard_app.py`: Streamlit dashboard
+- `src/history.py`, `src/train_model.py`, `src/backtest.py`, `src/live_trader.py`, `src/deploy.py`: data, training, backtest, and deployment scripts
+
+## Setup
+
+Python `3.10` is the safest assumption here. The checked-in `Dockerfile` also uses Python 3.10.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
+
+Notes:
+
+- `TA-Lib` is required by the dependency list and may need a system install or `conda-forge`.
+- `requirements.txt` includes the full stack: ML, AWS, FastAPI, Streamlit, Gemini, OpenAI, Reddit, and data tooling.
+
+## Environment Variables
+
+`src/config.py` loads `.env` from either the repo root or `src/.env`.
+
+Example minimum setup:
+
+```env
+# Recommended for the scanner and required for the multi-agent Gemini flows
+GEMINI_API_KEY=your_gemini_key
+GEMINI_MODEL=gemini-2.5-flash
+
+# Required for Reddit research inside src/orchestrator.py
+REDDIT_CLIENT_ID=your_reddit_client_id
+REDDIT_CLIENT_SECRET=your_reddit_client_secret
+REDDIT_USER_AGENT=autopilot-reddit-research-agent/1.0
+
+# Required only for social-narrative-agent/
+OPENAI_API_KEY=your_openai_key
+
+# Optional legacy trading / AWS settings
+COINDESK_API_KEY=your_coindesk_key
+ENDPOINT_NAME=your_sagemaker_endpoint
+SAGEMAKER_ROLE_ARN=your_role_arn
+AWS_REGION=us-east-1
+```
+
+Important behavior:
+
+- `main.py` can still run without `GEMINI_API_KEY`; it falls back to a neutral judge result when the LLM call fails.
+- `src/orchestrator.py` is not meaningfully usable without Gemini and Reddit credentials.
+- `social-narrative-agent/` requires `OPENAI_API_KEY`.
+
+## Common Commands
+
+### Scan active markets
+
+```bash
+python main.py --top 20 --category Politics
+```
+
+Useful flags:
+
+- `--top`: number of rows to print
+- `--category`: case-insensitive category filter
+- `--min-volume-24h`: liquidity floor
+- `--max-pages`: cap Polymarket pagination
+
+### Run the multi-agent orchestrator
+
+```bash
+python src/orchestrator.py --top 5 --category Politics --subreddit politics
+```
+
+This pulls ranked markets, Reddit context, news context, and calibration output for the top candidates.
+
+### Run the social narrative agent
+
+```bash
+python social-narrative-agent/main.py --topic "OpenAI GPT-5 release" --current-odds 0.42
+```
+
+### Run the legacy FastAPI trading API
+
+```bash
+python src/main.py
+```
+
+### Run the legacy dashboard state server
+
+```bash
+python src/dashboard_server.py
+```
+
+### Run the legacy Streamlit dashboard
+
+```bash
+streamlit run src/dashboard_app.py
+```
+
+## Tests
+
+The repo uses `unittest`.
+
+Example targeted runs:
+
+```bash
+env PYTHONPATH=src ./.venv/bin/python -m unittest discover -s tests/prediction_market_scanner -p 'test_main.py'
+env PYTHONPATH=src ./.venv/bin/python -m unittest discover -s tests/prediction_market_scanner -p 'test_orchestrator.py'
+./.venv/bin/python -m unittest discover social-narrative-agent/tests
+```
+
+## Repository Map
+
+```text
 .
-├── eth_1m_data/              # Stores raw historical data from Binance
-├── data/coindesk/...         # Unified CoinDesk datasets (1 CSV per month)
-├── backtest.py               # Generates signals over historical data for backtesting.
-├── history.py                # Fetches historical 1-minute data from Binance.
-├── coindesk_client.py        # Reusable CoinDesk Data API client.
-├── live_coindesk_collector.py# Live CoinDesk collector + inference + (paper) execution.
-├── inference.py              # Contains the code for the SageMaker real-time inference endpoint.
-├── label.py                  # Performs feature engineering and creates labels for the dataset.
-├── launch_sagemaker_job.py   # Orchestrates the AWS SageMaker training and deployment process.
-├── main.py                   # The main FastAPI application for serving live signals.
-├── paper_trade.py            # A script to run a simple paper trading simulation.
-├── model_meta.json           # Stores model metadata, like the decision threshold.
-├── requirements.txt          # A list of all Python dependencies for the project.
-└── README.md                 # This documentation file.
+├── main.py                         # Polymarket scanner CLI
+├── social-narrative-agent/         # Separate OpenAI-based social analysis CLI
+├── src/
+│   ├── orchestrator.py             # Multi-agent research + calibration runner
+│   ├── llm_judge.py                # Gemini-based market clarity/narrative judge
+│   ├── reddit_research_agent/      # Reddit fetch + analysis
+│   ├── news_research_agent/        # Google News RSS fetch + analysis
+│   ├── calibration_agent/          # ML baseline + calibration agent
+│   ├── main.py                     # Legacy FastAPI trading API
+│   ├── dashboard_server.py         # Legacy telemetry server
+│   └── dashboard_app.py            # Legacy Streamlit dashboard
+└── tests/                          # Prediction-market and agent tests
 ```
 
-## Setup and Installation
+## Known Gaps
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/mawadSur/autopilot.git
-    cd autopilot
-    ```
-
-2.  **Create a virtual environment:**
-    ```bash
-    python -m venv .venv
-    source .venv/bin/activate  # On Windows use `venv\Scripts\activate`
-    ```
-
-3.  **Install dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-    Note: If you see TensorFlow `runtime_version` warnings, re-pin `protobuf==5.28.3` (or 5.28.x) to match the generated protos.
-    (TA-Lib is required; if pip fails on wheels, install the conda-forge package: `conda install -c conda-forge ta-lib`)
-
-4.  **Set up environment variables**
-    Create a `.env` file in the root directory and add your Binance API keys (if using Binance data) and CoinDesk API key (if using CoinDesk data).
-    ```env
-    # For history.py (fetching data)
-    BINANCE_KEY="your_binance_api_key"
-    BINANCE_SECRET="your_binance_api_secret"
-
-    # For CoinDesk Data API (used by coindesk_client.py)
-    COINDESK_API_KEY="your_coindesk_api_key"
-
-    # Optional: live execution via Coinbase (ccxt)
-    COINBASE_API_KEY="..."
-    COINBASE_API_SECRET="..."
-    COINBASE_PASSPHRASE="..."
-    ```
-
-5.  **Configure AWS Credentials**:
-    Ensure your environment is configured with AWS credentials. The simplest way is to use the AWS CLI:
-    ```bash
-    aws configure
-    ```
-    You will also need to **provide the correct IAM Role ARN** in `launch_sagemaker_job.py`.
-
-## Getting Started (Quickstart)
-
-1) **Fetch data**
-   - Binance:  
-     ```bash
-     python src/history.py
-     ```
-   - CoinDesk via client:  
-     ```bash
-     python src/coindesk_client.py --help
-     ```
-
-2) **Train locally**
-   ```bash
-   python src/train_model.py --data-path data/coindesk/ETH-USDT/1m --output-dir model
-   ```
-
-3) **Backtest**
-   ```bash
-   python src/backtest.py --model-dir model/seq_90
-   ```
-
-4) **Run live collector (paper mode)**
-   ```bash
-   python src/live_coindesk_collector.py --paper
-   ```
-
-## Workflow (Detailed)
-
-Follow these steps to run the project from end to end:
-
-1.  **Fetch Data**:
-    - Binance (OHLCV only): `python src/history.py`
-    - CoinDesk (via client): `python src/coindesk_client.py --help`
-    ```bash
-    python src/history.py
-    # or (see options)
-    python src/coindesk_client.py --help
-    ```
-
-2.  **Train and Deploy on AWS**: Execute the `launch_sagemaker_job.py` script. This will handle uploading data, training the model, and deploying it to a live endpoint.
-    ```bash
-    python src/launch_sagemaker_job.py
-    ```
-    After this step is complete, you will have a trained model in S3 and a live SageMaker endpoint.
-
-3.  **Run the Live API Server**: To run the API locally, you must first download the model artifacts from S3.
-
-    **How to Download Model Files from S3**
-
-    After the SageMaker training job is complete, it saves a `model.tar.gz` file to your S3 bucket. You can find the exact path in the console output of the training job.
-
-    Use the AWS CLI to download and extract the files:
-    ```bash
-    # Replace with the actual S3 path from your training job output
-aws s3 cp s3://sagemaker-pytorch-2025-07-17-03-15-00-123/output/model.tar.gz .
-
-    # This will extract best_model.pth and scaler.pkl into your current directory
-    tar -xzvf model.tar.gz
-    ```
-    
-    Now that the model files are local, start the FastAPI server:
-    ```bash
-    uvicorn main:app --reload
-    ```
-
-
-4.  **Connect a Frontend**: The API is now running on `http://127.0.0.1:8000`. You can connect a client to the WebSocket at `ws://127.0.0.1:8000/ws/signal-stream`.
-
-## How to Stay Profitable
-
-This project is profit-obsessed by design. The training pipeline now:
-- Computes forward returns and ranks features by correlation to 5-minute forward return.
-- Drops low-signal features and any feature that increases walk-forward drawdown.
-- Trains only on the most profitable subset (fast + generalizes better).
-- Writes a `profit_report.json` after every backtest with EV/expectancy and a retrain recommendation.
-
-**Recommended flow**
-1. Run the profit-optimized retrain command:
-   ```bash
-   python src/retrain_profit.py
-   ```
-2. Backtest the new model:
-   ```bash
-   python src/backtest.py --model-dir model/seq_90
-   ```
-3. If `profit_report.json` says “Retrain recommended”, rerun step 1.
-
-## API Endpoints
-
-The interactive API documentation (via Swagger UI) is available at `http://127.0.0.1:8000/docs` when the server is running.
-
-- **`GET /`**: Welcome message.
-- **`GET /signal/latest`**: Fetches the latest market data and returns a single "BUY" or "HOLD" signal.
-- **`POST /papertrade/start`**: Starts a background paper trading simulation.
-- **`GET /papertrade/status/{job_id}`**: Retrieves the status and log of a running simulation.
-- **`WS /ws/signal-stream`**: WebSocket endpoint that streams the latest signal, confidence, and price every 5 seconds.
-
-## Disclaimer
-
-**This project is for educational purposes only and is not financial advice.** The predictions from this model are not guaranteed to be accurate. Trading cryptocurrencies involves significant risk, and you should never trade with money you cannot afford to lose. The author is not responsible for any financial losses incurred by using this software.
+- The checked-in `Dockerfile` still points at an older `main.py --step trade` interface that does not match the current root CLI.
+- This README documents the current Python workflows only; it does not represent a packaged Codex app because this repo does not contain one yet.

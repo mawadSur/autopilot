@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from llm_judge import LLMJudgeResult
-from main import build_scan_results, export_scan_results, render_cli_table
+from main import build_scan_results, export_scan_results, parse_args, render_cli_table
 from models import Market
 
 
@@ -100,6 +100,23 @@ class MainScannerTests(unittest.TestCase):
         self.assertIn("INFO_EDGE", rows[0]["anomaly_flags"])
         self.assertIn("AMBIGUOUS", rows[1]["anomaly_flags"])
 
+    def test_build_scan_results_filters_by_category_case_insensitively(self):
+        now = datetime(2026, 4, 20, 12, 0, tzinfo=timezone.utc)
+        markets = [
+            self._market(market_id="alpha", category="Politics", volume_24h=60000.0),
+            self._market(market_id="beta", category="Crypto", volume_24h=55000.0),
+        ]
+
+        rows = build_scan_results(
+            now=now,
+            category="crypto",
+            fetch_markets_fn=lambda **kwargs: markets,
+            judge_market_fn=lambda title, rules_text: LLMJudgeResult(clarity_score=80, narrative_momentum=60, anomaly_flags=[]),
+        )
+
+        self.assertEqual([row["market_id"] for row in rows], ["beta"])
+        self.assertEqual(rows[0]["category"], "Crypto")
+
     def test_render_cli_table_limits_output_rows(self):
         rows = []
         for index in range(1, 26):
@@ -125,6 +142,10 @@ class MainScannerTests(unittest.TestCase):
         self.assertIn("Market 20", table)
         self.assertNotIn("Market 21", table)
         self.assertIn("Priority", table)
+
+    def test_parse_args_accepts_category_filter(self):
+        args = parse_args(["--category", "Politics"])
+        self.assertEqual(args.category, "Politics")
 
     def test_export_scan_results_writes_timestamped_json(self):
         now = datetime(2026, 4, 20, 12, 30, tzinfo=timezone.utc)

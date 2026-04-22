@@ -180,18 +180,40 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
     }
 
 
-def _extract_grounding(candidate: Dict[str, Any]) -> tuple[List[str], List[str]]:
-    metadata = candidate.get("groundingMetadata") or candidate.get("grounding_metadata") or {}
-    raw_queries = metadata.get("webSearchQueries") or metadata.get("web_search_queries") or []
-    search_queries = [str(query).strip() for query in raw_queries if str(query).strip()]
+_MISSING = object()
+
+
+def _safe_get(obj: Any, *names: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    for name in names:
+        value = _MISSING
+        if isinstance(obj, dict):
+            value = obj.get(name, _MISSING)
+        else:
+            value = getattr(obj, name, _MISSING)
+        if value is not _MISSING and value is not None:
+            return value
+    return default
+
+
+def _extract_grounding(candidate: Any) -> tuple[List[str], List[str]]:
+    metadata = _safe_get(candidate, "groundingMetadata", "grounding_metadata")
+
+    raw_queries = _safe_get(metadata, "webSearchQueries", "web_search_queries", default=[])
+    if isinstance(raw_queries, (list, tuple)):
+        search_queries = [str(query).strip() for query in raw_queries if str(query).strip()]
+    else:
+        query = str(raw_queries).strip()
+        search_queries = [query] if query else []
 
     source_titles: List[str] = []
-    raw_chunks = metadata.get("groundingChunks") or metadata.get("grounding_chunks") or []
+    raw_chunks = _safe_get(metadata, "groundingChunks", "grounding_chunks", default=[])
+    if not isinstance(raw_chunks, (list, tuple)):
+        raw_chunks = []
     for chunk in raw_chunks:
-        if not isinstance(chunk, dict):
-            continue
-        web = chunk.get("web") or {}
-        title = str(web.get("title") or web.get("uri") or "").strip()
+        web = _safe_get(chunk, "web")
+        title = str(_safe_get(web, "title", "uri", default="") or "").strip()
         if title and title not in source_titles:
             source_titles.append(title)
     return search_queries, source_titles
