@@ -4,8 +4,10 @@ import argparse
 import asyncio
 import importlib
 import inspect
+import json
 import logging
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -24,6 +26,8 @@ from main import build_scan_results
 from models import Market
 from reddit_research_agent.analyzer import RedditAgent
 from reddit_research_agent.fetcher import RedditDeepDiver
+from risk_management_agent.models import RiskAssessment, RiskMetrics
+from risk_management_agent.risk_engine import RiskCalculator
 
 
 LOGGER = logging.getLogger(__name__)
@@ -42,6 +46,7 @@ _NEWS_IMPORT_CANDIDATES = (
     ("news_research_agent.fetcher", "GoogleNewsRSSFetcher", "news_research_agent.analyzer", "NewsAgent"),
     ("news_agent.fetcher", "NewsAggregator", "news_agent.analyzer", "NewsAgent"),
 )
+_DEFAULT_BANKROLL = 10_000.0
 
 
 def _extract_title_category(source: Market | Dict[str, Any]) -> tuple[str, str]:
@@ -241,6 +246,179 @@ def _run_calibration_agent(
     )
 
 
+def _build_risk_assessment(
+    *,
+    risk_metrics: RiskMetrics,
+    calibration: CalibrationReport,
+) -> RiskAssessment:
+    kill_switch_triggered = (
+        risk_metrics.market_price <= 0.01
+        or risk_metrics.market_price >= 0.99
+        or (risk_metrics.adjusted_position_size_pct <= 0.0 and risk_metrics.expected_value_estimate <= 0.0)
+    )
+
+    top_risk_reasons: list[str] = []
+    if risk_metrics.adjusted_position_size_pct <= 0.0:
+        top_risk_reasons.append("No positive edge after calibration and penalties.")
+    if risk_metrics.liquidity_penalty_applied:
+        top_risk_reasons.append("Liquidity penalties applied due to spread/volume constraints.")
+    if risk_metrics.correlation_penalty_applied:
+        top_risk_reasons.append("Correlation penalties applied due to overlapping exposure.")
+    if risk_metrics.expected_value_estimate <= 0.0:
+        top_risk_reasons.append("Expected value estimate is not positive.")
+    if kill_switch_triggered:
+        top_risk_reasons.append("Kill switch triggered by extreme pricing or invalid sizing.")
+    if not top_risk_reasons:
+        top_risk_reasons.append("Risk profile acceptable under current constraints.")
+
+    allow_trade = (
+        not kill_switch_triggered
+        and risk_metrics.adjusted_position_size_pct > 0.0
+        and risk_metrics.expected_value_estimate > 0.0
+    )
+
+    if not allow_trade:
+        final_recommendation = "reject"
+    elif risk_metrics.adjusted_position_size_pct < 1.0:
+        final_recommendation = "small"
+    elif risk_metrics.adjusted_position_size_pct < 3.0:
+        final_recommendation = "medium"
+    else:
+        final_recommendation = "high-conviction paper trade"
+
+    risk_logic_summary = (
+        f"Calibration probability {_format_probability(calibration.calibrated_true_prob)} versus market "
+        f"{_format_probability(risk_metrics.market_price)} produced adjusted size "
+        f"{risk_metrics.adjusted_position_size_pct:.2f}% with EV {risk_metrics.expected_value_estimate:.2f}."
+    )
+
+    return RiskAssessment(
+        allow_trade=allow_trade,
+        simulated_position_size_pct=risk_metrics.adjusted_position_size_pct,
+        max_loss_if_wrong=risk_metrics.max_loss_if_wrong,
+        expected_value_estimate=risk_metrics.expected_value_estimate,
+        top_risk_reasons=top_risk_reasons,
+        kill_switch_triggered=kill_switch_triggered,
+        final_recommendation=final_recommendation,
+        risk_logic_summary=risk_logic_summary,
+    )
+
+
+def _run_risk_management_agent(
+    risk_management_agent: Any | None,
+    *,
+    market: Market,
+    calibration: CalibrationReport,
+    risk_metrics: RiskMetrics,
+) -> RiskAssessment:
+    if risk_management_agent is None:
+        return _build_risk_assessment(risk_metrics=risk_metrics, calibration=calibration)
+    method = _resolve_method(risk_management_agent, ("assess", "evaluate", "analyze_risk"))
+    return _call_with_supported_kwargs(
+        method,
+        market=market,
+        calibration=calibration,
+        risk_metrics=risk_metrics,
+        calibrated_true_prob=calibration.calibrated_true_prob,
+        market_price=market.implied_prob,
+    )
+
+
+def _to_serializable(value: Any) -> Any:
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        return _to_serializable(value.model_dump())
+    if isinstance(value, dict):
+        return {str(key): _to_serializable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_serializable(item) for item in value]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _write_trade_execution_log(*, event_payload: Dict[str, Any], market_id: str) -> Path:
+    output_path = REPO_ROOT / f"trade_execution_{market_id}.json"
+    output_path.write_text(json.dumps(_to_serializable(event_payload), indent=2, sort_keys=True), encoding="utf-8")
+    return output_path
+
+
+def _render_final_trading_execution(assessment: RiskAssessment) -> str:
+    if assessment.allow_trade:
+        headline = (
+            f"{ANSI_BOLD}Final Trading Execution:{ANSI_RESET} "
+            f"{ANSI_BOLD}{ANSI_GREEN}[TRADE ALLOWED]{ANSI_RESET} "
+            f"{assessment.simulated_position_size_pct:.2f}% of Bankroll"
+        )
+    else:
+        top_reason = assessment.top_risk_reasons[0] if assessment.top_risk_reasons else "No reason provided."
+        headline = (
+            f"{ANSI_BOLD}Final Trading Execution:{ANSI_RESET} "
+            f"{ANSI_BOLD}{ANSI_RED}[TRADE REJECTED]{ANSI_RESET} "
+            f"{top_reason}"
+        )
+    return "\n".join(
+        [
+            headline,
+            f"{ANSI_BOLD}Recommendation:{ANSI_RESET} {assessment.final_recommendation}",
+            f"{ANSI_BOLD}Risk Summary:{ANSI_RESET} {assessment.risk_logic_summary}",
+        ]
+    )
+
+
+def run_final_risk_gate(
+    *,
+    calibration: CalibrationReport,
+    market: Market,
+    scanner_row: Dict[str, Any],
+    reddit_report: Any,
+    news_report: Any,
+    bankroll: float,
+    risk_calculator: RiskCalculator,
+    risk_management_agent: Any | None = None,
+    existing_open_positions: Optional[Sequence[Any]] = None,
+) -> Dict[str, Any]:
+    risk_metrics = risk_calculator.calculate_base_metrics(
+        market=market,
+        calibrated_true_prob=calibration.calibrated_true_prob,
+        bankroll=bankroll,
+        existing_open_positions=existing_open_positions,
+    )
+    risk_assessment = _run_risk_management_agent(
+        risk_management_agent,
+        market=market,
+        calibration=calibration,
+        risk_metrics=risk_metrics,
+    )
+
+    event_payload = {
+        "event_id": market.market_id,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "scanner": scanner_row,
+        "research": {
+            "reddit_query": build_reddit_search_query(market),
+            "news_query": build_news_search_query(market),
+            "reddit_report": reddit_report,
+            "news_report": news_report,
+        },
+        "calibration": calibration,
+        "risk": {
+            "risk_metrics": risk_metrics,
+            "risk_assessment": risk_assessment,
+        },
+    }
+    log_path = _write_trade_execution_log(event_payload=event_payload, market_id=market.market_id)
+
+    return {
+        "market": market,
+        "scanner": scanner_row,
+        "calibration": calibration,
+        "risk_metrics": risk_metrics,
+        "risk_assessment": risk_assessment,
+        "log_path": log_path,
+        "event_payload": event_payload,
+    }
+
+
 async def _analyze_market(
     *,
     market: Market,
@@ -252,7 +430,7 @@ async def _analyze_market(
     calibration_agent: Any,
     xgboost_probability_fn: BaselineFn,
     subreddits: Optional[Sequence[str]],
-) -> CalibrationReport:
+) -> Dict[str, Any]:
     reddit_query = build_reddit_search_query(market)
     news_query = build_news_search_query(market)
     reddit_diver = _instantiate_reddit_diver(
@@ -305,7 +483,15 @@ async def _analyze_market(
         market=market,
         scanner_priority=int(scan_row.get("research_priority") or 0),
     )
-    return calibration
+    return {
+        "scanner": scan_row,
+        "market": market,
+        "reddit_query": reddit_query,
+        "news_query": news_query,
+        "reddit_report": reddit_report,
+        "news_report": news_report,
+        "calibration": calibration,
+    }
 
 
 async def analyze_top_markets(
@@ -400,7 +586,7 @@ async def analyze_top_markets(
         if isinstance(result, Exception):
             logger.warning("Multi-agent analysis failed for %s: %s", market.title, result)
             continue
-        completed.append(result)
+        completed.append(result["calibration"])
     return completed
 
 
@@ -500,6 +686,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-pages", type=int, default=None)
     parser.add_argument("--category", type=str, default=None)
     parser.add_argument("--subreddit", action="append", dest="subreddits", default=None)
+    parser.add_argument("--bankroll", type=float, default=_DEFAULT_BANKROLL)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
@@ -521,6 +708,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     )
     print_alpha_assessment_table(calibrations)
+    if calibrations:
+        risk_calculator = RiskCalculator()
+        selected_rows = list(
+            _call_with_supported_kwargs(
+                build_scan_results,
+                min_volume_24h=args.min_volume_24h,
+                page_size=args.page_size,
+                max_pages=args.max_pages,
+                category=args.category,
+                fetch_markets_fn=fetch_active_markets,
+            )
+        )[: len(calibrations)]
+        markets_by_id = {market.market_id: market for market in fetch_active_markets(
+            min_volume_24h=args.min_volume_24h,
+            page_size=args.page_size,
+            max_pages=args.max_pages,
+        )}
+        for calibration, scanner_row in zip(calibrations, selected_rows):
+            market = markets_by_id.get(str(scanner_row.get("market_id") or ""))
+            if market is None:
+                continue
+            execution = run_final_risk_gate(
+                calibration=calibration,
+                market=market,
+                scanner_row=scanner_row,
+                reddit_report={},
+                news_report={},
+                bankroll=args.bankroll,
+                risk_calculator=risk_calculator,
+            )
+            print(_render_final_trading_execution(execution["risk_assessment"]))
+            print(f"{ANSI_BOLD}Execution Log:{ANSI_RESET} {execution['log_path']}")
     return 0
 
 
