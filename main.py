@@ -102,6 +102,7 @@ def build_scan_results(
     min_volume_24h: float = DEFAULT_MIN_VOLUME_24H,
     page_size: int = DEFAULT_PAGE_SIZE,
     max_pages: Optional[int] = None,
+    category: Optional[str] = None,
     fetch_markets_fn: FetchMarketsFn = fetch_active_markets,
     attach_spreads_fn: AttachSpreadsFn = attach_category_spread_averages,
     passes_filters_fn: PassesFiltersFn = passes_market_filters,
@@ -112,6 +113,7 @@ def build_scan_results(
 ) -> List[Dict[str, Any]]:
     logger = logger or LOGGER
     current_time = now or _utc_now()
+    normalized_category = str(category or "").strip().lower()
     markets = list(
         fetch_markets_fn(
             min_volume_24h=min_volume_24h,
@@ -123,6 +125,8 @@ def build_scan_results(
 
     results: List[Dict[str, Any]] = []
     for market in markets:
+        if normalized_category and str(market.category or "").strip().lower() != normalized_category:
+            continue
         market.refresh_derived_fields(now=current_time)
         if not passes_filters_fn(market, now=current_time):
             continue
@@ -255,6 +259,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--top", type=int, default=DEFAULT_TOP_N)
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "output"))
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--category", type=str, default=None, help="Filter by category (e.g., Politics, Crypto)")
     return parser.parse_args(argv)
 
 
@@ -270,6 +275,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         min_volume_24h=args.min_volume_24h,
         page_size=args.page_size,
         max_pages=args.max_pages,
+        category=args.category,
     )
     print(render_cli_table(results, limit=args.top))
     output_path = export_scan_results(results, output_dir=args.output_dir, now=current_time)

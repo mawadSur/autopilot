@@ -1,10 +1,11 @@
+import os
 import unittest
 from unittest.mock import patch
 
 import requests
 
 import llm_judge
-from llm_judge import LLMJudgeResult, judge_market
+from llm_judge import LLMJudgeResult, _build_payload, _extract_grounding, _request_gemini_json, _resolve_api_key, _resolve_model, _resolve_timeout, judge_market
 
 
 class FakeResponse:
@@ -116,6 +117,54 @@ class LLMJudgeTests(unittest.TestCase):
         self.assertIn("substantial evidence", result.reasoning.lower())
         self.assertNotIn("tools", session.calls[0]["json"])
 
+    def test_judge_market_handles_missing_grounding_metadata(self):
+        response = FakeResponse(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": '{"clarity_score": 72, "narrative_momentum": 38, "ambiguous": false, "reasoning": "Sparse but valid response."}'
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        session = FakeSession(response)
+
+        result = judge_market(
+            "Will the vote pass?",
+            "This market resolves to Yes if the measure passes officially before the deadline.",
+            api_key="test-key",
+            session=session,
+        )
+
+        self.assertEqual(result.search_queries, [])
+        self.assertEqual(result.source_titles, [])
+
+    def test_extract_grounding_supports_object_style_candidates_and_missing_attrs(self):
+        web_chunk = type("Chunk", (), {"web": type("Web", (), {"title": "Reuters headline"})()})()
+        metadata = type(
+            "GroundingMeta",
+            (),
+            {
+                "web_search_queries": ["latest market news"],
+                "grounding_chunks": [web_chunk],
+            },
+        )()
+        candidate = type("Candidate", (), {"grounding_metadata": metadata})()
+
+        search_queries, source_titles = _extract_grounding(candidate)
+        self.assertEqual(search_queries, ["latest market news"])
+        self.assertEqual(source_titles, ["Reuters headline"])
+
+        empty_queries, empty_titles = _extract_grounding(type("Candidate", (), {})())
+        self.assertEqual(empty_queries, [])
+        self.assertEqual(empty_titles, [])
+
     def test_judge_market_salvages_truncated_json_like_output(self):
         response = FakeResponse(
             {
@@ -156,6 +205,40 @@ class LLMJudgeTests(unittest.TestCase):
                     "This market resolves to Yes if the bill is signed into law before June 1.",
                     session=FakeSession(FakeResponse({"candidates": []})),
                 )
+
+    @unittest.skipUnless(
+        os.getenv("RUN_LIVE_GEMINI_GROUNDING_TEST") == "1",
+        "Set RUN_LIVE_GEMINI_GROUNDING_TEST=1 to run live Gemini grounding integration tests.",
+    )
+    def test_live_grounding_activation_for_current_btc_price_prompt(self):
+        api_key = _resolve_api_key(None)
+        if not api_key:
+            self.skipTest("No Gemini API key configured for live grounding test")
+
+        session = requests.Session()
+        try:
+            response_json = _request_gemini_json(
+                session,
+                api_key=api_key,
+                model=_resolve_model(None),
+                payload=_build_payload(
+                    "What is the exact current trading price of Bitcoin as of the last 5 minutes today?",
+                    "Use the most current market data available and rely on live search when needed.",
+                    use_search_grounding=True,
+                ),
+                timeout_s=_resolve_timeout(None),
+            )
+        finally:
+            session.close()
+
+        candidates = response_json.get("candidates") or []
+        self.assertTrue(candidates, "Gemini returned no candidates for the live grounding test")
+
+        search_queries, source_titles = _extract_grounding(candidates[0])
+        self.assertTrue(
+            search_queries or source_titles,
+            f"Expected grounding metadata for the live BTC prompt, got candidate: {candidates[0]}",
+        )
 
 
 if __name__ == "__main__":
