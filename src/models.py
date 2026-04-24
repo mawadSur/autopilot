@@ -66,18 +66,18 @@ class LSTMClassifier(nn.Module):
         direction_factor = 2 if bidirectional else 1
         self.head = nn.Sequential(
             nn.LayerNorm(hidden_size * direction_factor),
-            nn.Linear(hidden_size * direction_factor, hidden_size),
+            nn.Linear(hidden_size * direction_factor, 256),
             nn.ReLU(),
             nn.Dropout(p=dropout),
-            nn.Linear(hidden_size, num_classes),
+            nn.Linear(256, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, F]
-        # We take the last hidden state for classification (common approach)
-        output, (hn, cn) = self.lstm(x)  # output: [B, T, H*D]
-        last = output[:, -1, :]          # [B, H*D]
-        logits = self.head(last)         # [B, C]
+        # Match training: for bidirectional LSTMs use the final forward and
+        # backward hidden states rather than output[:, -1, :].
+        _, (hn, _) = self.lstm(x)
+        last = torch.cat([hn[-2], hn[-1]], dim=1) if self.lstm.bidirectional else hn[-1]
+        logits = self.head(last)
         return logits
 
 

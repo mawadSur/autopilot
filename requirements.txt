@@ -1,19 +1,34 @@
-backtrader
-python-dotenv
-matplotlib
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Core data/modeling stack
+numpy
 pandas
+scikit-learn
+joblib
+torch
+tensorflow
+
+# API and app runtime
+fastapi
+uvicorn
+python-dotenv
+redis
+aiohttp
+websockets
+
+# Trading / market integrations
 python-binance
+ccxt
+backtrader
+
+# AWS / deployment
+boto3
+sagemaker
+
+# Data storage / utilities
+h5py
+matplotlib
+psutil
+tqdm
 setuptools
 wheel
-tqdm
-tensorflow
-numpy
-torch --index-url https://download.pytorch.org/whl/cpu
-typing-extensions>=4.7.0
-joblib
-ccxt
-sagemaker
-boto3
-uvicorn
-fastapi
-scikit-learn==1.3.0

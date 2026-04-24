@@ -4,18 +4,100 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import asyncio
+import json
+import redis.asyncio as redis
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+from dotenv import load_dotenv
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+load_dotenv()
 
 # NOTE: We intentionally avoid heavy AWS / ML imports at module import time.
 #       They will be imported inside endpoints to keep `uvicorn main:app --reload` reliable.
 
 APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
 BASE_DIR = Path(__file__).resolve().parent
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", os.getenv("TRADE_SYMBOL", "ETHUSDT")).split(",") if s.strip()]
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception:
+                # Connection might be closed
+                pass
+
+manager = ConnectionManager()
+
+async def candle_broadcaster(symbol: str):
+    """Broadcast the latest cached candle for a symbol."""
+    r = redis.from_url(f"redis://{REDIS_HOST}:{REDIS_PORT}", decode_responses=True)
+    cache_key = f"cache:{symbol}:latest_candle"
+    print(f"📡 Candle broadcaster started for {cache_key}")
+    last_time: Optional[str] = None
+
+    while True:
+        try:
+            data = await r.hgetall(cache_key)
+            if data and data.get("time") != last_time:
+                last_time = data.get("time")
+                await manager.broadcast({"type": "candle", "symbol": symbol, "data": data})
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"❌ Candle broadcaster error [{symbol}]: {e}")
+            await asyncio.sleep(5)
+
+async def signal_broadcaster(symbol: str):
+    """Poll Redis list for new signals for a symbol and broadcast."""
+    r = redis.from_url(f"redis://{REDIS_HOST}:{REDIS_PORT}", decode_responses=True)
+    list_key = f"list:{symbol}:signals"
+    print(f"📡 Signal broadcaster started for {list_key}")
+    
+    while True:
+        try:
+            res = await r.brpop(list_key, timeout=5)
+            if res:
+                _, data = res
+                await manager.broadcast({"type": "signal", "symbol": symbol, "data": json.loads(data)})
+        except Exception as e:
+            print(f"❌ Signal broadcaster error [{symbol}]: {e}")
+            await asyncio.sleep(5)
+
+async def trade_broadcaster(symbol: str):
+    """Poll Redis list for new trades for a symbol and broadcast."""
+    r = redis.from_url(f"redis://{REDIS_HOST}:{REDIS_PORT}", decode_responses=True)
+    list_key = f"list:{symbol}:trades"
+    print(f"📡 Trade broadcaster started for {list_key}")
+    
+    while True:
+        try:
+            res = await r.brpop(list_key, timeout=5)
+            if res:
+                _, data = res
+                await manager.broadcast({"type": "trade", "symbol": symbol, "data": json.loads(data)})
+        except Exception as e:
+            print(f"❌ Trade broadcaster error [{symbol}]: {e}")
+            await asyncio.sleep(5)
 
 def create_app() -> FastAPI:
     app = FastAPI(title="AI Crypto Trading API", version=APP_VERSION)
@@ -32,9 +114,70 @@ def create_app() -> FastAPI:
     # simple process registry for long-running scripts
     app.state.procs: Dict[str, subprocess.Popen] = {}
 
+    @app.on_event("startup")
+    async def startup_event():
+        # Start background broadcasters for each symbol
+        for symbol in SYMBOLS:
+            asyncio.create_task(candle_broadcaster(symbol))
+            asyncio.create_task(signal_broadcaster(symbol))
+            asyncio.create_task(trade_broadcaster(symbol))
+
+    @app.websocket("/ws/signal-stream")
+    async def signal_stream(websocket: WebSocket):
+        await manager.connect(websocket)
+        try:
+            while True:
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            manager.disconnect(websocket)
+        except Exception:
+            manager.disconnect(websocket)
+
     @app.get("/")
     async def root():
-        return {"message": "AI Crypto Trading API is running", "version": APP_VERSION}
+        return {"message": "AI Crypto Trading API is running", "version": APP_VERSION, "symbols": SYMBOLS}
+
+    @app.get("/status")
+    async def status():
+        """Get status of all active symbols."""
+        r = redis.from_url(f"redis://{REDIS_HOST}:{REDIS_PORT}", decode_responses=True)
+        results = {}
+        for symbol in SYMBOLS:
+            # Get latest candle
+            candle = await r.hgetall(f"cache:{symbol}:latest_candle")
+            
+            # Check for open position (reading state file)
+            state_file = Path(f"state_{symbol}.json")
+            position = None
+            if state_file.exists():
+                try:
+                    with open(state_file, "r") as f:
+                        position = json.load(f)
+                except:
+                    pass
+            
+            results[symbol] = {
+                "active": True,
+                "latest_price": candle.get("close"),
+                "last_update": candle.get("timestamp"),
+                "position": position
+            }
+        return results
+
+    @app.post("/retrain")
+    async def trigger_retrain():
+        """Manually trigger automated retraining."""
+        script = BASE_DIR / "auto_retrain.py"
+        if not script.exists():
+            raise HTTPException(404, f"Missing script: {script}")
+        
+        cmd = [os.getenv("PYTHON", "python"), str(script)]
+        try:
+            proc = subprocess.Popen(cmd, cwd=str(BASE_DIR.parent))
+            app.state.procs[f"retrain:{proc.pid}"] = proc
+            return {"status": "started", "pid": proc.pid}
+        except Exception as e:
+            raise HTTPException(500, f"Failed to start retraining: {e}")
 
     @app.get("/health")
     async def health():
@@ -278,9 +421,10 @@ def create_app() -> FastAPI:
         script = BASE_DIR / "paper_trade.py"
         if not script.exists():
             raise HTTPException(404, f"Missing script: {script}")
-        cmd = [os.getenv("PYTHON", "python"), str(script)]
+        # Ensure it points to the 'model' directory for meta and weights
+        cmd = [os.getenv("PYTHON", "python"), str(script), "--model-dir", "model"]
         try:
-            proc = subprocess.Popen(cmd, cwd=str(BASE_DIR))
+            proc = subprocess.Popen(cmd, cwd=str(BASE_DIR.parent))
             app.state.procs[f"paper-trade:{proc.pid}"] = proc
             return {"status": "started", "pid": proc.pid}
         except Exception as e:
@@ -317,4 +461,4 @@ app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+    uvicorn.run("src.main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
