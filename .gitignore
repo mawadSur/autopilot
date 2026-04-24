@@ -9,6 +9,7 @@ __pycache__/
 *.whl
 *.csv
 .venv*
+venv/
 tf-venv*
 *.deb*
 *.run
@@ -16,3 +17,29 @@ tf-venv*
 *.log
 eth_1m_data
 eth_1s_data
+
+# Credentials — never commit
+.env
+src/.env
+
+# Model binaries and artifacts
+*.pt
+*.joblib
+model/
+tmp_smoke_model/
+test_model_temp/
+labeled_chunks/
+
+# Runtime artifacts
+*.db
+*.pyc
+paper_trade.log
+
+# Platform binaries
+redis-new/
+*.exe
+*.pdb
+*.dll
+
+# Node
+node_modules/

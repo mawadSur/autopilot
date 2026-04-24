@@ -89,7 +89,7 @@ def trade_live(poll_seconds: int = 1) -> None:
                 order = place_market_quote_order(client, SIDE_BUY, SYMBOL, QUOTE_USDT)
                 print(f"🚀 BUY @ {price:.2f} | conf={conf:.3f} -> {order.get('status', 'ok')}")
                 position_open = True
-            elif position_open and signal == 0:
+            elif position_open and signal == -1:
                 order = place_market_quote_order(client, SIDE_SELL, SYMBOL, QUOTE_USDT)
                 print(f"🏁 SELL @ {price:.2f} -> {order.get('status', 'ok')}")
                 position_open = False
