@@ -392,8 +392,14 @@ def run_final_risk_gate(
 
     event_payload = {
         "event_id": market.market_id,
+        "trade_id": market.market_id,
+        "status": "open",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "settled_at": None,
+        "final_outcome": None,
+        "post_settlement_news": None,
         "scanner": scanner_row,
+        "features_window": None,
         "research": {
             "reddit_query": build_reddit_search_query(market),
             "news_query": build_news_search_query(market),

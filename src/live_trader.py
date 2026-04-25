@@ -48,6 +48,7 @@ from utils import (
     fmt_money,
     FEATURE_COLUMNS_PROFITABLE,
     align_feature_columns,
+    DashboardClient,
 )
 from config import cfg
 try:
@@ -61,8 +62,9 @@ except ModuleNotFoundError:
     from simulator import SimulationConfig, PortfolioSimulator, Bar
 
 PROJECT = Path(__file__).resolve().parent
-MODEL_DIR = PROJECT / "model"
-DATA_DIR = PROJECT / "eth_1m_data"
+REPO_ROOT = PROJECT.parent
+MODEL_DIR = REPO_ROOT / cfg.model_dir
+DATA_DIR = REPO_ROOT / cfg.data_dir
 
 
 # ----------------------------

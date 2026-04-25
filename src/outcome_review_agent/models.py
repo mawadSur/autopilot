@@ -1,56 +1,47 @@
 from __future__ import annotations
 
-from typing import Literal
-
 from pydantic import BaseModel, ConfigDict, Field
 
 
 class OutcomeReview(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    trade_id: str = Field(
+    matrix_classification: str = Field(
+        ...,
+        description=(
+            "One of: Deserved Success, Good Failure, Dumb Luck, or Poetic Justice."
+        ),
+    )
+    thesis_held: bool = Field(
+        ...,
+        description="Whether the original thesis held based on available evidence.",
+    )
+    unknown_at_entry: bool = Field(
+        ...,
+        description="Whether post-settlement information was impossible to know at trade entry.",
+    )
+    calibration_reasonable: bool = Field(
+        ...,
+        description="Whether the original calibration was reasonable given entry-time information.",
+    )
+    resulting_detected: bool = Field(
+        ...,
+        description="True when outcome appears driven by luck/noise more than process quality.",
+    )
+    research_module_flaw: bool = Field(
+        ...,
+        description="True if there is a detectable flaw in research quality or evidence handling.",
+    )
+    risk_module_flaw: bool = Field(
+        ...,
+        description="True if there is a detectable flaw in risk sizing, constraints, or execution discipline.",
+    )
+    key_takeaways: list[str] = Field(
+        default_factory=list,
+        description="Actionable post-mortem takeaways for model/process improvement.",
+    )
+    reasoning: str = Field(
         ...,
         min_length=1,
-        description="Unique identifier for the settled trade.",
-    )
-    classification: Literal[
-        "deserved success",
-        "good failure",
-        "dumb luck",
-        "poetic justice",
-    ] = Field(
-        ...,
-        description="Outcome quadrant classification based on process quality and result quality.",
-    )
-    process_score: int = Field(
-        ...,
-        ge=0,
-        le=10,
-        description="How well the agents followed the strategy from 0 to 10.",
-    )
-    outcome_score: int = Field(
-        ...,
-        ge=0,
-        le=10,
-        description="Outcome quality based on simulated profit/loss from 0 to 10.",
-    )
-    new_info_impact: str = Field(
-        ...,
-        min_length=1,
-        description="What emerged after entry that the model missed.",
-    )
-    confidence_in_classification: int = Field(
-        ...,
-        ge=0,
-        le=100,
-        description="Confidence in this classification from 0 to 100.",
-    )
-    explanation: str = Field(
-        ...,
-        min_length=1,
-        description="Concise explanation of why this outcome fits the selected quadrant.",
-    )
-    strategy_adjustment_needed: bool = Field(
-        ...,
-        description="True if this indicates a systemic flaw, False if this was statistical noise.",
+        description="Concise explanation for the matrix classification and flaw/resulting diagnosis.",
     )

@@ -31,7 +31,7 @@ class TradingConfig(BaseSettings):
     FEATURE_VERSION: ClassVar[str] = FEATURE_VERSION
     # Data / model
     data_dir: str = Field("eth_1m_data", env="DATA_DIR")
-    model_dir: str = Field("model", env="MODEL_DIR")
+    model_dir: str = Field("model_sanity", env="MODEL_DIR")
     window_size: Optional[int] = Field(None, env="WINDOW_SIZE")
     batch_size: int = Field(512, env="BATCH_SIZE")
     chunksize: int = Field(300_000, env="CHUNKSIZE")

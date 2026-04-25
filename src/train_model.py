@@ -677,10 +677,10 @@ def run_profit_simulation(
     loader: DataLoader,
     device: torch.device,
     cfg: "TrainConfig",
-) -> None:
+) -> Optional[Dict[str, Any]]:
     """Replay validation set, estimate EV/Sharpe-like stats, and log drawdowns."""
     if not state_dict:
-        return
+        return None
     model.load_state_dict(state_dict)
     model.eval()
     all_probs: List[np.ndarray] = []
@@ -2525,6 +2525,26 @@ def train(cfg: TrainConfig):
         and final_val_files
     ):
         logger.info("[final_profit_sim] Replaying validation files for Sharpe-style metrics.")
+        
+        # Rebuild model with the correct input size for final_best_state
+        model_meta_dict = dict(meta_existing)
+        model_meta_dict.update({
+            "input_size": len(final_feature_cols),
+            "hidden_size": cfg.hidden_size,
+            "num_layers": cfg.num_layers,
+            "dropout": cfg.dropout,
+            "bidirectional": cfg.bidirectional,
+            "num_classes": 3,
+            "model_type": selected_model_type,
+        })
+        if selected_model_type in {"transformer", "transformer_classifier"}:
+            model_meta_dict.setdefault("num_heads", meta_existing.get("num_heads", 4))
+            model_meta_dict["transformer_pooling"] = str(getattr(cfg, "transformer_pooling", "weighted_last"))
+        else:
+            model_meta_dict.pop("num_heads", None)
+            model_meta_dict.pop("transformer_pooling", None)
+        model = build_model_from_meta(model_meta_dict).to(device)
+
         final_val_ds = StreamWindowDataset(
             final_val_files,
             final_feature_cols,

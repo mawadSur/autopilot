@@ -24,16 +24,34 @@ def _normalize_text(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def _flatten_review_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Lift PerformanceTracker's nested ``outcome_review`` fields onto the entry."""
+    flat = dict(entry)
+    review = entry.get("outcome_review")
+    if isinstance(review, dict):
+        for key, value in review.items():
+            flat.setdefault(key, value)
+    return flat
+
+
 def _extract_trades(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, list):
         return [trade for trade in payload if isinstance(trade, dict)]
 
     if isinstance(payload, dict):
+        # PerformanceTracker audit shape: {"reviews": [{...}], "aggregates": {...}}.
+        reviews = payload.get("reviews")
+        if isinstance(reviews, list):
+            return [_flatten_review_entry(r) for r in reviews if isinstance(r, dict)]
+
         trades = payload.get("trades")
         if isinstance(trades, list):
             return [trade for trade in trades if isinstance(trade, dict)]
 
-    raise ValueError("performance_audit.json must be a list of trades or contain a 'trades' list")
+    raise ValueError(
+        "performance_audit.json must be a list of trades, contain a 'trades' list, "
+        "or contain a 'reviews' list (PerformanceTracker shape)."
+    )
 
 
 def _resolve_quadrant(trade: dict[str, Any]) -> str | None:
@@ -42,6 +60,7 @@ def _resolve_quadrant(trade: dict[str, Any]) -> str | None:
         trade.get("audit_quadrant"),
         trade.get("category"),
         trade.get("result_quadrant"),
+        trade.get("matrix_classification"),
     )
 
     for candidate in candidate_fields:
@@ -53,7 +72,7 @@ def _resolve_quadrant(trade: dict[str, Any]) -> str | None:
 
 
 def _is_win(trade: dict[str, Any]) -> bool:
-    for key in ("is_win", "won", "win"):
+    for key in ("is_win", "won", "win", "final_outcome"):
         value = trade.get(key)
         if isinstance(value, bool):
             return value

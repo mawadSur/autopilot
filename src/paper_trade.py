@@ -31,6 +31,7 @@ from utils import (
     compute_features,
     FEATURE_COLUMNS_PROFITABLE,
     align_feature_columns,
+    DashboardClient,
 )
 try:
     from simulator import simulate_trades_with_tp_sl, print_portfolio_report

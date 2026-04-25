@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -34,11 +34,15 @@ class PerformanceTracker:
         outcome_review_agent: Any,
         audit_file: str | Path | None = None,
         trade_file_glob: str = "trade_execution_*.json",
+        additional_review_agents: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.trade_store_dir = Path(trade_store_dir)
         self.outcome_review_agent = outcome_review_agent
         self.trade_file_glob = trade_file_glob
         self.audit_file = Path(audit_file) if audit_file else self.trade_store_dir / "performance_audit.json"
+        # Each entry runs alongside the primary outcome review and lands in the audit
+        # entry under "<name>_review" (e.g. "data_quality" → "data_quality_review").
+        self.additional_review_agents: Dict[str, Any] = dict(additional_review_agents or {})
 
     def process_settled_trades(self) -> Dict[str, Any]:
         """Review any new settled trades and update the performance audit."""
@@ -52,7 +56,7 @@ class PerformanceTracker:
             if trade_key in reviewed_keys:
                 continue
 
-            outcome_review = self._call_outcome_review_agent(trade.payload)
+            outcome_review = self._call_review_agent(self.outcome_review_agent, trade.payload)
             audit_entry = {
                 "trade_id": trade.trade_id,
                 "source_file": trade.source_file,
@@ -60,7 +64,10 @@ class PerformanceTracker:
                 "settled_at": self._extract_settlement_time(trade.payload),
                 "reviewed_at": self._utc_now_iso(),
                 "outcome_review": outcome_review,
+                "final_outcome": trade.payload.get("final_outcome"),
             }
+            for agent_name, agent in self.additional_review_agents.items():
+                audit_entry[f"{agent_name}_review"] = self._call_review_agent(agent, trade.payload)
             new_reviews.append(audit_entry)
             reviewed_keys.add(trade_key)
 
@@ -122,7 +129,7 @@ class PerformanceTracker:
                     source_file=file_path.name,
                 )
 
-    def _call_outcome_review_agent(self, trade_payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _call_review_agent(self, agent: Any, trade_payload: Dict[str, Any]) -> Dict[str, Any]:
         method_candidates = (
             "review_trade",
             "analyze_trade",
@@ -132,13 +139,13 @@ class PerformanceTracker:
         )
 
         for method_name in method_candidates:
-            method = getattr(self.outcome_review_agent, method_name, None)
+            method = getattr(agent, method_name, None)
             if not callable(method):
                 continue
 
             if inspect.iscoroutinefunction(method):
                 raise RuntimeError(
-                    "PerformanceTracker expects a synchronous OutcomeReviewAgent method. "
+                    "PerformanceTracker expects a synchronous review-agent method. "
                     "Provide a sync adapter for async agents."
                 )
 
@@ -155,7 +162,7 @@ class PerformanceTracker:
             return {"review": review}
 
         raise RuntimeError(
-            "OutcomeReviewAgent must implement one of: "
+            "Review agent must implement one of: "
             "review_trade(trade_payload), analyze_trade(trade_payload), review(trade_payload), run(trade_payload), "
             "or be directly callable."
         )

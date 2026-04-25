@@ -1,25 +1,25 @@
 {
   "fold": 2,
-  "val_acc": 0.6984015867460039,
-  "val_macro_f1": 0.5942744086418325,
+  "val_acc": 0.6977015517442539,
+  "val_macro_f1": 0.5929102911482377,
   "feature_count": 37,
   "feature_selection_method": "mutual_information_walk_forward",
   "precision": {
-    "short_win": 0.4551,
+    "short_win": 0.4531,
     "timeout": 0.9333,
-    "long_win": 0.3876
+    "long_win": 0.3858
   },
   "recall": {
-    "short_win": 0.5357,
+    "short_win": 0.5393,
     "timeout": 0.8556,
-    "long_win": 0.4089
+    "long_win": 0.4016
   },
   "pred_dist": {
-    "short_win": 0.2522,
+    "short_win": 0.255,
     "timeout": 0.5384,
-    "long_win": 0.2094
+    "long_win": 0.2066
   },
-  "temperature": 0.628155529499054,
+  "temperature": 0.628125786781311,
   "optimized_thresholds": {
     "thr_long": 0.6,
     "thr_short": 0.6,

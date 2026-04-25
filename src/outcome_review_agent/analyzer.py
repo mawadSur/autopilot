@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, ConfigDict, Field
 
 from config import cfg
+from outcome_review_agent.models import OutcomeReview
 
 
 DEFAULT_MODEL_NAME = "gemini-2.5-pro"
@@ -26,50 +26,6 @@ SYSTEM_PROMPT = (
     '- Was the original calibration reasonable given the information available at the time?\n\n'
     'Your goal is to identify if the system is "resulting" or if it actually has a flaw in its research or risk modules.'
 )
-
-
-class OutcomeReview(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    matrix_classification: str = Field(
-        ...,
-        description=(
-            "One of: Deserved Success, Good Failure, Dumb Luck, or Poetic Justice."
-        ),
-    )
-    thesis_held: bool = Field(
-        ...,
-        description="Whether the original thesis held based on available evidence.",
-    )
-    unknown_at_entry: bool = Field(
-        ...,
-        description="Whether post-settlement information was impossible to know at trade entry.",
-    )
-    calibration_reasonable: bool = Field(
-        ...,
-        description="Whether the original calibration was reasonable given entry-time information.",
-    )
-    resulting_detected: bool = Field(
-        ...,
-        description="True when outcome appears driven by luck/noise more than process quality.",
-    )
-    research_module_flaw: bool = Field(
-        ...,
-        description="True if there is a detectable flaw in research quality or evidence handling.",
-    )
-    risk_module_flaw: bool = Field(
-        ...,
-        description="True if there is a detectable flaw in risk sizing, constraints, or execution discipline.",
-    )
-    key_takeaways: list[str] = Field(
-        default_factory=list,
-        description="Actionable post-mortem takeaways for model/process improvement.",
-    )
-    reasoning: str = Field(
-        ...,
-        min_length=1,
-        description="Concise explanation for the matrix classification and flaw/resulting diagnosis.",
-    )
 
 
 def _resolve_api_key(explicit_api_key: Optional[str]) -> Optional[str]:
@@ -218,6 +174,36 @@ class OutcomeReviewAgent:
             ),
         )
         return _parse_review_response(response)
+
+    def review_trade(self, trade_payload: Mapping[str, Any]) -> Dict[str, Any]:
+        """Adapter for PerformanceTracker-style payloads stored as JSON.
+
+        Pulls ``final_outcome`` (required), ``post_settlement_news`` (optional),
+        and ``trade_log`` (optional, defaults to the whole payload) out of a
+        single dict and delegates to ``review_settled_trade``. Returns the
+        review as a plain dict so it serializes straight into the audit file.
+        """
+        if not isinstance(trade_payload, Mapping):
+            raise TypeError(f"trade_payload must be a Mapping, got {type(trade_payload)!r}")
+        if "final_outcome" not in trade_payload:
+            raise ValueError("trade_payload must include 'final_outcome' (bool)")
+
+        final_outcome = trade_payload["final_outcome"]
+        if not isinstance(final_outcome, bool):
+            raise TypeError("trade_payload['final_outcome'] must be a bool")
+
+        trade_log = trade_payload.get("trade_log", trade_payload)
+        post_settlement_news = trade_payload.get(
+            "post_settlement_news",
+            "No post-settlement news provided.",
+        )
+
+        review = self.review_settled_trade(
+            trade_log=trade_log,
+            final_outcome=final_outcome,
+            post_settlement_news=post_settlement_news,
+        )
+        return review.model_dump()
 
     def _build_client(self) -> Any:
         if not self.api_key:

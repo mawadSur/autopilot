@@ -1,0 +1,7 @@
+{
+  "live_config": {
+    "thr_long": 0.55,
+    "thr_short": 0.6,
+    "score": 1.0
+  }
+}
