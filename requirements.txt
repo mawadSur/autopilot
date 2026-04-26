@@ -40,3 +40,10 @@ loguru
 streamlit
 plotly
 openai
+
+# Calibration baseline. Loaded by src/calibration_agent/ml_service.py when
+# XGBOOST_MODEL_PATH points at a joblib-saved model.
+xgboost>=3.0,<4.0
+
+# Tooling
+ruff>=0.6,<1.0

@@ -21,13 +21,27 @@ class SynthesisReportTests(unittest.TestCase):
                 "The crowd is overweighting stale consensus.",
                 "The market may be underestimating one key catalyst.",
             ],
-            verdict="possible edge",
-            explanation="There may be some informational edge, but it is not yet decisive.",
+            verdict="stale",
+            explanation="The market has not yet absorbed the latest reporting.",
         )
 
-        self.assertEqual(report.verdict, "possible edge")
+        self.assertEqual(report.verdict, "stale")
         self.assertEqual(len(report.reasons_market_is_right), 3)
         self.assertTrue(report.has_unique_evidence)
+
+    def test_report_accepts_all_spec_verdicts(self):
+        valid_verdicts = ("stale", "efficient", "overreactive", "unclear")
+        for value in valid_verdicts:
+            report = SynthesisReport(
+                implied_probability=0.5,
+                narrative_direction="mixed",
+                has_unique_evidence=False,
+                reasons_market_is_right=["One", "Two", "Three"],
+                reasons_market_is_wrong=["One", "Two", "Three"],
+                verdict=value,
+                explanation="Explanation",
+            )
+            self.assertEqual(report.verdict, value)
 
     def test_report_rejects_reason_lists_with_wrong_length(self):
         with self.assertRaises(ValidationError):
@@ -37,7 +51,7 @@ class SynthesisReportTests(unittest.TestCase):
                 has_unique_evidence=False,
                 reasons_market_is_right=["One", "Two"],
                 reasons_market_is_wrong=["One", "Two", "Three"],
-                verdict="no edge",
+                verdict="efficient",
                 explanation="Explanation",
             )
 
@@ -53,6 +67,19 @@ class SynthesisReportTests(unittest.TestCase):
                 explanation="Explanation",
             )
 
+    def test_report_rejects_legacy_verdict_values(self):
+        for legacy_value in ("no edge", "possible edge", "strong research edge"):
+            with self.assertRaises(ValidationError):
+                SynthesisReport(
+                    implied_probability=0.5,
+                    narrative_direction="mixed",
+                    has_unique_evidence=False,
+                    reasons_market_is_right=["One", "Two", "Three"],
+                    reasons_market_is_wrong=["One", "Two", "Three"],
+                    verdict=legacy_value,
+                    explanation="Explanation",
+                )
+
     def test_schema_includes_descriptions_and_exact_reason_lengths(self):
         schema = SynthesisReport.model_json_schema()
         properties = schema["properties"]
@@ -61,10 +88,9 @@ class SynthesisReportTests(unittest.TestCase):
             properties["implied_probability"]["description"],
             "Current market-implied probability (e.g. 0.45 for 45%)",
         )
-        self.assertEqual(
-            properties["verdict"]["description"],
-            "Final trading verdict. Must be 'no edge' if evidence is mixed or weak.",
-        )
+        verdict_description = properties["verdict"]["description"]
+        for value in ("stale", "efficient", "overreactive", "unclear"):
+            self.assertIn(value, verdict_description)
         self.assertEqual(properties["reasons_market_is_right"]["minItems"], 3)
         self.assertEqual(properties["reasons_market_is_right"]["maxItems"], 3)
         self.assertEqual(properties["reasons_market_is_wrong"]["minItems"], 3)

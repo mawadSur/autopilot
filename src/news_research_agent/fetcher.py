@@ -7,6 +7,8 @@ from urllib.parse import quote_plus
 
 import feedparser
 
+from research_mock import build_mock_news_entries, is_research_mock_enabled
+
 
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
 DEFAULT_ARTICLE_LIMIT = 10
@@ -28,6 +30,9 @@ class GoogleNewsRSSFetcher:
         self._feedparser = feedparser_module if feedparser_module is not None else feedparser
 
     def fetch_news(self) -> List[Dict[str, str]]:
+        if is_research_mock_enabled():
+            mock_entries = build_mock_news_entries(self.search_query)
+            return mock_entries[: self.article_limit]
         feed = self._feedparser.parse(self._build_feed_url())
         entries = list(getattr(feed, "entries", []) or [])
         parsed_entries = [self._parse_entry(entry) for entry in entries]

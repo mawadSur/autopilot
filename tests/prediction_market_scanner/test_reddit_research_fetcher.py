@@ -1,6 +1,13 @@
+import logging
+import os
 import unittest
+from unittest.mock import patch
 
-from reddit_research_agent.fetcher import RedditDeepDiver
+from reddit_research_agent import fetcher as reddit_fetcher
+from reddit_research_agent.fetcher import (
+    RedditDeepDiver,
+    _reset_missing_credentials_log_state,
+)
 
 
 class FakeAuthor:
@@ -157,6 +164,112 @@ class RedditDeepDiverTests(unittest.TestCase):
         diver = RedditDeepDiver("alias query", reddit_client=reddit)
 
         self.assertEqual(diver.fetch_threads(), diver.fetch_discussion_context())
+
+
+class GracefulDegradationTests(unittest.TestCase):
+    """Behaviour when REDDIT_CLIENT_ID is absent (Devvit-MCP-driven workflows).
+
+    With no PRAW credentials AND no explicit ``RESEARCH_MOCK`` toggle, the
+    fetcher should quietly degrade to deterministic mock data and surface a
+    one-time INFO log pointing the operator at the /reddit-research skill.
+    Legacy users with credentials set keep getting the live PRAW path.
+    """
+
+    def setUp(self):
+        _reset_missing_credentials_log_state()
+
+    def tearDown(self):
+        _reset_missing_credentials_log_state()
+
+    def _env_without_reddit_or_mock(self) -> dict:
+        return {
+            key: value
+            for key, value in os.environ.items()
+            if key
+            not in {
+                "REDDIT_CLIENT_ID",
+                "REDDIT_CLIENT_SECRET",
+                "REDDIT_USER_AGENT",
+                "RESEARCH_MOCK",
+            }
+        }
+
+    def test_no_reddit_client_id_falls_back_to_mock(self):
+        with patch.dict(
+            os.environ, self._env_without_reddit_or_mock(), clear=True
+        ):
+            with self.assertLogs(
+                "reddit_research_agent.fetcher", level=logging.INFO
+            ) as captured:
+                diver = RedditDeepDiver(
+                    "polymarket sample question",
+                    subreddits=["politics", "news"],
+                )
+                self.assertIsNone(
+                    diver.reddit,
+                    "reddit client must not be built when credentials are missing",
+                )
+
+                context = diver.fetch_threads()
+
+        # Mock context shape and content checks.
+        self.assertIn("REDDIT DISCUSSION CONTEXT", context)
+        self.assertIn("[MOCK DATA]", context)
+        self.assertIn("polymarket sample question", context)
+        self.assertIn("SUBREDDITS: politics+news", context)
+
+        # Exactly one INFO log mentioning the /reddit-research skill.
+        skill_log_lines = [
+            record.getMessage()
+            for record in captured.records
+            if "/reddit-research skill" in record.getMessage()
+        ]
+        self.assertEqual(
+            len(skill_log_lines),
+            1,
+            f"expected exactly one skill-pointer log, got: {skill_log_lines}",
+        )
+        self.assertIn("REDDIT_CLIENT_ID not set", skill_log_lines[0])
+        self.assertIn("Devvit MCP", skill_log_lines[0])
+
+    def test_existing_credentials_still_use_praw(self):
+        """When REDDIT_CLIENT_ID is set, the real PRAW path is taken."""
+
+        captured_kwargs = {}
+
+        class FakePraw:
+            class Reddit:
+                def __init__(self, **kwargs):
+                    captured_kwargs.update(kwargs)
+                    # Mark this instance so the test can identify it later.
+                    self._is_fake_praw = True
+
+        env = self._env_without_reddit_or_mock()
+        env.update(
+            {
+                "REDDIT_CLIENT_ID": "fake_client_id",
+                "REDDIT_CLIENT_SECRET": "fake_client_secret",
+                "REDDIT_USER_AGENT": "fake-user-agent/1.0",
+            }
+        )
+        with patch.dict(os.environ, env, clear=True):
+            with patch.object(reddit_fetcher, "praw", FakePraw):
+                diver = RedditDeepDiver(
+                    "credentialed query", subreddits=["politics"]
+                )
+
+        # The constructor should have built a PRAW client (not None).
+        self.assertIsNotNone(diver.reddit)
+        self.assertTrue(getattr(diver.reddit, "_is_fake_praw", False))
+
+        # PRAW received the env-derived configuration.
+        self.assertEqual(captured_kwargs.get("client_id"), "fake_client_id")
+        self.assertEqual(
+            captured_kwargs.get("client_secret"), "fake_client_secret"
+        )
+        self.assertEqual(
+            captured_kwargs.get("user_agent"), "fake-user-agent/1.0"
+        )
 
 
 if __name__ == "__main__":

@@ -34,9 +34,15 @@ class SynthesisReport(BaseModel):
         max_length=3,
         description="Top 3 distinct reasons the market's current odds could be mispriced",
     )
-    verdict: Literal["no edge", "possible edge", "strong research edge"] = Field(
+    verdict: Literal["stale", "efficient", "overreactive", "unclear"] = Field(
         ...,
-        description="Final trading verdict. Must be 'no edge' if evidence is mixed or weak.",
+        description=(
+            "Market-efficiency classification. Pick exactly one of: "
+            "'stale' (market price has not updated against recent material news), "
+            "'efficient' (market price reflects available evidence well), "
+            "'overreactive' (market has moved farther than the evidence supports), "
+            "'unclear' (insufficient signal to classify)."
+        ),
     )
     explanation: str = Field(
         ...,

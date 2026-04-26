@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Iterable, List, Optional, Sequence, Set
 
@@ -8,10 +9,48 @@ try:
 except ImportError:  # pragma: no cover - exercised through injected fake clients in tests
     praw = None
 
+from research_mock import build_mock_reddit_context, is_research_mock_enabled
+
+
+LOGGER = logging.getLogger(__name__)
 
 DEFAULT_SUBREDDIT = "all"
 DEFAULT_THREAD_LIMIT = 5
 DEFAULT_COMMENT_LIMIT = 15
+
+# Module-level flag so the "missing credentials -> mock" notice only fires once
+# per process rather than once per RedditDeepDiver instantiation.
+_MISSING_CREDENTIALS_LOG_EMITTED = False
+
+
+def _reddit_credentials_present() -> bool:
+    """Return True iff the minimum PRAW credential is set in the environment."""
+
+    return bool((os.getenv("REDDIT_CLIENT_ID") or "").strip())
+
+
+def _emit_missing_credentials_log_once() -> None:
+    """Log a one-time INFO message when PRAW credentials are absent.
+
+    Pointers the operator at the interactive Devvit MCP skill so they
+    understand the degradation path and what to do for live data.
+    """
+
+    global _MISSING_CREDENTIALS_LOG_EMITTED
+    if _MISSING_CREDENTIALS_LOG_EMITTED:
+        return
+    LOGGER.info(
+        "REDDIT_CLIENT_ID not set - Reddit fetcher returning deterministic mock data. "
+        "For interactive Reddit research, use the /reddit-research skill (Devvit MCP)."
+    )
+    _MISSING_CREDENTIALS_LOG_EMITTED = True
+
+
+def _reset_missing_credentials_log_state() -> None:
+    """Reset the once-per-process log flag. Intended for test isolation."""
+
+    global _MISSING_CREDENTIALS_LOG_EMITTED
+    _MISSING_CREDENTIALS_LOG_EMITTED = False
 
 
 def _normalize_text(value: str, *, max_chars: int) -> str:
@@ -50,12 +89,38 @@ class RedditDeepDiver:
         self.subreddits = normalized_subreddits
         self.thread_limit = max(1, int(thread_limit))
         self.comment_limit = max(1, int(comment_limit))
-        self.reddit = reddit_client if reddit_client is not None else self._build_reddit_client()
+        if reddit_client is not None:
+            self.reddit = reddit_client
+        elif is_research_mock_enabled():
+            # Skip building a PRAW client in mock mode so we never require
+            # REDDIT_CLIENT_ID and never import-side-effect a real session.
+            self.reddit = None
+        elif not _reddit_credentials_present():
+            # Graceful degradation: with no PRAW credentials AND no explicit
+            # RESEARCH_MOCK toggle, fall back to deterministic mock data and
+            # surface a one-time INFO log pointing at the /reddit-research
+            # skill (Devvit MCP) for interactive use.
+            _emit_missing_credentials_log_once()
+            self.reddit = None
+        else:
+            self.reddit = self._build_reddit_client()
 
     def fetch_threads(self) -> str:
         return self.fetch_discussion_context()
 
     def fetch_discussion_context(self) -> str:
+        if is_research_mock_enabled():
+            return build_mock_reddit_context(
+                self.search_query, subreddits=self.subreddits
+            )
+        if self.reddit is None:
+            # Constructor decided to degrade to mock data (e.g. PRAW credentials
+            # were absent). Use the same deterministic mock context the
+            # RESEARCH_MOCK path emits so downstream agents see a uniform shape.
+            _emit_missing_credentials_log_once()
+            return build_mock_reddit_context(
+                self.search_query, subreddits=self.subreddits
+            )
         submissions = list(self._search_submissions())
         lines = [
             "REDDIT DISCUSSION CONTEXT",

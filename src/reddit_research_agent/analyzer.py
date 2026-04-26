@@ -15,7 +15,26 @@ from reddit_research_agent.models import RedditResearchReport
 DEFAULT_MODEL_NAME = "gemini-2.5-pro"
 DEFAULT_TIMEOUT_S = 30
 SYSTEM_PROMPT_TEMPLATE = (
-    "You are a Reddit research agent for event-driven markets. Your job is to find informed discussion, identify expert-level comments, and distinguish substantive reasoning from crowd speculation regarding the market: {market_title}. Current market implied probability is {implied_probability_pct}%. Evaluate depth of reasoning, references to data, disagreement quality, view updating, and sentiment balance. Prefer thoughtful contrarian comments over popular shallow comments."
+    "You are a Reddit research agent for event-driven markets. Your job is to find informed "
+    "discussion, identify expert-level comments, and distinguish substantive reasoning from "
+    "crowd speculation regarding the market: {market_title}. "
+    "Current market implied probability is {implied_probability_pct}%. "
+    "Evaluate depth of reasoning, references to data, disagreement quality, view updating, "
+    "and sentiment balance. Prefer thoughtful contrarian comments over popular shallow comments.\n\n"
+    "Return ONLY a JSON object that matches the required RedditResearchReport schema with "
+    "ALL of the following fields populated:\n"
+    "- bullish_thesis: non-empty string explaining the strongest case the YES side resolves.\n"
+    "- bearish_thesis: non-empty string explaining the strongest case the NO side resolves.\n"
+    "- key_evidence: list of distinct, non-empty pieces of evidence cited in the discussion.\n"
+    "- key_assumptions: list of non-empty assumptions the bullish/bearish theses depend on.\n"
+    "- conviction_score: int 0-10 conveying how strongly the discussion converges on a view.\n"
+    "- evidence_quality_score: int 0-100; higher = stronger primary sources.\n"
+    "- misinformation_risk_score: int 0-100; higher = higher misinformation risk.\n"
+    "- sentiment_score: int -100..100; negative=bearish, positive=bullish, 0=neutral.\n"
+    "- key_sources: list of up to 10 URLs, subreddit names, or commenter handles cited.\n"
+    "- summary: non-empty narrative summary of the Reddit discussion landscape.\n"
+    "- pricing_assessment: one of 'underpriced', 'overpriced', 'fairly priced', 'unclear'.\n"
+    "- assessment_reasoning: non-empty rationale tying evidence to the pricing_assessment."
 )
 
 
@@ -129,7 +148,8 @@ class RedditAgent:
             raise ValueError("implied_prob must be between 0.0 and 1.0")
 
         prompt = (
-            "Analyze the following Reddit Discussion Context and return only a JSON object that matches the required schema.\n\n"
+            "Analyze the following Reddit Discussion Context and return only a JSON object that "
+            "matches the required RedditResearchReport schema with ALL fields populated.\n\n"
             f"Market title: {title}\n"
             f"Implied probability: {implied_probability:.6f}\n\n"
             "Reddit Discussion Context:\n"

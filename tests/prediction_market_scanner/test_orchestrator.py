@@ -22,6 +22,12 @@ class FakeNewsResearchReport(BaseModel):
     timeline: list[str]
     key_facts: list[str]
     source_quality_score: int
+    bullish_thesis: str
+    bearish_thesis: str
+    evidence_quality_score: int
+    misinformation_risk_score: int
+    sentiment_score: int
+    key_sources: list[str]
     summary: str
 
 
@@ -61,12 +67,16 @@ class FakeRedditAgent:
             }
         )
         return RedditResearchReport(
-            pro_argument="Primary-source upside case.",
-            anti_argument="Consensus may already price this in.",
+            bullish_thesis="Primary-source upside case.",
+            bearish_thesis="Consensus may already price this in.",
             key_evidence=["Reddit signal"],
             key_assumptions=["The signal is real"],
             conviction_score=7,
-            evidence_quality_score=8,
+            evidence_quality_score=80,
+            misinformation_risk_score=15,
+            sentiment_score=30,
+            key_sources=["u/sourcehound"],
+            summary="Reddit threads converge on a fresher primary-source signal.",
             pricing_assessment="underpriced",
             assessment_reasoning="The discussion contains fresher evidence than the market move.",
         )
@@ -88,6 +98,12 @@ class FakeNewsAgent:
             timeline=["2026-04-01: Headline"],
             key_facts=["Source-backed fact"],
             source_quality_score=8,
+            bullish_thesis="Headline supports the YES side resolving.",
+            bearish_thesis="Coverage is thin and could reverse on a single late headline.",
+            evidence_quality_score=70,
+            misinformation_risk_score=20,
+            sentiment_score=25,
+            key_sources=["https://example.com/a"],
             summary="Coverage is factual and recent.",
         )
 
@@ -355,12 +371,39 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
             "research_priority": 99,
         }
 
+        reddit_report = RedditResearchReport(
+            bullish_thesis="Bullish thesis.",
+            bearish_thesis="Bearish thesis.",
+            key_evidence=["Evidence"],
+            key_assumptions=["Assumption"],
+            conviction_score=7,
+            evidence_quality_score=82,
+            misinformation_risk_score=11,
+            sentiment_score=27,
+            key_sources=["u/sourcehound"],
+            summary="Bullish sentiment",
+            pricing_assessment="underpriced",
+            assessment_reasoning="Reasoning.",
+        )
+        news_report = FakeNewsResearchReport(
+            timeline=["2026-04-20: Headline"],
+            key_facts=["Fact"],
+            source_quality_score=8,
+            bullish_thesis="Up.",
+            bearish_thesis="Down.",
+            evidence_quality_score=64,
+            misinformation_risk_score=19,
+            sentiment_score=33,
+            key_sources=["https://example.com/a"],
+            summary="Supportive headlines",
+        )
+
         execution = run_final_risk_gate(
             calibration=calibration,
             market=market,
             scanner_row=scanner_row,
-            reddit_report={"summary": "Bullish sentiment"},
-            news_report={"summary": "Supportive headlines"},
+            reddit_report=reddit_report,
+            news_report=news_report,
             bankroll=10_000.0,
             risk_calculator=RiskCalculator(),
         )
@@ -372,7 +415,165 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("research", execution["event_payload"])
         self.assertIn("calibration", execution["event_payload"])
         self.assertIn("risk", execution["event_payload"])
+
+        # market_outcome is the XGBoost training label ("did the market
+        # resolve YES?"). It must start as None and only be filled in once
+        # the market settles, distinct from final_outcome (the side-aware
+        # "did the trade win?" answer).
+        self.assertIn("market_outcome", execution["event_payload"])
+        self.assertIsNone(execution["event_payload"]["market_outcome"])
+        self.assertIsNone(execution["event_payload"]["final_outcome"])
+
+        # features_window must be populated at decision time so that, once
+        # trades settle, the (features, outcome) pairs train the real XGBoost
+        # baseline. Asserts the slot stops being None.
+        features_window = execution["event_payload"]["features_window"]
+        self.assertIsInstance(features_window, dict)
+        for column in (
+            "implied_prob",
+            "spread",
+            "volume_24h",
+            "open_interest",
+            "days_to_resolution",
+            "price_change_1h",
+            "price_change_6h",
+            "price_change_24h",
+            "captured_at_utc",
+        ):
+            self.assertIn(column, features_window, msg=f"features_window missing column {column!r}")
+        self.assertEqual(features_window["implied_prob"], market.implied_prob)
+
+        # Research-signal features must also be merged into features_window so
+        # the calibration model can learn from sentiment / evidence / misinfo.
+        for column in (
+            "news_sentiment_score",
+            "news_evidence_quality_score",
+            "news_misinformation_risk_score",
+            "reddit_sentiment_score",
+            "reddit_evidence_quality_score",
+            "reddit_misinformation_risk_score",
+        ):
+            self.assertIn(
+                column,
+                features_window,
+                msg=f"features_window missing research column {column!r}",
+            )
+        self.assertEqual(features_window["news_sentiment_score"], 33.0)
+        self.assertEqual(features_window["news_evidence_quality_score"], 64.0)
+        self.assertEqual(features_window["news_misinformation_risk_score"], 19.0)
+        self.assertEqual(features_window["reddit_sentiment_score"], 27.0)
+        self.assertEqual(features_window["reddit_evidence_quality_score"], 82.0)
+        self.assertEqual(features_window["reddit_misinformation_risk_score"], 11.0)
+
+        # Canonical schema: orchestrator-written logs must self-identify via
+        # the ``source`` field so build_dataset.py can fork on provenance
+        # (orchestrator vs backfill vs shadow). ``notes`` stays None for the
+        # orchestrator path; only backfill populates it with caveats.
+        self.assertIn("source", execution["event_payload"])
+        self.assertEqual(execution["event_payload"]["source"], "orchestrator")
+        self.assertIn("notes", execution["event_payload"])
+        self.assertIsNone(execution["event_payload"]["notes"])
+
+        # PnL tracking: decision-time fields must be populated (entry_price /
+        # position_size_usd / max_loss_usd) so settlement can derive realized
+        # PnL. exit_price + realized_pnl_usd start as None and are filled by
+        # mark_trade_settled.py.
+        payload = execution["event_payload"]
+        for key in (
+            "entry_price",
+            "position_size_usd",
+            "exit_price",
+            "realized_pnl_usd",
+            "max_loss_usd",
+        ):
+            self.assertIn(key, payload, msg=f"event_payload missing PnL key {key!r}")
+        self.assertIsNone(payload["exit_price"])
+        self.assertIsNone(payload["realized_pnl_usd"])
+        self.assertGreater(payload["entry_price"], 0.0)
+        self.assertGreaterEqual(payload["position_size_usd"], 0.0)
+        self.assertGreaterEqual(payload["max_loss_usd"], 0.0)
         execution["log_path"].unlink(missing_ok=True)
+
+    async def test_analyze_top_markets_isolates_per_market_failures(self):
+        markets = self._markets()
+        reddit_agent = FakeRedditAgent()
+        news_agent = FakeNewsAgent()
+
+        class FailingForOneMarketCalibrationAgent(FakeCalibrationAgent):
+            def calibrate(self, market, news_report, xgboost_prob, reddit_report=None):
+                if market.market_id == "mkt-1":
+                    raise RuntimeError("synthetic calibration failure")
+                return super().calibrate(
+                    market,
+                    news_report,
+                    xgboost_prob,
+                    reddit_report=reddit_report,
+                )
+
+        calibration_agent = FailingForOneMarketCalibrationAgent()
+
+        def fake_fetch_markets_fn(**_):
+            return markets
+
+        def fake_build_scan_results_fn(*, fetch_markets_fn=None, **kwargs):
+            available_markets = list(
+                fetch_markets_fn(
+                    min_volume_24h=kwargs.get("min_volume_24h"),
+                    page_size=kwargs.get("page_size"),
+                    max_pages=kwargs.get("max_pages"),
+                )
+            )
+            return [
+                {
+                    "market_id": available_markets[1].market_id,
+                    "title": available_markets[1].title,
+                    "category": available_markets[1].category,
+                    "implied_prob": available_markets[1].implied_prob,
+                    "research_priority": 98,
+                },
+                {
+                    "market_id": available_markets[0].market_id,
+                    "title": available_markets[0].title,
+                    "category": available_markets[0].category,
+                    "implied_prob": available_markets[0].implied_prob,
+                    "research_priority": 91,
+                },
+            ]
+
+        with self.assertLogs("orchestrator", level="WARNING") as log_capture:
+            calibrations = await analyze_top_markets(
+                top_n=2,
+                build_scan_results_fn=fake_build_scan_results_fn,
+                fetch_markets_fn=fake_fetch_markets_fn,
+                reddit_diver_cls=FakeRedditDiver,
+                reddit_agent=reddit_agent,
+                news_aggregator_cls=FakeNewsAggregator,
+                news_agent=news_agent,
+                calibration_agent=calibration_agent,
+                xgboost_probability_fn=self._baseline_probability,
+                subreddits=["politics"],
+            )
+
+        # The healthy market still calibrates and is returned.
+        self.assertEqual(len(calibrations), 1)
+        self.assertEqual(calibrations[0].action, "paper-trade candidate")
+
+        # The failing market is captured in the new failed_markets attribute.
+        failed_markets = getattr(calibrations, "failed_markets", None)
+        self.assertIsNotNone(failed_markets)
+        self.assertEqual(len(failed_markets), 1)
+        self.assertEqual(failed_markets[0]["market_id"], "mkt-1")
+        self.assertIn("RuntimeError", failed_markets[0]["error"])
+        self.assertIn("synthetic calibration failure", failed_markets[0]["error"])
+
+        # The failure is logged at WARNING with the market id.
+        warning_records = [
+            record for record in log_capture.records if record.levelname == "WARNING"
+        ]
+        self.assertTrue(
+            any("mkt-1" in record.getMessage() for record in warning_records),
+            msg=f"expected mkt-1 in WARNING logs, got {[r.getMessage() for r in warning_records]}",
+        )
 
 
 if __name__ == "__main__":

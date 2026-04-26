@@ -65,13 +65,28 @@ def _coerce_probability(value: Any, *, field_name: str) -> float:
     return probability
 
 
+def _validate_invariants(report: CalibrationReport) -> CalibrationReport:
+    """Enforce the spec invariant: calibrated_true_prob >= xgboost_prob whenever
+    llm_adjustment_pct_points is non-negative. Negative adjustments are permitted
+    to drop the calibrated probability below the baseline.
+    """
+    if report.llm_adjustment_pct_points >= 0 and report.calibrated_true_prob < report.xgboost_prob:
+        raise ValueError(
+            "calibrated_true_prob ("
+            f"{report.calibrated_true_prob}) must be >= xgboost_prob ("
+            f"{report.xgboost_prob}) when llm_adjustment_pct_points ("
+            f"{report.llm_adjustment_pct_points}) is non-negative."
+        )
+    return report
+
+
 def _coerce_report(parsed: Any) -> CalibrationReport:
     if isinstance(parsed, CalibrationReport):
-        return parsed
+        return _validate_invariants(parsed)
     if isinstance(parsed, dict):
-        return CalibrationReport.model_validate(parsed)
+        return _validate_invariants(CalibrationReport.model_validate(parsed))
     if isinstance(parsed, str):
-        return CalibrationReport.model_validate_json(parsed)
+        return _validate_invariants(CalibrationReport.model_validate_json(parsed))
     raise TypeError(f"Unsupported parsed response type: {type(parsed)!r}")
 
 
@@ -150,6 +165,16 @@ def _default_news_report(market: Market) -> NewsResearchReport:
         timeline=[],
         key_facts=[],
         source_quality_score=0,
+        bullish_thesis=(
+            f"No news evidence was provided for {market.title}; treat any bullish case as weak."
+        ),
+        bearish_thesis=(
+            f"No news evidence was provided for {market.title}; status-quo / NO outcome remains the default."
+        ),
+        evidence_quality_score=0,
+        misinformation_risk_score=50,
+        sentiment_score=0,
+        key_sources=[],
         summary=(
             f"No news research report was provided for {market.title}. "
             "Treat qualitative evidence as weak unless the structured market metadata clearly justifies caution."

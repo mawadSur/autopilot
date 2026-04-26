@@ -7,9 +7,9 @@ import random
 import time
 from collections.abc import Iterable
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
 
@@ -295,6 +295,170 @@ def fetch_active_markets(
         if own_session:
             http.close()
     return markets
+
+
+def _resolved_market_outcome(market_payload: Dict[str, Any]) -> Optional[bool]:
+    """Determine the binary YES/NO resolution for a closed market.
+
+    Polymarket settles a binary market by setting ``outcomePrices`` to ``["1","0"]``
+    (Yes won) or ``["0","1"]`` (No won). Refunded / void / 50-50 splits land at
+    ``["0.5","0.5"]`` (or otherwise non-extreme values) and are returned as
+    ``None`` so callers can skip them. We also consult ``umaResolutionStatus``
+    (e.g. ``"resolved"``) only as a sanity check — the price array is the
+    authoritative outcome signal.
+    """
+
+    outcome_prices = _parse_outcome_prices(market_payload.get("outcomePrices"))
+    if len(outcome_prices) < 2:
+        return None
+
+    yes_price, no_price = outcome_prices[0], outcome_prices[1]
+    if yes_price >= 0.99 and no_price <= 0.01:
+        return True
+    if no_price >= 0.99 and yes_price <= 0.01:
+        return False
+    return None
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if not value or not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _historical_max_volume(market_payload: Dict[str, Any]) -> float:
+    """Best-effort historical volume signal for a closed market.
+
+    24h volume on a closed market is degraded (often near zero), so we prefer
+    cumulative or weekly fields when available, falling back to ``volume24hr``.
+    """
+
+    for key in ("volumeNum", "volume", "volume1wk", "volume1mo", "volumeClob"):
+        value = _coerce_optional_float(market_payload.get(key))
+        if value is not None and value > 0.0:
+            return value
+    return _coerce_float(market_payload.get("volume24hr"))
+
+
+def fetch_resolved_markets(
+    *,
+    min_volume_24h: float = DEFAULT_MIN_VOLUME_24H,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    session: Optional[requests.Session] = None,
+    max_pages: Optional[int] = None,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    days_back: Optional[int] = None,
+) -> List[Tuple[Market, bool]]:
+    """Page resolved Polymarket markets and return ``(market, market_outcome)`` pairs.
+
+    Mirrors :func:`fetch_active_markets` but queries the closed-market slice
+    (``active=false&closed=true``, ordered by ``endDate`` descending) and pairs
+    each market with its boolean resolution. Markets whose resolution is
+    ambiguous (refunded / void / 50-50) are skipped and counted in the
+    ``orchestrator``-style INFO log so operators can see how much of the page
+    we lost.
+
+    The ``min_volume_24h`` filter is applied against the best historical
+    volume signal we can find on the payload (cumulative / weekly / 24h, in
+    that order) since closed markets typically report near-zero ``volume24hr``.
+    """
+
+    own_session = session is None
+    http = session or requests.Session()
+    if "Accept" not in http.headers:
+        http.headers["Accept"] = "application/json"
+    if "User-Agent" not in http.headers:
+        http.headers["User-Agent"] = DEFAULT_USER_AGENT
+
+    cutoff_dt: Optional[datetime] = None
+    if days_back is not None and days_back > 0:
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=int(days_back))
+
+    results: List[Tuple[Market, bool]] = []
+    seen_market_ids = set()
+    skipped_ambiguous = 0
+    offset = 0
+    page_count = 0
+    try:
+        while True:
+            payload = _request_json(
+                http,
+                f"{GAMMA_API_BASE_URL}/markets",
+                params={
+                    "active": "false",
+                    "closed": "true",
+                    "limit": page_size,
+                    "offset": offset,
+                    "order": "endDate",
+                    "ascending": "false",
+                },
+                timeout=timeout,
+            )
+            if not payload:
+                break
+            for market_payload in payload:
+                if not market_payload.get("closed", False):
+                    continue
+                market_id = str(market_payload.get("id", "")).strip()
+                if not market_id or market_id in seen_market_ids:
+                    continue
+
+                historical_volume = _historical_max_volume(market_payload)
+                if historical_volume < min_volume_24h:
+                    continue
+
+                event_payload: Dict[str, Any] = {}
+                raw_events = market_payload.get("events") or []
+                if isinstance(raw_events, list) and raw_events:
+                    first_event = raw_events[0]
+                    if isinstance(first_event, dict):
+                        event_payload = first_event
+
+                if cutoff_dt is not None:
+                    end_dt = _parse_iso_datetime(
+                        market_payload.get("endDate")
+                        or market_payload.get("endDateIso")
+                        or event_payload.get("endDate")
+                        or event_payload.get("endDateIso")
+                    )
+                    if end_dt is not None and end_dt < cutoff_dt:
+                        continue
+
+                outcome = _resolved_market_outcome(market_payload)
+                if outcome is None:
+                    skipped_ambiguous += 1
+                    continue
+
+                market = _market_from_gamma_payload(market_payload, event_payload)
+                seen_market_ids.add(market_id)
+                results.append((market, outcome))
+            page_count += 1
+            if max_pages is not None and page_count >= max_pages:
+                break
+            if len(payload) < page_size:
+                break
+            offset += page_size
+    finally:
+        if own_session:
+            http.close()
+
+    if skipped_ambiguous:
+        LOGGER.info(
+            "fetch_resolved_markets skipped %d market(s) with ambiguous resolution outcomes.",
+            skipped_ambiguous,
+        )
+    return results
 
 
 def main() -> None:

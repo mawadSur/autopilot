@@ -96,8 +96,8 @@ class SynthesisAgentTests(unittest.TestCase):
                 "Recent news shifted the timeline faster than price responded.",
                 "The crowd found a niche but credible source.",
             ],
-            verdict="possible edge",
-            explanation="There may be a small informational edge, but the case is not overwhelming.",
+            verdict="stale",
+            explanation="The market has not yet absorbed the latest narrative.",
         )
         client = FakeClient(FakeResponse(parsed=response_payload))
         agent = SynthesisAgent("test-key", client=client, types_module=FakeTypesModule())
@@ -108,7 +108,7 @@ class SynthesisAgentTests(unittest.TestCase):
             self._news_context(),
         )
 
-        self.assertEqual(report.verdict, "possible edge")
+        self.assertEqual(report.verdict, "stale")
         self.assertEqual(len(client.models.calls), 1)
         call = client.models.calls[0]
         self.assertEqual(call["model"], "gemini-2.5-pro")
@@ -134,6 +134,12 @@ class SynthesisAgentTests(unittest.TestCase):
 
         self.assertEqual(fake_genai.calls, ["test-key"])
         self.assertIsNotNone(agent.client)
+
+    def test_system_prompt_describes_all_four_verdict_categories(self):
+        for value in ("stale", "efficient", "overreactive", "unclear"):
+            self.assertIn(value, SYSTEM_PROMPT)
+        for legacy_value in ("no edge", "possible edge", "strong research edge"):
+            self.assertNotIn(legacy_value, SYSTEM_PROMPT)
 
     def test_invalid_inputs_raise(self):
         agent = SynthesisAgent("test-key", client=FakeClient(FakeResponse(parsed={})), types_module=FakeTypesModule())

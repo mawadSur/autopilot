@@ -19,7 +19,11 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(1, str(SRC_DIR))
 
 from calibration_agent.analyzer import CalibrationAgent
-from calibration_agent.ml_service import get_xgboost_probability
+from calibration_agent.ml_service import (
+    extract_market_features,
+    extract_research_features,
+    get_xgboost_probability,
+)
 from calibration_agent.models import CalibrationReport
 from fetcher import DEFAULT_MIN_VOLUME_24H, DEFAULT_PAGE_SIZE, fetch_active_markets
 from main import build_scan_results
@@ -47,6 +51,21 @@ _NEWS_IMPORT_CANDIDATES = (
     ("news_agent.fetcher", "NewsAggregator", "news_agent.analyzer", "NewsAgent"),
 )
 _DEFAULT_BANKROLL = 10_000.0
+
+
+class _CalibrationResults(List[CalibrationReport]):
+    """List of completed calibrations augmented with a per-market failure log.
+
+    Subclassing ``list`` keeps callers that iterate / index / ``len()`` the
+    return value of :func:`analyze_top_markets` working unchanged, while
+    surfacing the new ``failed_markets`` attribute for callers that want it.
+    """
+
+    failed_markets: List[Dict[str, str]] = []
+
+    def __init__(self, iterable: Sequence[CalibrationReport] = ()) -> None:
+        super().__init__(iterable)
+        self.failed_markets = []
 
 
 def _extract_title_category(source: Market | Dict[str, Any]) -> tuple[str, str]:
@@ -390,6 +409,23 @@ def run_final_risk_gate(
         risk_metrics=risk_metrics,
     )
 
+    # Always-long-YES convention: pay the ask if scanner_row exposes one,
+    # otherwise fall back to the mid-price (the market's implied probability).
+    scanner_ask = None
+    if isinstance(scanner_row, dict):
+        scanner_ask = scanner_row.get("ask_price")
+    try:
+        entry_price = float(scanner_ask) if scanner_ask is not None else float(market.implied_prob)
+    except (TypeError, ValueError):
+        entry_price = float(market.implied_prob)
+
+    position_size_usd = float(bankroll) * float(risk_assessment.simulated_position_size_pct) / 100.0
+    max_loss_raw = getattr(risk_assessment, "max_loss_if_wrong", None)
+    try:
+        max_loss_usd = float(max_loss_raw) if max_loss_raw is not None else 0.0
+    except (TypeError, ValueError):
+        max_loss_usd = 0.0
+
     event_payload = {
         "event_id": market.market_id,
         "trade_id": market.market_id,
@@ -397,9 +433,14 @@ def run_final_risk_gate(
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "settled_at": None,
         "final_outcome": None,
+        "market_outcome": None,
         "post_settlement_news": None,
         "scanner": scanner_row,
-        "features_window": None,
+        "features_window": {
+            **extract_market_features(market),
+            **extract_research_features(news_report, reddit_report),
+        },
+        "model_meta": None,
         "research": {
             "reddit_query": build_reddit_search_query(market),
             "news_query": build_news_search_query(market),
@@ -411,6 +452,13 @@ def run_final_risk_gate(
             "risk_metrics": risk_metrics,
             "risk_assessment": risk_assessment,
         },
+        "entry_price": entry_price,
+        "position_size_usd": position_size_usd,
+        "exit_price": None,
+        "realized_pnl_usd": None,
+        "max_loss_usd": max_loss_usd,
+        "source": "orchestrator",
+        "notes": None,
     }
     log_path = _write_trade_execution_log(event_payload=event_payload, market_id=market.market_id)
 
@@ -521,7 +569,7 @@ async def analyze_top_markets(
     logger = logger or LOGGER
     top_limit = max(0, int(top_n))
     if top_limit == 0:
-        return []
+        return _CalibrationResults()
 
     resolved_news_aggregator_cls, resolved_news_agent = _resolve_news_dependencies(
         news_aggregator_cls=news_aggregator_cls,
@@ -549,7 +597,7 @@ async def analyze_top_markets(
         )
     )[:top_limit]
     if not scan_rows:
-        return []
+        return _CalibrationResults()
 
     if not captured_markets:
         for market in fetch_markets_fn(
@@ -588,12 +636,27 @@ async def analyze_top_markets(
     task_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     completed: List[CalibrationReport] = []
+    failed_markets: List[Dict[str, str]] = []
     for (_, market), result in zip(selected_markets, task_results):
         if isinstance(result, Exception):
-            logger.warning("Multi-agent analysis failed for %s: %s", market.title, result)
+            market_id = getattr(market, "market_id", "") or ""
+            logger.warning(
+                "Market analysis failed for %s: %s",
+                market_id,
+                result,
+                exc_info=(type(result), result, result.__traceback__),
+            )
+            failed_markets.append(
+                {
+                    "market_id": str(market_id),
+                    "error": f"{type(result).__name__}: {result}",
+                }
+            )
             continue
         completed.append(result["calibration"])
-    return completed
+    results = _CalibrationResults(completed)
+    results.failed_markets = failed_markets
+    return results
 
 
 def _format_probability(probability: float) -> str:

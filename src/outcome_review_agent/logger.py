@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,9 @@ class PerformanceTracker:
         audit_file: str | Path | None = None,
         trade_file_glob: str = "trade_execution_*.json",
         additional_review_agents: Optional[Mapping[str, Any]] = None,
+        conditional_review_agents: Optional[
+            Mapping[str, Tuple[Callable[[Dict[str, Any], Dict[str, Any]], bool], Any]]
+        ] = None,
     ) -> None:
         self.trade_store_dir = Path(trade_store_dir)
         self.outcome_review_agent = outcome_review_agent
@@ -43,6 +46,11 @@ class PerformanceTracker:
         # Each entry runs alongside the primary outcome review and lands in the audit
         # entry under "<name>_review" (e.g. "data_quality" → "data_quality_review").
         self.additional_review_agents: Dict[str, Any] = dict(additional_review_agents or {})
+        # Predicate-gated agents: only invoked when predicate(trade_payload, outcome_review)
+        # is True. Output omitted from the audit entry when the predicate returns False.
+        self.conditional_review_agents: Dict[
+            str, Tuple[Callable[[Dict[str, Any], Dict[str, Any]], bool], Any]
+        ] = dict(conditional_review_agents or {})
 
     def process_settled_trades(self) -> Dict[str, Any]:
         """Review any new settled trades and update the performance audit."""
@@ -67,6 +75,10 @@ class PerformanceTracker:
                 "final_outcome": trade.payload.get("final_outcome"),
             }
             for agent_name, agent in self.additional_review_agents.items():
+                audit_entry[f"{agent_name}_review"] = self._call_review_agent(agent, trade.payload)
+            for agent_name, (predicate, agent) in self.conditional_review_agents.items():
+                if not predicate(trade.payload, outcome_review):
+                    continue
                 audit_entry[f"{agent_name}_review"] = self._call_review_agent(agent, trade.payload)
             new_reviews.append(audit_entry)
             reviewed_keys.add(trade_key)

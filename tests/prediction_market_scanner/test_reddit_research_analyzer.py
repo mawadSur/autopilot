@@ -1,6 +1,10 @@
 import unittest
 
-from reddit_research_agent.analyzer import RedditAgent, _build_system_prompt
+from reddit_research_agent.analyzer import (
+    RedditAgent,
+    SYSTEM_PROMPT_TEMPLATE,
+    _build_system_prompt,
+)
 from reddit_research_agent.models import RedditResearchReport
 
 
@@ -55,12 +59,16 @@ class FakeTypesModule:
 class RedditAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_analyze_discussion_returns_reddit_research_report(self):
         response_payload = RedditResearchReport(
-            pro_argument="Primary-source reporting indicates the catalyst is more likely than the market implies.",
-            anti_argument="The thread still relies on one timing assumption that could break late.",
+            bullish_thesis="Primary-source reporting indicates the catalyst is more likely than the market implies.",
+            bearish_thesis="The thread still relies on one timing assumption that could break late.",
             key_evidence=["Regulatory filing timestamp", "Direct link to executive statement"],
             key_assumptions=["No contradictory filing appears", "The reported date is authentic"],
             conviction_score=7,
-            evidence_quality_score=8,
+            evidence_quality_score=82,
+            misinformation_risk_score=12,
+            sentiment_score=44,
+            key_sources=["https://reddit.com/r/LocalLLaMA/post/abc", "u/sourcehound"],
+            summary="Threads converge on a fresher primary-source signal that the market hasn't fully priced.",
             pricing_assessment="underpriced",
             assessment_reasoning="Reddit surfaced fresher primary-source evidence than the current market price appears to reflect.",
         )
@@ -75,7 +83,13 @@ class RedditAgentTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(report.pricing_assessment, "underpriced")
-        self.assertEqual(report.evidence_quality_score, 8)
+        self.assertEqual(report.evidence_quality_score, 82)
+        self.assertEqual(report.misinformation_risk_score, 12)
+        self.assertEqual(report.sentiment_score, 44)
+        self.assertEqual(report.bullish_thesis.startswith("Primary-source"), True)
+        self.assertEqual(report.bearish_thesis.startswith("The thread"), True)
+        self.assertIn("u/sourcehound", report.key_sources)
+        self.assertTrue(report.summary)
         self.assertEqual(len(client.models.calls), 1)
 
         call = client.models.calls[0]
@@ -89,6 +103,18 @@ class RedditAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(call["config"].kwargs["response_schema"], RedditResearchReport)
         self.assertEqual(call["config"].kwargs["temperature"], 0.2)
         self.assertEqual(call["config"].kwargs["http_options"].kwargs["timeout"], 30)
+
+    def test_system_prompt_template_documents_spec_fields(self):
+        for field in (
+            "bullish_thesis",
+            "bearish_thesis",
+            "evidence_quality_score",
+            "misinformation_risk_score",
+            "sentiment_score",
+            "key_sources",
+            "summary",
+        ):
+            self.assertIn(field, SYSTEM_PROMPT_TEMPLATE)
 
     async def test_analyze_discussion_validates_inputs(self):
         agent = RedditAgent(api_key="test-key", client=FakeClient(FakeResponse(parsed={})), types_module=FakeTypesModule())
