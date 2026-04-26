@@ -1,0 +1,324 @@
+"""Unit tests for the Redis-backed :class:`PositionStore`.
+
+Every test uses ``fakeredis.FakeRedis()`` as the underlying client — none of
+these tests require a live Redis instance.
+"""
+
+from __future__ import annotations
+
+import unittest
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import fakeredis
+from pydantic import ValidationError
+
+from state.position_store import (
+    PENDING_ORPHAN_AGE,
+    Position,
+    PositionStore,
+)
+
+
+def _new_position(
+    *,
+    side: str = "long",
+    status: str = "open",
+    entry_price: float = 100.0,
+    base_size: float = 1.0,
+    symbol: str = "ETH/USDT",
+    exchange: str = "coinbase",
+    opened_at_utc: str | None = None,
+    entry_order_id: str | None = "order-abc",
+    fees_usd: float = 0.0,
+) -> Position:
+    return Position(
+        position_id=str(uuid.uuid4()),
+        exchange=exchange,
+        symbol=symbol,
+        side=side,  # type: ignore[arg-type]
+        status=status,  # type: ignore[arg-type]
+        entry_price=entry_price,
+        entry_quote_usd=entry_price * base_size,
+        base_size=base_size,
+        opened_at_utc=opened_at_utc
+        or datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        entry_order_id=entry_order_id,
+        fees_usd=fees_usd,
+    )
+
+
+class _StubExchange:
+    """Stub ``exchange`` for :meth:`PositionStore.reconcile` tests.
+
+    Tests construct one with the order ids they want to be "still open" on the
+    exchange. Every call to ``get_open_orders`` returns those as dicts.
+    """
+
+    def __init__(self, open_order_ids: list[str] | None = None) -> None:
+        self._ids = list(open_order_ids or [])
+        self.calls: list[dict] = []
+
+    def get_open_orders(self, symbol: str | None = None) -> list[dict]:
+        self.calls.append({"symbol": symbol})
+        return [{"order_id": oid} for oid in self._ids]
+
+
+class PositionSchemaTests(unittest.TestCase):
+    def test_position_minimal_construction(self) -> None:
+        position = _new_position()
+        self.assertEqual(position.side, "long")
+        self.assertEqual(position.status, "open")
+        self.assertEqual(position.fees_usd, 0.0)
+        self.assertIsNone(position.exit_price)
+        self.assertEqual(position.model_meta, {})
+
+    def test_position_rejects_unknown_field(self) -> None:
+        with self.assertRaises(ValidationError):
+            Position(
+                position_id="x",
+                exchange="coinbase",
+                symbol="ETH/USDT",
+                side="long",
+                status="open",
+                entry_price=1.0,
+                entry_quote_usd=1.0,
+                base_size=1.0,
+                opened_at_utc=datetime.now(timezone.utc).isoformat(),
+                bogus_extra="nope",
+            )
+
+    def test_position_rejects_invalid_side(self) -> None:
+        with self.assertRaises(ValidationError):
+            Position(
+                position_id="x",
+                exchange="coinbase",
+                symbol="ETH/USDT",
+                side="sideways",  # type: ignore[arg-type]
+                status="open",
+                entry_price=1.0,
+                entry_quote_usd=1.0,
+                base_size=1.0,
+                opened_at_utc=datetime.now(timezone.utc).isoformat(),
+            )
+
+
+class PositionStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fake = fakeredis.FakeRedis(decode_responses=True)
+        self.store = PositionStore(redis_client=self.fake, namespace="test")
+
+    # --- writes -------------------------------------------------------
+    def test_record_open_persists_position_and_open_set(self) -> None:
+        pos = _new_position()
+        recorded = self.store.record_open(pos)
+
+        self.assertEqual(recorded.status, "open")
+        # Position blob exists.
+        self.assertIsNotNone(self.fake.get(f"test:positions:{pos.position_id}"))
+        # ID is in the open_set.
+        self.assertIn(pos.position_id, self.fake.smembers("test:open_set"))
+
+    def test_get_returns_none_for_unknown_id(self) -> None:
+        self.assertIsNone(self.store.get("nope"))
+
+    def test_list_open_returns_only_open_or_pending(self) -> None:
+        live = self.store.record_open(_new_position(symbol="ETH/USDT"))
+        pending = self.store.record_pending(_new_position(symbol="BTC/USDT"))
+        # Manually inject a "closed" position into the open_set to simulate
+        # a stale entry — list_open must filter it out.
+        stale_closed = _new_position(symbol="SOL/USDT")
+        stale_closed = stale_closed.model_copy(update={"status": "closed"})
+        self.fake.set(
+            f"test:positions:{stale_closed.position_id}",
+            stale_closed.model_dump_json(),
+        )
+        self.fake.sadd("test:open_set", stale_closed.position_id)
+
+        ids = {p.position_id for p in self.store.list_open()}
+        self.assertEqual(ids, {live.position_id, pending.position_id})
+
+    def test_record_close_moves_to_closed_today(self) -> None:
+        pos = self.store.record_open(_new_position(entry_price=100.0, base_size=1.0))
+        closed = self.store.record_close(
+            pos.position_id, exit_price=110.0, exit_quote_usd=110.0
+        )
+
+        self.assertEqual(closed.status, "closed")
+        self.assertNotIn(pos.position_id, self.fake.smembers("test:open_set"))
+        # Closed-today set contains it (UTC date).
+        date_key = (
+            "test:closed:" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        )
+        self.assertIn(pos.position_id, self.fake.smembers(date_key))
+
+    def test_record_close_computes_long_pnl(self) -> None:
+        pos = self.store.record_open(_new_position(entry_price=100.0, base_size=2.0))
+        closed = self.store.record_close(
+            pos.position_id, exit_price=110.0, exit_quote_usd=220.0
+        )
+        # 2 * (110 - 100) - 0 = 20
+        self.assertAlmostEqual(closed.realized_pnl_usd or 0.0, 20.0)
+
+    def test_record_close_computes_short_pnl(self) -> None:
+        pos = self.store.record_open(
+            _new_position(side="short", entry_price=100.0, base_size=2.0)
+        )
+        closed = self.store.record_close(
+            pos.position_id, exit_price=90.0, exit_quote_usd=180.0
+        )
+        # 2 * (100 - 90) - 0 = 20
+        self.assertAlmostEqual(closed.realized_pnl_usd or 0.0, 20.0)
+
+    def test_record_close_subtracts_fees(self) -> None:
+        # Entry-side fees applied first via mark_filled-style flow.
+        pos = self.store.record_open(
+            _new_position(entry_price=100.0, base_size=1.0, fees_usd=0.5)
+        )
+        closed = self.store.record_close(
+            pos.position_id, exit_price=110.0, exit_quote_usd=110.0, fees_usd=0.7
+        )
+        # gross 10 - (0.5 + 0.7) = 8.8
+        self.assertAlmostEqual(closed.realized_pnl_usd or 0.0, 8.8)
+        self.assertAlmostEqual(closed.fees_usd, 1.2)
+
+    # --- aggregations -------------------------------------------------
+    def test_open_notional_usd_sums_open_positions(self) -> None:
+        self.store.record_open(_new_position(entry_price=100.0, base_size=1.0))
+        self.store.record_open(_new_position(entry_price=200.0, base_size=2.0))
+        # Total = 100 + 400 = 500
+        self.assertAlmostEqual(self.store.open_notional_usd(), 500.0)
+
+    def test_open_notional_for_symbol_filters(self) -> None:
+        self.store.record_open(
+            _new_position(symbol="ETH/USDT", entry_price=100.0, base_size=1.0)
+        )
+        self.store.record_open(
+            _new_position(symbol="BTC/USDT", entry_price=200.0, base_size=2.0)
+        )
+        self.assertAlmostEqual(
+            self.store.open_notional_for_symbol("ETH/USDT"), 100.0
+        )
+        self.assertAlmostEqual(
+            self.store.open_notional_for_symbol("BTC/USDT"), 400.0
+        )
+        self.assertAlmostEqual(
+            self.store.open_notional_for_symbol("DOGE/USDT"), 0.0
+        )
+
+    def test_daily_realized_pnl_usd_sums_closed_today(self) -> None:
+        a = self.store.record_open(_new_position(entry_price=100.0, base_size=1.0))
+        b = self.store.record_open(_new_position(entry_price=100.0, base_size=2.0))
+        self.store.record_close(a.position_id, exit_price=110.0, exit_quote_usd=110.0)
+        self.store.record_close(b.position_id, exit_price=95.0, exit_quote_usd=190.0)
+        # 10 + (-10) = 0
+        self.assertAlmostEqual(self.store.daily_realized_pnl_usd(), 0.0)
+
+    def test_daily_realized_pnl_usd_excludes_yesterday(self) -> None:
+        pos = self.store.record_open(_new_position(entry_price=100.0, base_size=1.0))
+        closed = self.store.record_close(
+            pos.position_id, exit_price=110.0, exit_quote_usd=110.0
+        )
+        # Patch the position blob's closed_at_utc to yesterday and migrate the
+        # set membership to yesterday's bucket — simulates a position that
+        # closed across midnight.
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        moved = closed.model_copy(update={"closed_at_utc": yesterday.isoformat()})
+        self.fake.set(
+            f"test:positions:{closed.position_id}", moved.model_dump_json()
+        )
+        today_key = (
+            "test:closed:" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        )
+        yesterday_key = "test:closed:" + yesterday.strftime("%Y-%m-%d")
+        self.fake.srem(today_key, closed.position_id)
+        self.fake.sadd(yesterday_key, closed.position_id)
+
+        self.assertAlmostEqual(self.store.daily_realized_pnl_usd(), 0.0)
+
+    # --- reconcile ----------------------------------------------------
+    def test_reconcile_drops_orphan_pending_after_1_hour(self) -> None:
+        old_open = (
+            datetime.now(timezone.utc) - PENDING_ORPHAN_AGE - timedelta(minutes=5)
+        ).replace(microsecond=0)
+        pos = self.store.record_pending(
+            _new_position(
+                opened_at_utc=old_open.isoformat(),
+                entry_order_id="ghost-order",
+            )
+        )
+        exchange = _StubExchange(open_order_ids=[])  # exchange knows nothing
+
+        result = self.store.reconcile(exchange)
+
+        self.assertEqual(result["dropped"], 1)
+        self.assertEqual(result["warnings"], [])
+        # Removed from open_set.
+        self.assertNotIn(pos.position_id, self.fake.smembers("test:open_set"))
+        # Marked closed with the reconciled-orphan note.
+        rehydrated = self.store.get(pos.position_id)
+        assert rehydrated is not None
+        self.assertEqual(rehydrated.status, "closed")
+        self.assertEqual(rehydrated.notes, "reconciled-orphan")
+        self.assertEqual(rehydrated.realized_pnl_usd, 0.0)
+
+    def test_reconcile_keeps_pending_under_1_hour(self) -> None:
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=30)).replace(
+            microsecond=0
+        )
+        pos = self.store.record_pending(
+            _new_position(
+                opened_at_utc=recent.isoformat(),
+                entry_order_id="not-yet-orphaned",
+            )
+        )
+        exchange = _StubExchange(open_order_ids=[])
+
+        result = self.store.reconcile(exchange)
+
+        self.assertEqual(result["dropped"], 0)
+        self.assertEqual(result["reconciled"], 1)
+        # Still pending and still in the open_set.
+        self.assertIn(pos.position_id, self.fake.smembers("test:open_set"))
+        rehydrated = self.store.get(pos.position_id)
+        assert rehydrated is not None
+        self.assertEqual(rehydrated.status, "pending")
+
+    def test_reconcile_keeps_pending_when_exchange_confirms_order(self) -> None:
+        # Even with an "ancient" opened_at, an exchange-confirmed order is not
+        # an orphan.
+        ancient = (
+            datetime.now(timezone.utc) - PENDING_ORPHAN_AGE - timedelta(hours=12)
+        ).replace(microsecond=0)
+        pos = self.store.record_pending(
+            _new_position(
+                opened_at_utc=ancient.isoformat(),
+                entry_order_id="exchange-knows-this",
+            )
+        )
+        exchange = _StubExchange(open_order_ids=["exchange-knows-this"])
+
+        result = self.store.reconcile(exchange)
+
+        self.assertEqual(result["dropped"], 0)
+        self.assertEqual(result["reconciled"], 1)
+        self.assertIn(pos.position_id, self.fake.smembers("test:open_set"))
+        rehydrated = self.store.get(pos.position_id)
+        assert rehydrated is not None
+        self.assertEqual(rehydrated.status, "pending")
+
+    # --- admin --------------------------------------------------------
+    def test_clear_namespace_deletes_all_keys(self) -> None:
+        self.store.record_open(_new_position())
+        self.store.record_open(_new_position())
+        self.store.record_pending(_new_position())
+        self.assertGreater(len(list(self.fake.scan_iter(match="test:*"))), 0)
+
+        deleted = self.store.clear_namespace()
+
+        self.assertGreater(deleted, 0)
+        self.assertEqual(list(self.fake.scan_iter(match="test:*")), [])
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

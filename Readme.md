@@ -15,7 +15,30 @@ If you adapt this for live execution, you are on your own — review every gate,
 
 See [`features.md`](./features.md) for the full mapping of the prediction-market-bot spec against what's implemented today (✅ done · 🟡 partial · ❌ missing).
 
-Five Claude Code skills live under `.claude/skills/` covering the operator-driven path: `pipeline-orchestrator`, `narrative-calibrator`, `risk-gatekeeper`, `execution-reviewer`, `post-mortem-auditor`. The Python agents under `src/` cover the batch path. Both run side by side — see the Architecture section below.
+Six Claude Code skills live under `.claude/skills/` covering the operator-driven path: `pipeline-orchestrator`, `narrative-calibrator`, `risk-gatekeeper`, `execution-reviewer`, `post-mortem-auditor`, `reddit-research`. The Python agents under `src/` cover the batch path. Both run side by side — see the Architecture section below.
+
+## Crypto Trading Build Progress
+
+The repo is currently being extended for **automated crypto trading on Coinbase + Hyperliquid** (intraday/short-horizon, target $100K bankroll). Build phases tracked here:
+
+| Phase | Component | Status | Notes |
+|---|---|---|---|
+| 1 | Coinbase connector (`src/exchanges/coinbase.py`) | ✅ done | ccxt-backed; sandbox toggle via `COINBASE_USE_SANDBOX`. Note: ccxt 4.5 has no Coinbase sandbox URL — kill-switch + operator-intent gates still apply, but Phase 5 needs a paper-trade simulator behind the same interface. 15 tests. |
+| 2 | Risk circuit breakers (`src/risk/circuit_breakers.py`) | ✅ done | Kill switch (force_flat) > daily loss / drawdown / notional caps (halt_new_entries) > allow. 19 tests. |
+| 3 | Redis position state (`src/state/position_store.py`) | ✅ done | `fakeredis` for tests; `redis>=5.0` added to requirements; `reconcile()` drops orphan pending positions > 1h with no exchange-side order. 18 tests. |
+| 4 | Alerts pipeline (`src/alerts/notifier.py`) | ✅ done | Discord (info/fills/daily summary) + Telegram (alert/critical with MarkdownV2 escape). Best-effort — never raises to caller. 14 tests. |
+| 5 | Live supervisor + 14-day shakedown gate (`src/live_supervisor.py`) | ✅ done | Tick loop wires Phase 1-4. Shakedown resets on uncaught error / kill-switch trip / daily-loss breaker trip. Paper mode synthesizes fills at mid ± 5 bps slippage. 16 tests. |
+| 6 | Hyperliquid perps adapter (`src/exchanges/hyperliquid.py`) | ✅ done | Read-only V1 (info / clearinghouseState / userFills). Write methods raise `NotImplementedError` — EIP-712 signing via `eth-account` is intentionally deferred (avoids heavy crypto deps). 14 tests. |
+| 7 | Monitoring (Sentry + Prometheus) | 🟡 mostly done | `src/observability/monitoring.py` + supervisor hooks landed (gauges, counters, histogram, sentry capture). Standalone `test_observability.py` is missing (agent timed out); supervisor tests still cover the integration path. Follow-up: add the dedicated unit tests + Grafana dashboard JSON. |
+
+**Test suite:** 403 tests, all green, 0.5s runtime. Six phases of crypto trading infra wired and tested.
+
+**Mandatory gates:**
+- No live mode until ≥14 days of clean paper-trade PnL on the supervised loop.
+- No friends-and-family money until ≥6 months of personal live trading with positive Sharpe AND a securities lawyer in the loop.
+- `KILL_SWITCH_FILE` must be set; `touch $KILL_SWITCH_FILE` halts new entries at the next decision tick.
+
+See `.env.example` Section 4 for the full env-var contract (Coinbase, Hyperliquid, Kraken, Redis, Discord, Telegram, Sentry, circuit-breaker thresholds).
 
 ## Overview
 
