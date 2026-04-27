@@ -101,7 +101,11 @@ def init_sentry(
     if _SENTRY_INITIALIZED:
         return True
 
-    effective_dsn = dsn or os.getenv("SENTRY_DSN")
+    # Treat bare `SENTRY_DSN=` (empty string) as "not configured", same as unset.
+    # This is a common .env footgun — without the strip, sentry_sdk.init parses
+    # the empty string as a URL and fails with "Unsupported scheme ''".
+    raw_dsn = dsn if dsn is not None else os.getenv("SENTRY_DSN")
+    effective_dsn = raw_dsn.strip() if isinstance(raw_dsn, str) else raw_dsn
     if not effective_dsn:
         return False
 

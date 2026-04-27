@@ -327,6 +327,21 @@ class Supervisor:
                     action_counts[t.action_taken] = (
                         action_counts.get(t.action_taken, 0) + 1
                     )
+                    # Per-tick INFO log so operators see live activity.
+                    confidence = (
+                        f"{t.model_confidence:.3f}"
+                        if t.model_confidence is not None
+                        else "n/a"
+                    )
+                    note_suffix = f" -- {t.notes}" if t.notes else ""
+                    LOGGER.info(
+                        "tick #%d | %s | action=%s | confidence=%s%s",
+                        iterations,
+                        t.symbol,
+                        t.action_taken,
+                        confidence,
+                        note_suffix,
+                    )
                 # Sleep last so a single-iter call doesn't pay an idle wait.
                 if max_iterations is None or iterations < max_iterations:
                     self._sleep(self.config.tick_interval_s)
@@ -984,10 +999,31 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI entrypoint."""
+    # Load .env from repo root and src/.env (matches src/config.py convention).
+    # Do this BEFORE constructing the exchange / breakers / pusher so they see
+    # the env vars the operator put in .env. Silent if python-dotenv is absent.
+    try:
+        from dotenv import load_dotenv  # type: ignore[import-not-found]
+
+        repo_root = Path(__file__).resolve().parent.parent
+        load_dotenv(repo_root / ".env", override=False)
+        load_dotenv(repo_root / "src" / ".env", override=False)
+    except Exception:  # noqa: BLE001 - .env loading is best-effort
+        pass
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,  # ensure live streaming when output is piped/tee'd
+        force=True,
     )
+    # Force unbuffered stdout so each log record appears immediately when the
+    # process is invoked under a pipe (the default 4KB block buffer otherwise
+    # makes the supervisor look frozen for several seconds per tick).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
     args = _parse_args(argv)
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     if not symbols:

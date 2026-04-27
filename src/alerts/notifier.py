@@ -397,9 +397,24 @@ class Notifier:
             ) else None
         except (ValueError, json.JSONDecodeError):
             description = None
+        # Add an actionable hint for the most common Telegram setup mistake.
+        # 400 "chat not found" means the chat_id is wrong (or the bot was never
+        # given access to that chat). Document the fix path inline so operators
+        # don't have to dig.
+        hint = ""
+        if status == 400 and description and "chat not found" in description.lower():
+            hint = (
+                " — TELEGRAM_CHAT_ID is wrong or the bot has no access to that chat. "
+                "Fix: 1) DM the bot in Telegram with any message (e.g. /start). "
+                "2) curl https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates "
+                "3) read 'result[*].message.chat.id' from the JSON response and use that."
+            )
+        elif status == 401:
+            hint = " — TELEGRAM_BOT_TOKEN is invalid. Re-issue via @BotFather."
         logger.warning(
-            "Telegram notify failed (HTTP %s): %s",
+            "Telegram notify failed (HTTP %s): %s%s",
             status,
             description or body_text,
+            hint,
         )
         return False

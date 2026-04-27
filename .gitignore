@@ -24,3 +24,12 @@ model/
 *.pt
 model/
 model/
+
+# Crypto trading runtime state
+.shakedown.json
+.kill_switch
+
+# npm artifacts (Python repo; node_modules from MCP installs)
+node_modules/
+package.json
+package-lock.json

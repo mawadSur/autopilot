@@ -19,11 +19,15 @@ Phase 1 of the live-trading buildout. Wiring into live_trader.py is Phase 5.
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
+import requests
 from pydantic import BaseModel, ConfigDict, Field, computed_field
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +128,33 @@ def _normalize_symbol(symbol: str) -> str:
             raise ExchangeError(f"Invalid symbol: {symbol!r}")
         return f"{parts[0].upper()}/{parts[1].upper()}"
     raise ExchangeError(f"Unrecognised symbol format: {symbol!r}")
+
+
+# Coinbase US spot lists USD pairs, not USDT. Operators accustomed to Binance/
+# Bybit symbols frequently pass ``ETH/USDT`` — translate with a one-time WARNING
+# rather than letting ccxt's market-lookup IndexError leak through.
+_COINBASE_QUOTE_TRANSLATIONS: Dict[str, str] = {"USDT": "USD", "USDC": "USD"}
+_LOGGED_TRANSLATIONS: set[str] = set()
+
+
+def _coinbase_market_symbol(symbol: str) -> str:
+    """Apply Coinbase-specific quote currency mapping after generic normalize."""
+    norm = _normalize_symbol(symbol)
+    base, _, quote = norm.partition("/")
+    translated_quote = _COINBASE_QUOTE_TRANSLATIONS.get(quote, quote)
+    if translated_quote == quote:
+        return norm
+    translated = f"{base}/{translated_quote}"
+    cache_key = f"{norm}->{translated}"
+    if cache_key not in _LOGGED_TRANSLATIONS:
+        _LOGGED_TRANSLATIONS.add(cache_key)
+        logger.warning(
+            "Coinbase quote translation: %s -> %s (Coinbase US spot does not list %s pairs)",
+            norm,
+            translated,
+            quote,
+        )
+    return translated
 
 
 def _utcnow_iso() -> str:
@@ -445,16 +476,55 @@ class CoinbaseExchange:
         return balances
 
     def get_ticker(self, symbol: str) -> Ticker:
-        norm_symbol = _normalize_symbol(symbol)
+        """Fetch ticker. Uses Coinbase's public REST endpoint directly.
+
+        Bypasses ccxt because ccxt 4.5's coinbase driver raises IndexError
+        from inside its parser against the Advanced Trade unified endpoint.
+        The public ``/api/v3/brokerage/market/products/{product_id}`` endpoint
+        needs no auth and returns exactly the fields we need.
+
+        ccxt is still used for orders / balances / open orders.
+        """
+        norm_symbol = _coinbase_market_symbol(symbol)
         try:
-            raw = self._client.fetch_ticker(norm_symbol)
+            return self._fetch_ticker_via_rest(norm_symbol)
+        except ExchangeError:
+            raise
         except Exception as exc:
             raise ExchangeError(f"fetch_ticker failed: {exc}") from exc
 
-        bid = _coerce_float((raw or {}).get("bid"))
-        ask = _coerce_float((raw or {}).get("ask"))
-        last = _coerce_float((raw or {}).get("last"), default=(bid + ask) / 2.0 if (bid and ask) else 0.0)
-        volume = _coerce_float((raw or {}).get("baseVolume"))
+    def _fetch_ticker_via_rest(self, norm_symbol: str) -> Ticker:
+        """Public Coinbase Advanced Trade products endpoint. No auth, no ccxt."""
+        # ccxt format ``ETH/USD`` -> Coinbase product_id ``ETH-USD``.
+        product_id = norm_symbol.replace("/", "-")
+        url = f"https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}"
+        try:
+            resp = requests.get(url, timeout=10.0)
+        except Exception as exc:
+            raise ExchangeError(f"products GET failed: {exc}") from exc
+
+        status = getattr(resp, "status_code", 0)
+        if status == 404:
+            raise ExchangeError(
+                f"Product {product_id!r} is not listed on Coinbase. "
+                "Try a USD pair such as ETH-USD, BTC-USD, or SOL-USD."
+            )
+        if not 200 <= status < 300:
+            body = getattr(resp, "text", "")[:200]
+            raise ExchangeError(f"products GET returned HTTP {status}: {body}")
+
+        try:
+            data = resp.json() or {}
+        except Exception as exc:
+            raise ExchangeError(f"products GET returned non-JSON: {exc}") from exc
+
+        bid = _coerce_float(data.get("best_bid"))
+        ask = _coerce_float(data.get("best_ask"))
+        last = _coerce_float(
+            data.get("price"),
+            default=(bid + ask) / 2.0 if (bid and ask) else 0.0,
+        )
+        volume = _coerce_float(data.get("volume_24h"))
         return Ticker(
             symbol=norm_symbol,
             bid=bid,

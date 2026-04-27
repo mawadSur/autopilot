@@ -332,19 +332,48 @@ class AccountAndMarketDataTests(unittest.TestCase):
         self.assertEqual(as_dict["ETH"].total, 0.5)
 
     def test_get_ticker_computes_mid_and_spread_bps(self) -> None:
-        ex, fake = _make_exchange()
-        fake.last_client().ticker_response = {
-            "bid": 100.0,
-            "ask": 100.2,
-            "last": 100.1,
-            "baseVolume": 5000.0,
-        }
-        ticker = ex.get_ticker("ETH-USD")
+        ex, _ = _make_exchange()
+
+        # get_ticker now bypasses ccxt and hits Coinbase's public products
+        # endpoint directly via requests. Stub requests.get accordingly.
+        from unittest import mock
+
+        fake_response = mock.MagicMock(
+            status_code=200,
+            json=lambda: {
+                "best_bid": "100.0",
+                "best_ask": "100.2",
+                "price": "100.1",
+                "volume_24h": "5000.0",
+            },
+        )
+        with mock.patch(
+            "exchanges.coinbase.requests.get",
+            return_value=fake_response,
+        ) as patched_get:
+            ticker = ex.get_ticker("ETH-USD")
+
         self.assertEqual(ticker.symbol, "ETH/USD")
         # mid = 100.1; spread = 0.2 / 100.1 * 10000 ≈ 19.98 bps
         self.assertAlmostEqual(ticker.mid, 100.1, places=4)
         self.assertAlmostEqual(ticker.spread_bps, (0.2 / 100.1) * 10_000.0, places=4)
         self.assertEqual(ticker.volume_24h_base, 5000.0)
+        # Confirm we called the public products endpoint with the dash-style id.
+        called_url = patched_get.call_args.args[0]
+        self.assertIn("/api/v3/brokerage/market/products/ETH-USD", called_url)
+
+    def test_get_ticker_404_emits_clear_error(self) -> None:
+        ex, _ = _make_exchange()
+        from unittest import mock
+
+        fake_response = mock.MagicMock(status_code=404, text="Not Found")
+        with mock.patch(
+            "exchanges.coinbase.requests.get",
+            return_value=fake_response,
+        ):
+            with self.assertRaises(ExchangeError) as cm:
+                ex.get_ticker("XYZ/USD")
+        self.assertIn("not listed on Coinbase", str(cm.exception))
 
 
 # ---------------------------------------------------------------------------
