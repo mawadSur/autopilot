@@ -1057,13 +1057,36 @@ def main(argv: Optional[List[str]] = None) -> int:
     circuit_breakers = CircuitBreakerSet()
     notifier = Notifier()
 
+    # Try the legacy transformer; fall back to neutral placeholder if anything
+    # goes wrong (missing artifacts, torch import error, etc.). The supervisor
+    # must never crash on model boot.
+    predict_fn: Callable[[str, Ticker], Tuple[Literal["buy", "sell"], float]] = (
+        _placeholder_predict
+    )
+    try:
+        from predictor import build_default_predict_fn
+
+        legacy = build_default_predict_fn(exchange)
+        if legacy is not None:
+            predict_fn = legacy
+            LOGGER.info("supervisor: using LegacyTransformerPredictor")
+        else:
+            LOGGER.warning(
+                "supervisor: no legacy predictor available; using placeholder "
+                "(every tick will be skipped_low_confidence)"
+            )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning(
+            "supervisor: predictor bootstrap failed (%s); using placeholder", exc
+        )
+
     supervisor = Supervisor(
         config=config,
         exchange=exchange,
         position_store=position_store,
         circuit_breakers=circuit_breakers,
         notifier=notifier,
-        model_predict_fn=_placeholder_predict,
+        model_predict_fn=predict_fn,
         metrics_pusher=metrics_pusher,
     )
 

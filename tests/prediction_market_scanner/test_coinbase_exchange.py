@@ -362,6 +362,63 @@ class AccountAndMarketDataTests(unittest.TestCase):
         called_url = patched_get.call_args.args[0]
         self.assertIn("/api/v3/brokerage/market/products/ETH-USD", called_url)
 
+    def test_fetch_recent_candles_returns_oldest_first(self) -> None:
+        ex, _ = _make_exchange()
+        from unittest import mock
+
+        # Coinbase returns newest-first; we expect oldest-first after sort.
+        fake_response = mock.MagicMock(
+            status_code=200,
+            json=lambda: {
+                "candles": [
+                    {
+                        "start": "1700000120",
+                        "open": "102",
+                        "high": "103",
+                        "low": "101",
+                        "close": "102.5",
+                        "volume": "10",
+                    },
+                    {
+                        "start": "1700000060",
+                        "open": "101",
+                        "high": "102",
+                        "low": "100.5",
+                        "close": "101.5",
+                        "volume": "20",
+                    },
+                    {
+                        "start": "1700000000",
+                        "open": "100",
+                        "high": "101",
+                        "low": "99",
+                        "close": "100.5",
+                        "volume": "30",
+                    },
+                ]
+            },
+        )
+        with mock.patch(
+            "exchanges.coinbase.requests.get",
+            return_value=fake_response,
+        ) as patched_get:
+            rows = ex.fetch_recent_candles("ETH/USD", granularity="ONE_MINUTE", limit=3)
+
+        self.assertEqual(len(rows), 3)
+        # Oldest first.
+        self.assertEqual(rows[0]["open"], 100.0)
+        self.assertEqual(rows[1]["open"], 101.0)
+        self.assertEqual(rows[2]["open"], 102.0)
+        # ISO timestamp set.
+        self.assertTrue(rows[0]["timestamp"].endswith("+00:00"))
+        # _unix scratch field stripped.
+        self.assertNotIn("_unix", rows[0])
+        # Endpoint hit with dash-style id and granularity param.
+        called_url = patched_get.call_args.args[0]
+        self.assertIn("/api/v3/brokerage/market/products/ETH-USD/candles", called_url)
+        called_params = patched_get.call_args.kwargs.get("params", {})
+        self.assertEqual(called_params.get("granularity"), "ONE_MINUTE")
+
     def test_get_ticker_404_emits_clear_error(self) -> None:
         ex, _ = _make_exchange()
         from unittest import mock

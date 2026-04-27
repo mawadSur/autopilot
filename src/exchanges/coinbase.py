@@ -534,6 +534,97 @@ class CoinbaseExchange:
             as_of_utc=_utcnow_iso(),
         )
 
+    def fetch_recent_candles(
+        self,
+        symbol: str,
+        *,
+        granularity: Literal[
+            "ONE_MINUTE",
+            "FIVE_MINUTE",
+            "FIFTEEN_MINUTE",
+            "THIRTY_MINUTE",
+            "ONE_HOUR",
+            "TWO_HOUR",
+            "SIX_HOUR",
+            "ONE_DAY",
+        ] = "ONE_MINUTE",
+        limit: int = 350,
+    ) -> List[Dict[str, Any]]:
+        """Fetch recent OHLCV candles via Coinbase REST. No auth required.
+
+        Returns rows sorted oldest-first with keys ``timestamp`` (ISO UTC),
+        ``open``, ``high``, ``low``, ``close``, ``volume`` (all floats).
+        Coinbase returns at most 350 candles per request.
+        """
+        norm_symbol = _coinbase_market_symbol(symbol)
+        product_id = norm_symbol.replace("/", "-")
+        granularity_seconds = {
+            "ONE_MINUTE": 60,
+            "FIVE_MINUTE": 300,
+            "FIFTEEN_MINUTE": 900,
+            "THIRTY_MINUTE": 1800,
+            "ONE_HOUR": 3600,
+            "TWO_HOUR": 7200,
+            "SIX_HOUR": 21600,
+            "ONE_DAY": 86400,
+        }[granularity]
+        bounded_limit = max(1, min(int(limit), 350))
+        end = int(datetime.now(timezone.utc).timestamp())
+        start = end - granularity_seconds * bounded_limit
+        url = (
+            f"https://api.coinbase.com/api/v3/brokerage/market/products/"
+            f"{product_id}/candles"
+        )
+        params = {
+            "start": str(start),
+            "end": str(end),
+            "granularity": granularity,
+            "limit": str(bounded_limit),
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=10.0)
+        except Exception as exc:
+            raise ExchangeError(f"candles GET failed: {exc}") from exc
+
+        status = getattr(resp, "status_code", 0)
+        if status == 404:
+            raise ExchangeError(
+                f"Product {product_id!r} is not listed on Coinbase. "
+                "Try a USD pair such as ETH-USD, BTC-USD, or SOL-USD."
+            )
+        if not 200 <= status < 300:
+            body = getattr(resp, "text", "")[:200]
+            raise ExchangeError(f"candles GET returned HTTP {status}: {body}")
+
+        try:
+            data = resp.json() or {}
+        except Exception as exc:
+            raise ExchangeError(f"candles GET returned non-JSON: {exc}") from exc
+
+        raw_candles = data.get("candles") or []
+        rows: List[Dict[str, Any]] = []
+        for c in raw_candles:
+            try:
+                ts = int(c["start"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rows.append(
+                {
+                    "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    "_unix": ts,
+                    "open": _coerce_float(c.get("open")),
+                    "high": _coerce_float(c.get("high")),
+                    "low": _coerce_float(c.get("low")),
+                    "close": _coerce_float(c.get("close")),
+                    "volume": _coerce_float(c.get("volume")),
+                }
+            )
+        # Coinbase returns newest-first; we want oldest-first.
+        rows.sort(key=lambda r: r["_unix"])
+        for r in rows:
+            r.pop("_unix", None)
+        return rows
+
     # -- internal -----------------------------------------------------------
 
     def _order_from_raw(
