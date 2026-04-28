@@ -152,6 +152,17 @@ class StubPositionStore:
     def daily_realized_pnl_usd(self, *, now_utc: Optional[datetime] = None) -> float:
         return float(self._daily_pnl)
 
+    def daily_realized_pnl_usd_for_symbol(
+        self, symbol: str, *, now_utc: Optional[datetime] = None
+    ) -> float:
+        return float(
+            sum(
+                (p.realized_pnl_usd or 0.0)
+                for p in self._closed_today
+                if p.symbol == symbol
+            )
+        )
+
     # -- writes
     def record_open(self, position: Position) -> Position:
         self.recorded_open.append(position)
@@ -362,7 +373,13 @@ def _build_supervisor(
         now_fn=_fake_now,
     )
     if paper_days_clean:
-        sup.shakedown_state.paper_days_clean = paper_days_clean
+        # Per-symbol: seed every configured symbol's clean-day counter so
+        # the most-restrictive aggregate matches the legacy single-symbol
+        # semantics tests were written against.
+        for sym in sup.config.symbols:
+            sup.shakedown_state.get_or_init(sym).paper_days_clean = (
+                paper_days_clean
+            )
 
     return sup, {
         "exchange": exchange,
@@ -392,7 +409,8 @@ class TestSupervisorInit(unittest.TestCase):
 
             # Now load a second supervisor pointing at the same file: should
             # reuse the persisted state, not overwrite it.
-            sup.shakedown_state.paper_days_clean = 7
+            for sym in sup.config.symbols:
+                sup.shakedown_state.get_or_init(sym).paper_days_clean = 7
             sup._persist_shakedown(sup.shakedown_state)
             sup2, _ = _build_supervisor(shakedown_path=path)
             self.assertEqual(sup2.shakedown_state.paper_days_clean, 7)
@@ -665,6 +683,145 @@ class TestDailyClose(unittest.TestCase):
         self.assertTrue(path.exists())
         loaded = ShakedownState.model_validate_json(path.read_text())
         self.assertEqual(loaded.paper_days_clean, 3)
+
+
+class TestPerSymbolShakedown(unittest.TestCase):
+    """Phase 10 multi-symbol orchestration tests.
+
+    Per-symbol semantics:
+      * Each configured symbol has its own ``paper_days_clean`` counter.
+      * Account-level events (kill switch, daily-loss breaker) reset every
+        symbol; per-symbol errors only reset the offending symbol.
+      * ``is_live_unlocked(symbol)`` is per-symbol; ``is_live_unlocked()`` is
+        the most-restrictive aggregate.
+    """
+
+    def test_fresh_supervisor_seeds_entries_for_every_configured_symbol(
+        self,
+    ) -> None:
+        sup, _ = _build_supervisor(symbols=["ETH/USD", "BTC/USD", "SOL/USD"])
+        self.assertEqual(
+            set(sup.shakedown_state.per_symbol.keys()),
+            {"ETH/USD", "BTC/USD", "SOL/USD"},
+        )
+        for s in sup.shakedown_state.per_symbol.values():
+            self.assertEqual(s.paper_days_clean, 0)
+
+    def test_per_symbol_error_only_resets_that_symbol(self) -> None:
+        # ETH errors; BTC stays clean -> BTC streak survives.
+        sup, _ = _build_supervisor(symbols=["ETH/USD", "BTC/USD"])
+        for sym in ("ETH/USD", "BTC/USD"):
+            sup.shakedown_state.get_or_init(sym).paper_days_clean = 10
+        sup._increment_symbol_errors("ETH/USD")
+        sup.evaluate_shakedown()
+        self.assertEqual(
+            sup.shakedown_state.per_symbol["ETH/USD"].paper_days_clean, 0
+        )
+        self.assertEqual(
+            sup.shakedown_state.per_symbol["BTC/USD"].paper_days_clean, 11
+        )
+
+    def test_kill_switch_trip_resets_every_symbol(self) -> None:
+        sup, _ = _build_supervisor(symbols=["ETH/USD", "BTC/USD"])
+        for sym in ("ETH/USD", "BTC/USD"):
+            sup.shakedown_state.get_or_init(sym).paper_days_clean = 7
+        sup._kill_switch_trips_today = 1
+        sup.evaluate_shakedown()
+        self.assertEqual(
+            sup.shakedown_state.per_symbol["ETH/USD"].paper_days_clean, 0
+        )
+        self.assertEqual(
+            sup.shakedown_state.per_symbol["BTC/USD"].paper_days_clean, 0
+        )
+
+    def test_account_loss_breaker_resets_every_symbol(self) -> None:
+        store = StubPositionStore(daily_pnl=-500.0)
+        breakers = StubCircuitBreakers(daily_loss_limit_usd=200.0)
+        sup, _ = _build_supervisor(
+            symbols=["ETH/USD", "BTC/USD"],
+            position_store=store,
+            circuit_breakers=breakers,
+        )
+        for sym in ("ETH/USD", "BTC/USD"):
+            sup.shakedown_state.get_or_init(sym).paper_days_clean = 12
+        sup.evaluate_shakedown()
+        for sym in ("ETH/USD", "BTC/USD"):
+            self.assertEqual(
+                sup.shakedown_state.per_symbol[sym].paper_days_clean, 0
+            )
+
+    def test_is_live_unlocked_per_symbol_independent(self) -> None:
+        sup, _ = _build_supervisor(
+            mode="live",
+            symbols=["ETH/USD", "BTC/USD"],
+            shakedown_min_days=14,
+        )
+        sup.shakedown_state.get_or_init("ETH/USD").paper_days_clean = 14
+        sup.shakedown_state.get_or_init("BTC/USD").paper_days_clean = 5
+        self.assertTrue(sup.is_live_unlocked("ETH/USD"))
+        self.assertFalse(sup.is_live_unlocked("BTC/USD"))
+        # Aggregate (no-args) = most-restrictive = False.
+        self.assertFalse(sup.is_live_unlocked())
+
+    def test_is_live_unlocked_aggregate_true_only_when_all_unlocked(self) -> None:
+        sup, _ = _build_supervisor(
+            mode="live",
+            symbols=["ETH/USD", "BTC/USD"],
+            shakedown_min_days=14,
+        )
+        sup.shakedown_state.get_or_init("ETH/USD").paper_days_clean = 14
+        sup.shakedown_state.get_or_init("BTC/USD").paper_days_clean = 14
+        self.assertTrue(sup.is_live_unlocked())
+
+    def test_legacy_state_file_migrates_to_per_symbol(self) -> None:
+        """A pre-Phase-10 shakedown JSON should load + migrate seamlessly."""
+        legacy_blob = (
+            '{"started_at_utc": "2026-04-01T00:00:00+00:00", '
+            '"paper_days_clean": 9, '
+            '"last_evaluation_utc": "2026-04-25T00:00:00+00:00", '
+            '"daily_history": [{"date": "2026-04-25", "clean": true}], '
+            '"live_unlocked_at_utc": null, '
+            '"equity_peak_usd": 12345.67}'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "legacy.json"
+            path.write_text(legacy_blob, encoding="utf-8")
+            sup, _ = _build_supervisor(
+                symbols=["ETH/USD", "BTC/USD"],
+                shakedown_path=path,
+            )
+        # Both symbols inherit the legacy single-counter value.
+        self.assertEqual(
+            sup.shakedown_state.per_symbol["ETH/USD"].paper_days_clean, 9
+        )
+        self.assertEqual(
+            sup.shakedown_state.per_symbol["BTC/USD"].paper_days_clean, 9
+        )
+        # Equity peak preserved.
+        self.assertAlmostEqual(sup.shakedown_state.equity_peak_usd, 12345.67)
+        # Top-level paper_days_clean property = min across symbols.
+        self.assertEqual(sup.shakedown_state.paper_days_clean, 9)
+
+    def test_per_symbol_unlock_flips_only_target_symbol(self) -> None:
+        sup, _ = _build_supervisor(
+            symbols=["ETH/USD", "BTC/USD"], shakedown_min_days=3
+        )
+        # ETH at 2 (will hit 3 after this evaluation -> unlock); BTC at 0.
+        sup.shakedown_state.get_or_init("ETH/USD").paper_days_clean = 2
+        sup.evaluate_shakedown()
+        self.assertEqual(
+            sup.shakedown_state.per_symbol["ETH/USD"].paper_days_clean, 3
+        )
+        self.assertIsNotNone(
+            sup.shakedown_state.per_symbol["ETH/USD"].live_unlocked_at_utc
+        )
+        # BTC stays at 1 (clean today) and not unlocked.
+        self.assertEqual(
+            sup.shakedown_state.per_symbol["BTC/USD"].paper_days_clean, 1
+        )
+        self.assertIsNone(
+            sup.shakedown_state.per_symbol["BTC/USD"].live_unlocked_at_utc
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

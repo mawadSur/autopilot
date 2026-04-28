@@ -122,17 +122,92 @@ class SupervisorConfig(BaseModel):
     min_confidence_to_trade: float = 0.6
 
 
-class ShakedownState(BaseModel):
-    """Rolling shakedown evidence persisted between supervisor processes."""
+class SymbolShakedownState(BaseModel):
+    """Per-symbol shakedown evidence.
+
+    Each tracked symbol carries its own ``paper_days_clean`` counter and
+    daily history so a freshly added symbol starts at 0 even when other
+    symbols are already unlocked. Account-level events (kill switch,
+    daily-loss breaker) reset every symbol; per-symbol errors only reset
+    the offending symbol.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    started_at_utc: str
     paper_days_clean: int = 0
     last_evaluation_utc: Optional[str] = None
     daily_history: List[Dict[str, Any]] = Field(default_factory=list)
     live_unlocked_at_utc: Optional[str] = None
+
+
+class ShakedownState(BaseModel):
+    """Rolling shakedown evidence persisted between supervisor processes.
+
+    Per-symbol evidence lives in ``per_symbol``; ``equity_peak_usd`` and
+    ``started_at_utc`` remain global (they describe the whole bankroll).
+
+    Migration: the previous schema stored ``paper_days_clean`` /
+    ``daily_history`` / ``live_unlocked_at_utc`` at the top level for a
+    single implicit symbol. ``_load_or_init_shakedown`` detects that
+    layout and rewrites it into ``per_symbol`` on first load.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    started_at_utc: str
     equity_peak_usd: float = 0.0
+    per_symbol: Dict[str, SymbolShakedownState] = Field(default_factory=dict)
+
+    def get_or_init(self, symbol: str) -> SymbolShakedownState:
+        if symbol not in self.per_symbol:
+            self.per_symbol[symbol] = SymbolShakedownState()
+        return self.per_symbol[symbol]
+
+    # ------------------------------------------------------------------
+    # Backward-compat read-only helpers used by older callers / dashboards.
+    # ------------------------------------------------------------------
+    @property
+    def paper_days_clean(self) -> int:
+        """Most-restrictive (min) clean-day count across tracked symbols.
+
+        Returns 0 if no symbols are tracked yet -- a fresh supervisor
+        hasn't accumulated evidence for anything.
+        """
+        if not self.per_symbol:
+            return 0
+        return min(s.paper_days_clean for s in self.per_symbol.values())
+
+    @property
+    def daily_history(self) -> List[Dict[str, Any]]:
+        """Flattened history across all symbols, newest-last per symbol.
+
+        Each entry already carries its ``symbol`` key (added by
+        ``evaluate_shakedown``), so consumers can group by it.
+        """
+        out: List[Dict[str, Any]] = []
+        for s in self.per_symbol.values():
+            out.extend(s.daily_history)
+        return out
+
+    @property
+    def live_unlocked_at_utc(self) -> Optional[str]:
+        """Earliest unlock timestamp across symbols, or None if none unlocked."""
+        timestamps = [
+            s.live_unlocked_at_utc
+            for s in self.per_symbol.values()
+            if s.live_unlocked_at_utc is not None
+        ]
+        return min(timestamps) if timestamps else None
+
+    @property
+    def last_evaluation_utc(self) -> Optional[str]:
+        """Latest evaluation timestamp across symbols."""
+        timestamps = [
+            s.last_evaluation_utc
+            for s in self.per_symbol.values()
+            if s.last_evaluation_utc is not None
+        ]
+        return max(timestamps) if timestamps else None
 
 
 class SupervisorTick(BaseModel):
@@ -205,13 +280,17 @@ class Supervisor:
         self._now = now_fn
         self.metrics_pusher = metrics_pusher
 
-        # Per-iteration error counter; rolled into shakedown evidence on
-        # daily_close().
-        self._errors_today = 0
+        # Per-iteration error tracking. Errors are per-symbol (each
+        # _tick_symbol failure resets only that symbol's clean streak), but
+        # kill-switch trips are account-level (every symbol resets).
+        self._errors_today_by_symbol: Dict[str, int] = {
+            sym: 0 for sym in config.symbols
+        }
         self._kill_switch_trips_today = 0
 
-        # One-time warning latches.
-        self._warned_live_locked = False
+        # One-time warning latches, keyed by symbol so the live-locked
+        # warning fires once per locked symbol per process.
+        self._warned_live_locked: Dict[str, bool] = {}
 
         # Hydrate (or initialise) the shakedown evidence file.
         self.shakedown_state: ShakedownState = self._load_or_init_shakedown()
@@ -231,7 +310,19 @@ class Supervisor:
         if path.exists():
             try:
                 blob = path.read_text(encoding="utf-8")
-                return ShakedownState.model_validate_json(blob)
+                state, was_migrated = self._parse_shakedown_blob(blob)
+                # Make sure every configured symbol has an entry so callers
+                # can rely on ``per_symbol[symbol]`` after construction.
+                missing_symbols = [
+                    s for s in self.config.symbols if s not in state.per_symbol
+                ]
+                for sym in missing_symbols:
+                    state.get_or_init(sym)
+                # Persist now if we migrated or added new symbols, so the
+                # next process boot reads the canonical layout.
+                if was_migrated or missing_symbols:
+                    self._persist_shakedown(state)
+                return state
             except Exception as exc:  # noqa: BLE001 - corrupt file recovery
                 LOGGER.warning(
                     "Shakedown state at %s is corrupt (%s); reinitialising.",
@@ -239,8 +330,57 @@ class Supervisor:
                     exc,
                 )
         state = ShakedownState(started_at_utc=self._now().isoformat())
+        for sym in self.config.symbols:
+            state.get_or_init(sym)
         self._persist_shakedown(state)
         return state
+
+    def _parse_shakedown_blob(self, blob: str) -> Tuple[ShakedownState, bool]:
+        """Parse JSON blob, migrating from the legacy global format if needed.
+
+        Returns ``(state, was_migrated)`` so the caller can re-persist after
+        a migration to canonicalise the on-disk layout.
+        """
+        import json
+
+        raw = json.loads(blob)
+        was_migrated = False
+        # Legacy format: top-level paper_days_clean / daily_history etc., no
+        # per_symbol field. Migrate by promoting the legacy values into a
+        # per-symbol entry for every currently-configured symbol so they
+        # inherit the existing clean-day streak.
+        if "per_symbol" not in raw and any(
+            k in raw
+            for k in (
+                "paper_days_clean",
+                "daily_history",
+                "live_unlocked_at_utc",
+                "last_evaluation_utc",
+            )
+        ):
+            legacy_per_symbol_payload = {
+                "paper_days_clean": int(raw.pop("paper_days_clean", 0) or 0),
+                "last_evaluation_utc": raw.pop("last_evaluation_utc", None),
+                "daily_history": list(raw.pop("daily_history", []) or []),
+                "live_unlocked_at_utc": raw.pop("live_unlocked_at_utc", None),
+            }
+            raw["per_symbol"] = {
+                sym: legacy_per_symbol_payload for sym in self.config.symbols
+            }
+            was_migrated = True
+            LOGGER.info(
+                "Migrated legacy shakedown state to per-symbol layout for %d "
+                "symbol(s); preserved paper_days_clean=%d.",
+                len(self.config.symbols),
+                legacy_per_symbol_payload["paper_days_clean"],
+            )
+        return ShakedownState.model_validate(raw), was_migrated
+
+    def _increment_symbol_errors(self, symbol: str) -> None:
+        """Bump the per-symbol error counter for today's shakedown evaluation."""
+        self._errors_today_by_symbol[symbol] = (
+            self._errors_today_by_symbol.get(symbol, 0) + 1
+        )
 
     def _persist_shakedown(self, state: ShakedownState) -> None:
         path = self.config.shakedown_state_path
@@ -253,13 +393,30 @@ class Supervisor:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def is_live_unlocked(self) -> bool:
-        """True only if mode='live' AND shakedown evidence is sufficient."""
+    def is_live_unlocked(self, symbol: Optional[str] = None) -> bool:
+        """True only if mode='live' AND shakedown evidence is sufficient.
+
+        With ``symbol`` set: returns the per-symbol gate. With no symbol:
+        returns True only if EVERY configured symbol is unlocked (used for
+        whole-supervisor summary / metrics).
+        """
         if self.config.mode != "live":
             return False
-        return (
-            self.shakedown_state.paper_days_clean
-            >= self.config.shakedown_min_days
+        if symbol is not None:
+            sym_state = self.shakedown_state.per_symbol.get(symbol)
+            if sym_state is None:
+                return False
+            return sym_state.paper_days_clean >= self.config.shakedown_min_days
+        # No symbol: most-restrictive aggregate over configured symbols.
+        if not self.config.symbols:
+            return False
+        return all(
+            (
+                self.shakedown_state.per_symbol.get(s)
+                and self.shakedown_state.per_symbol[s].paper_days_clean
+                >= self.config.shakedown_min_days
+            )
+            for s in self.config.symbols
         )
 
     def run_once(self) -> List[SupervisorTick]:
@@ -274,7 +431,9 @@ class Supervisor:
                 # Genuinely uncaught path -- tick_symbol should catch
                 # ExchangeError / generic exceptions itself, but if something
                 # leaks through (eg pydantic validation), don't kill the loop.
-                self._errors_today += 1
+                self._errors_today_by_symbol[symbol] = (
+                    self._errors_today_by_symbol.get(symbol, 0) + 1
+                )
                 LOGGER.exception("Unhandled tick error on %s", symbol)
                 _capture_exception(exc)
                 self._safe_alert(
@@ -362,61 +521,74 @@ class Supervisor:
     def evaluate_shakedown(self) -> ShakedownState:
         """Roll today's evidence into the shakedown state and persist it.
 
-        Reset triggers (any of these resets ``paper_days_clean`` to 0):
-            * uncaught error during a tick
-            * kill switch tripped during the day
+        Per-symbol reset triggers (reset that symbol's clean streak):
+            * uncaught error inside ``_tick_symbol`` for that symbol
+        Account-level reset triggers (reset EVERY symbol's clean streak):
+            * kill switch tripped during the day (operator intervention)
             * realised daily PnL <= -daily_loss_limit_usd
-              (only applies when the breaker is configured)
+              (only when the breaker is configured)
         """
         now = self._now()
         today_iso = _today_iso(now)
-        daily_pnl = float(self.position_store.daily_realized_pnl_usd())
-        errors = int(self._errors_today)
+        account_daily_pnl = float(self.position_store.daily_realized_pnl_usd())
         ks_trips = int(self._kill_switch_trips_today)
 
-        daily_loss_breaker_tripped = False
+        account_loss_breaker_tripped = False
         limit = self.circuit_breakers.daily_loss_limit_usd
-        if limit is not None and daily_pnl <= -float(limit):
-            daily_loss_breaker_tripped = True
+        if limit is not None and account_daily_pnl <= -float(limit):
+            account_loss_breaker_tripped = True
 
-        clean = (
-            errors == 0
-            and ks_trips == 0
-            and not daily_loss_breaker_tripped
-        )
+        # Account-level events affect every symbol; pre-compute the flag.
+        account_dirty = ks_trips > 0 or account_loss_breaker_tripped
 
-        if clean:
-            self.shakedown_state.paper_days_clean += 1
-        else:
-            self.shakedown_state.paper_days_clean = 0
+        # Make sure every configured symbol has an entry -- a symbol added
+        # mid-stream still gets evaluated.
+        for sym in self.config.symbols:
+            self.shakedown_state.get_or_init(sym)
 
-        self.shakedown_state.last_evaluation_utc = now.isoformat()
-        self.shakedown_state.daily_history.append(
-            {
-                "date": today_iso,
-                "daily_pnl_usd": daily_pnl,
-                "errors_count": errors,
-                "kill_switch_trips": ks_trips,
-                "daily_loss_breaker_tripped": daily_loss_breaker_tripped,
-                "clean": clean,
-            }
-        )
-        if (
-            self.shakedown_state.paper_days_clean
-            >= self.config.shakedown_min_days
-            and self.shakedown_state.live_unlocked_at_utc is None
-        ):
-            self.shakedown_state.live_unlocked_at_utc = now.isoformat()
+        for symbol, sym_state in self.shakedown_state.per_symbol.items():
+            errors_for_symbol = int(self._errors_today_by_symbol.get(symbol, 0))
+            try:
+                pnl_for_symbol = float(
+                    self.position_store.daily_realized_pnl_usd_for_symbol(symbol)
+                )
+            except Exception:  # noqa: BLE001 - state read is best-effort
+                pnl_for_symbol = 0.0
 
-        # Update the equity high-water mark tracked across processes.
-        equity_now = self.config.bankroll_usd + daily_pnl
+            clean = (not account_dirty) and errors_for_symbol == 0
+
+            if clean:
+                sym_state.paper_days_clean += 1
+            else:
+                sym_state.paper_days_clean = 0
+
+            sym_state.last_evaluation_utc = now.isoformat()
+            sym_state.daily_history.append(
+                {
+                    "date": today_iso,
+                    "symbol": symbol,
+                    "daily_pnl_usd": pnl_for_symbol,
+                    "errors_count": errors_for_symbol,
+                    "kill_switch_trips": ks_trips,
+                    "daily_loss_breaker_tripped": account_loss_breaker_tripped,
+                    "clean": clean,
+                }
+            )
+            if (
+                sym_state.paper_days_clean >= self.config.shakedown_min_days
+                and sym_state.live_unlocked_at_utc is None
+            ):
+                sym_state.live_unlocked_at_utc = now.isoformat()
+
+        # Account-level: update the bankroll high-water mark.
+        equity_now = self.config.bankroll_usd + account_daily_pnl
         if equity_now > self.shakedown_state.equity_peak_usd:
             self.shakedown_state.equity_peak_usd = equity_now
 
         self._persist_shakedown(self.shakedown_state)
 
-        # Reset per-day counters once they've been folded into the evidence.
-        self._errors_today = 0
+        # Reset per-day counters once they've been folded into evidence.
+        self._errors_today_by_symbol = {sym: 0 for sym in self.config.symbols}
         self._kill_switch_trips_today = 0
         return self.shakedown_state
 
@@ -495,7 +667,7 @@ class Supervisor:
         try:
             ticker = self.exchange.get_ticker(symbol)
         except ExchangeError as exc:
-            self._errors_today += 1
+            self._increment_symbol_errors(symbol)
             self._safe_alert(
                 f"get_ticker failed for {symbol}: {exc}", severity="alert"
             )
@@ -525,7 +697,7 @@ class Supervisor:
         try:
             side, confidence = self.model_predict_fn(symbol, ticker)
         except Exception as exc:  # noqa: BLE001 - model errors should not crash
-            self._errors_today += 1
+            self._increment_symbol_errors(symbol)
             self._safe_alert(
                 f"model_predict_fn failed for {symbol}: {exc}",
                 severity="alert",
@@ -594,22 +766,26 @@ class Supervisor:
                 ),
             )
 
-        # 6. Mode gate -- live falls back to paper if shakedown not unlocked.
+        # 6. Mode gate -- live falls back to paper if THIS symbol's shakedown
+        # isn't unlocked. Other symbols can still trade live.
         effective_mode: Literal["paper", "live"] = "paper"
         notes_extra: Optional[str] = None
         if self.config.mode == "live":
-            if self.is_live_unlocked():
+            if self.is_live_unlocked(symbol):
                 effective_mode = "live"
             else:
-                if not self._warned_live_locked:
+                if not self._warned_live_locked.get(symbol, False):
+                    sym_state = self.shakedown_state.per_symbol.get(symbol)
+                    sym_clean = sym_state.paper_days_clean if sym_state else 0
                     LOGGER.warning(
-                        "mode='live' but shakedown not unlocked "
+                        "mode='live' but shakedown not unlocked for %s "
                         "(paper_days_clean=%d, required=%d); "
                         "falling back to paper-trade simulation.",
-                        self.shakedown_state.paper_days_clean,
+                        symbol,
+                        sym_clean,
                         self.config.shakedown_min_days,
                     )
-                    self._warned_live_locked = True
+                    self._warned_live_locked[symbol] = True
                 # Tick recorded as halted_breaker per spec, with paper sim.
                 self._paper_simulate_fill(
                     symbol=symbol,
@@ -645,7 +821,7 @@ class Supervisor:
                 )
                 notes_extra = "paper"
         except ExchangeError as exc:
-            self._errors_today += 1
+            self._increment_symbol_errors(symbol)
             self._safe_alert(
                 f"place_market_order failed for {symbol}: {exc}",
                 severity="alert",
@@ -659,7 +835,7 @@ class Supervisor:
                 notes=f"order: {exc!r}",
             )
         except Exception as exc:  # noqa: BLE001 - keep loop alive
-            self._errors_today += 1
+            self._increment_symbol_errors(symbol)
             LOGGER.exception("Unexpected order error on %s", symbol)
             self._safe_alert(
                 f"unexpected order error for {symbol}: {exc}",

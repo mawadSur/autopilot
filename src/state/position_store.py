@@ -354,6 +354,18 @@ class PositionStore:
             )
         )
 
+    def daily_realized_pnl_usd_for_symbol(
+        self, symbol: str, *, now_utc: Optional[datetime] = None
+    ) -> float:
+        """Per-symbol realised PnL for today (UTC). Used by per-symbol shakedown."""
+        return float(
+            sum(
+                (p.realized_pnl_usd or 0.0)
+                for p in self.list_closed_today(now_utc=now_utc)
+                if p.symbol == symbol
+            )
+        )
+
     # ------------------------------------------------------------------
     # reconcile
     # ------------------------------------------------------------------
