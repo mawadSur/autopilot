@@ -30,8 +30,10 @@ The repo is currently being extended for **automated crypto trading on Coinbase 
 | 5 | Live supervisor + 14-day shakedown gate (`src/live_supervisor.py`) | ✅ done | Tick loop wires Phase 1-4. Shakedown resets on uncaught error / kill-switch trip / daily-loss breaker trip. Paper mode synthesizes fills at mid ± 5 bps slippage. 16 tests. |
 | 6 | Hyperliquid perps adapter (`src/exchanges/hyperliquid.py`) | ✅ done | Read-only V1 (info / clearinghouseState / userFills). Write methods raise `NotImplementedError` — EIP-712 signing via `eth-account` is intentionally deferred (avoids heavy crypto deps). 14 tests. |
 | 7 | Monitoring (Sentry + Prometheus) | 🟡 mostly done | `src/observability/monitoring.py` + supervisor hooks landed (gauges, counters, histogram, sentry capture). Standalone `test_observability.py` is missing (agent timed out); supervisor tests still cover the integration path. Follow-up: add the dedicated unit tests + Grafana dashboard JSON. |
+| 8 | Real model wired into supervisor (`src/predictor.py`) | ✅ done | `LegacyTransformerPredictor` loads `model_sanity/`, fetches Coinbase 1m candles via REST, computes 36 features, runs the transformer, returns `(side, confidence)`. Env-controlled by `LEGACY_MODEL_DIR`. Falls back to neutral placeholder on any load failure so the supervisor never crashes on model issues. 11 tests including end-to-end against the real bundle. |
+| 9 | Operator tools — paper-session monitor (`src/paper_session_monitor.py`) | ✅ done | Read-only CLI that parses supervisor tick log lines and prints rolling per-symbol stats (action distribution, confidence percentiles, time-since-last-signal). Run alongside a paper session: `tee paper.log` then `paper_session_monitor.py paper.log --follow`. 16 tests. |
 
-**Test suite:** 403 tests, all green, 0.5s runtime. Six phases of crypto trading infra wired and tested.
+**Test suite:** 432 tests, all green, ~1s runtime. Eight phases of crypto trading infra wired and tested + operator tools.
 
 **Mandatory gates:**
 - No live mode until ≥14 days of clean paper-trade PnL on the supervised loop.
