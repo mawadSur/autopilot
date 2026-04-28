@@ -534,6 +534,38 @@ class CoinbaseExchange:
             as_of_utc=_utcnow_iso(),
         )
 
+    def fetch_candles_window(
+        self,
+        symbol: str,
+        *,
+        granularity: Literal[
+            "ONE_MINUTE",
+            "FIVE_MINUTE",
+            "FIFTEEN_MINUTE",
+            "THIRTY_MINUTE",
+            "ONE_HOUR",
+            "TWO_HOUR",
+            "SIX_HOUR",
+            "ONE_DAY",
+        ] = "ONE_MINUTE",
+        start_unix: int,
+        end_unix: int,
+    ) -> List[Dict[str, Any]]:
+        """Fetch candles in an explicit ``[start_unix, end_unix]`` window.
+
+        Used by historical backfill (``crypto_training.backfill_ohlcv``).
+        Coinbase enforces a 350-bar cap PER REQUEST, so the caller is
+        responsible for chunking large windows. The endpoint and parsing
+        is identical to ``fetch_recent_candles``; only the UNIX bounds
+        come from the caller instead of being computed from "now".
+        """
+        return self._fetch_candles(
+            symbol=symbol,
+            granularity=granularity,
+            start_unix=start_unix,
+            end_unix=end_unix,
+        )
+
     def fetch_recent_candles(
         self,
         symbol: str,
@@ -550,14 +582,12 @@ class CoinbaseExchange:
         ] = "ONE_MINUTE",
         limit: int = 350,
     ) -> List[Dict[str, Any]]:
-        """Fetch recent OHLCV candles via Coinbase REST. No auth required.
+        """Fetch the most recent ``limit`` candles via Coinbase REST.
 
         Returns rows sorted oldest-first with keys ``timestamp`` (ISO UTC),
         ``open``, ``high``, ``low``, ``close``, ``volume`` (all floats).
         Coinbase returns at most 350 candles per request.
         """
-        norm_symbol = _coinbase_market_symbol(symbol)
-        product_id = norm_symbol.replace("/", "-")
         granularity_seconds = {
             "ONE_MINUTE": 60,
             "FIVE_MINUTE": 300,
@@ -571,15 +601,33 @@ class CoinbaseExchange:
         bounded_limit = max(1, min(int(limit), 350))
         end = int(datetime.now(timezone.utc).timestamp())
         start = end - granularity_seconds * bounded_limit
+        return self._fetch_candles(
+            symbol=symbol,
+            granularity=granularity,
+            start_unix=start,
+            end_unix=end,
+        )
+
+    def _fetch_candles(
+        self,
+        *,
+        symbol: str,
+        granularity: str,
+        start_unix: int,
+        end_unix: int,
+    ) -> List[Dict[str, Any]]:
+        """Shared candles fetch implementation. Coinbase has a 350-bar/req cap."""
+        norm_symbol = _coinbase_market_symbol(symbol)
+        product_id = norm_symbol.replace("/", "-")
         url = (
             f"https://api.coinbase.com/api/v3/brokerage/market/products/"
             f"{product_id}/candles"
         )
         params = {
-            "start": str(start),
-            "end": str(end),
+            "start": str(int(start_unix)),
+            "end": str(int(end_unix)),
             "granularity": granularity,
-            "limit": str(bounded_limit),
+            "limit": "350",
         }
         try:
             resp = requests.get(url, params=params, timeout=10.0)
