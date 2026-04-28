@@ -1245,7 +1245,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         legacy = build_default_predict_fn(exchange)
         if legacy is not None:
             predict_fn = legacy
-            LOGGER.info("supervisor: using LegacyTransformerPredictor")
+            LOGGER.info(
+                "supervisor: using %s", type(legacy).__name__
+            )
         else:
             LOGGER.warning(
                 "supervisor: no legacy predictor available; using placeholder "

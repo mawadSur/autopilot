@@ -10,6 +10,7 @@ Two layers:
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -204,6 +205,145 @@ class LegacyTransformerIntegrationTests(unittest.TestCase):
         fake_ticker = mock.MagicMock(symbol="ETH/USD", bid=2000.0, ask=2000.5, last=2000.25)
         side, conf = predictor("ETH/USD", fake_ticker)
         self.assertEqual((side, conf), ("buy", 0.5))
+
+
+class XGBoostPredictorBuildFallbackTests(unittest.TestCase):
+    """``build_default_predict_fn`` priority: crypto > legacy > placeholder."""
+
+    def test_falls_back_to_legacy_when_crypto_dir_unset(self) -> None:
+        from predictor import build_default_predict_fn
+
+        with mock.patch.dict(
+            os.environ,
+            {"CRYPTO_MODEL_DIR": "", "LEGACY_MODEL_DIR": "/no/such/dir/zzz"},
+            clear=False,
+        ):
+            self.assertIsNone(build_default_predict_fn(exchange=None))
+
+    def test_falls_back_to_legacy_when_crypto_dir_missing(self) -> None:
+        from predictor import build_default_predict_fn
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CRYPTO_MODEL_DIR": "/no/such/crypto/dir",
+                "LEGACY_MODEL_DIR": "/no/such/legacy/dir",
+            },
+            clear=False,
+        ):
+            self.assertIsNone(build_default_predict_fn(exchange=None))
+
+
+@unittest.skipUnless(
+    Path("model_sanity/model.pt").exists(),
+    "model_sanity bundle not present in repo root",
+)
+class XGBoostPredictorIntegrationTests(unittest.TestCase):
+    """Train a tiny XGBoost model in a tempdir, wrap it, run end-to-end."""
+
+    def _make_synth_dataset(self, n: int = 500) -> "pd.DataFrame":
+        import pandas as pd
+
+        rng = np.random.default_rng(seed=11)
+        # Build features that match what compute_features actually produces
+        # so meta.feature_cols can reference them and the predictor's
+        # candle->feature path will recover them from real candles.
+        # We just need *some* known names. Pick a handful of common ones.
+        f = {
+            "return_5": rng.normal(0, 0.001, size=n),
+            "rv_60": rng.uniform(0.0001, 0.005, size=n),
+            "tod_sin": rng.uniform(-1, 1, size=n),
+        }
+        score = (
+            0.6 * f["return_5"] / 0.001
+            + 0.3 * (f["rv_60"] - 0.0025) / 0.001
+            + 0.1 * f["tod_sin"]
+        )
+        labels = (score > np.median(score)).astype(int)
+        timestamps = pd.date_range("2026-01-01", periods=n, freq="1min").astype(str)
+        return pd.DataFrame({"timestamp": timestamps, **f, "label": labels})
+
+    def _train_tiny_model(self, out_dir: Path) -> None:
+        import tempfile
+
+        from crypto_training.train_xgboost import train
+
+        df = self._make_synth_dataset(n=500)
+        with tempfile.TemporaryDirectory() as td:
+            ds_path = Path(td) / "ds.csv"
+            df.to_csv(ds_path, index=False)
+            train(
+                dataset_path=ds_path,
+                output_dir=out_dir,
+                val_frac=0.2,
+                test_frac=0.2,
+                xgb_kwargs={"n_estimators": 20, "max_depth": 3},
+            )
+
+    def test_xgb_predictor_loads_meta_and_returns_well_shaped_decision(self) -> None:
+        from predictor import XGBoostPredictor
+
+        candles = _synthetic_candles(n=400)
+        ex = _FakeExchange(candles)
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td) / "model_xgb"
+            self._train_tiny_model(model_dir)
+            predictor = XGBoostPredictor(
+                model_dir=str(model_dir),
+                exchange=ex,
+                thr_long=0.5,
+                warmup_bars=350,
+            )
+            fake_ticker = mock.MagicMock(symbol="ETH/USD")
+            side, conf = predictor("ETH/USD", fake_ticker)
+        self.assertIn(side, ("buy", "sell"))
+        self.assertGreaterEqual(conf, 0.0)
+        self.assertLessEqual(conf, 1.0)
+        self.assertGreaterEqual(len(ex.calls), 1)
+
+    def test_xgb_predictor_returns_neutral_below_thr_long(self) -> None:
+        from predictor import XGBoostPredictor
+
+        candles = _synthetic_candles(n=400)
+        ex = _FakeExchange(candles)
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td) / "model_xgb"
+            self._train_tiny_model(model_dir)
+            # Set thr_long very high so almost no real prediction can clear
+            # it -- we expect the safe-default neutral.
+            predictor = XGBoostPredictor(
+                model_dir=str(model_dir),
+                exchange=ex,
+                thr_long=0.99,
+                warmup_bars=350,
+            )
+            fake_ticker = mock.MagicMock(symbol="ETH/USD")
+            side, conf = predictor("ETH/USD", fake_ticker)
+        self.assertEqual((side, conf), ("buy", 0.5))
+
+    def test_xgb_predictor_returns_neutral_on_insufficient_history(self) -> None:
+        from predictor import XGBoostPredictor
+
+        candles = _synthetic_candles(n=50)
+        ex = _FakeExchange(candles)
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td) / "model_xgb"
+            self._train_tiny_model(model_dir)
+            predictor = XGBoostPredictor(
+                model_dir=str(model_dir), exchange=ex, thr_long=0.5
+            )
+            fake_ticker = mock.MagicMock(symbol="ETH/USD")
+            side, conf = predictor("ETH/USD", fake_ticker)
+        self.assertEqual((side, conf), ("buy", 0.5))
+
+    def test_xgb_predictor_raises_when_meta_missing(self) -> None:
+        from predictor import XGBoostPredictor
+
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td) / "missing"
+            model_dir.mkdir()
+            with self.assertRaises(FileNotFoundError):
+                XGBoostPredictor(model_dir=str(model_dir), exchange=None)
 
 
 if __name__ == "__main__":
