@@ -197,6 +197,27 @@ class LegacyTransformerPredictor:
         probs = probs_t.squeeze(0).detach().cpu().numpy()
         if probs.ndim == 0:
             probs = np.array([float(probs)])
+        # Operator-visible: surface the raw class probabilities so threshold
+        # tuning is data-driven. Logged once per minute (buffer refresh
+        # cadence).
+        if probs.size >= 3:
+            LOGGER.info(
+                "transformer predictor: %s P(short)=%.3f P(hold)=%.3f "
+                "P(long)=%.3f (thr_long=%.2f thr_short=%.2f)",
+                symbol,
+                float(probs[0]),
+                float(probs[1]),
+                float(probs[2]),
+                self.thr_long,
+                self.thr_short,
+            )
+        elif probs.size == 2:
+            LOGGER.info(
+                "transformer predictor: %s P(short)=%.3f P(long)=%.3f",
+                symbol,
+                float(probs[0]),
+                float(probs[1]),
+            )
         return probs
 
     # ------------------------------------------------------------------
@@ -370,8 +391,19 @@ class XGBoostPredictor:
         latest = feats[self.feature_cols].iloc[-1:].astype("float32")
         if latest.isna().any().any():
             latest = latest.fillna(0.0)
-        proba = self.model.predict_proba(latest.to_numpy())[0, 1]
-        return float(proba)
+        proba = float(self.model.predict_proba(latest.to_numpy())[0, 1])
+        # Operator-visible: surface the raw probability so threshold tuning
+        # is data-driven, not guesswork. One line per minute (buffer only
+        # refreshes on minute boundary).
+        verdict = "trigger" if proba >= self.thr_long else "neutral"
+        LOGGER.info(
+            "xgb predictor: %s P(long)=%.3f (thr=%.2f -> %s)",
+            symbol,
+            proba,
+            self.thr_long,
+            verdict,
+        )
+        return proba
 
 
 def build_default_predict_fn(exchange: Any) -> Optional[Any]:

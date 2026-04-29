@@ -1170,7 +1170,51 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Run a single iteration and exit (cron-friendly).",
     )
+    p.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help=(
+            "If set, save this run's outputs to a timestamped subdirectory "
+            "under here (supervisor.log + summary.json or ticks.json). "
+            "Recommended: --log-dir runs"
+        ),
+    )
     return p.parse_args(argv)
+
+
+def _setup_run_dir(
+    log_dir: Optional[str],
+    *,
+    symbols: List[str],
+    now_utc: Optional[datetime] = None,
+) -> Optional[Path]:
+    """If ``log_dir`` is set, create ``<log_dir>/<ts>_<symbols>/`` and attach
+    a file handler to the root logger so every LOGGER call lands in
+    ``supervisor.log``. Returns the run directory path or ``None``.
+    """
+    if not log_dir:
+        return None
+    now_utc = now_utc or datetime.now(timezone.utc)
+    safe_symbols = ",".join(sym.replace("/", "-") for sym in symbols) or "run"
+    ts = now_utc.strftime("%Y-%m-%dT%H-%M-%SZ")
+    run_dir = Path(log_dir).expanduser().resolve() / f"{ts}_{safe_symbols}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = run_dir / "supervisor.log"
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    root = logging.getLogger()
+    root.addHandler(handler)
+    # Make sure the root level lets INFO through. main() already calls
+    # basicConfig with level=INFO, but tests + non-CLI callers might not.
+    if root.level == logging.NOTSET or root.level > logging.INFO:
+        root.setLevel(logging.INFO)
+    LOGGER.info("supervisor: saving run outputs to %s", run_dir)
+    return run_dir
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1268,13 +1312,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         metrics_pusher=metrics_pusher,
     )
 
+    run_dir = _setup_run_dir(args.log_dir, symbols=symbols)
+
     if args.once:
         ticks = supervisor.run_once()
-        print(json.dumps([t.model_dump(mode="json") for t in ticks], indent=2))
+        ticks_payload = [t.model_dump(mode="json") for t in ticks]
+        print(json.dumps(ticks_payload, indent=2))
+        if run_dir is not None:
+            (run_dir / "ticks.json").write_text(
+                json.dumps(ticks_payload, indent=2), encoding="utf-8"
+            )
+            LOGGER.info("supervisor: wrote %s/ticks.json", run_dir)
         return 0
 
     summary = supervisor.run_loop()
     print(json.dumps(summary, indent=2))
+    if run_dir is not None:
+        (run_dir / "summary.json").write_text(
+            json.dumps(summary, indent=2), encoding="utf-8"
+        )
+        LOGGER.info("supervisor: wrote %s/summary.json", run_dir)
     return 0
 
 

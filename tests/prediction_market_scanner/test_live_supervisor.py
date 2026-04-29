@@ -824,5 +824,47 @@ class TestPerSymbolShakedown(unittest.TestCase):
         )
 
 
+class TestRunDirOutputSaving(unittest.TestCase):
+    """``--log-dir`` flag creates a timestamped subdir + FileHandler."""
+
+    def test_setup_run_dir_returns_none_when_unset(self) -> None:
+        from live_supervisor import _setup_run_dir
+
+        self.assertIsNone(_setup_run_dir(None, symbols=["ETH/USD"]))
+        self.assertIsNone(_setup_run_dir("", symbols=["ETH/USD"]))
+
+    def test_setup_run_dir_creates_timestamped_subdir(self) -> None:
+        from live_supervisor import _setup_run_dir
+
+        with tempfile.TemporaryDirectory() as td:
+            now = datetime(2026, 4, 29, 15, 30, 0, tzinfo=timezone.utc)
+            run_dir = _setup_run_dir(
+                td, symbols=["ETH/USD", "BTC/USD"], now_utc=now
+            )
+            self.assertIsNotNone(run_dir)
+            assert run_dir is not None
+            # Subdir name embeds the timestamp + sanitized symbols.
+            self.assertIn("2026-04-29T15-30-00Z", run_dir.name)
+            self.assertIn("ETH-USD", run_dir.name)
+            self.assertIn("BTC-USD", run_dir.name)
+            self.assertTrue(run_dir.exists())
+            # FileHandler attached -- write a log line, confirm it lands.
+            import logging as _logging
+
+            _logging.getLogger("live_supervisor").info("hello-from-test")
+            log_path = run_dir / "supervisor.log"
+            self.assertTrue(log_path.exists())
+            self.assertIn("hello-from-test", log_path.read_text(encoding="utf-8"))
+            # Cleanup: remove the FileHandler we added so subsequent tests
+            # don't accumulate handlers.
+            root = _logging.getLogger()
+            for h in list(root.handlers):
+                if isinstance(h, _logging.FileHandler) and str(log_path) in str(
+                    h.baseFilename
+                ):
+                    root.removeHandler(h)
+                    h.close()
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
