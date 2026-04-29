@@ -406,14 +406,129 @@ class XGBoostPredictor:
         return proba
 
 
-def build_default_predict_fn(exchange: Any) -> Optional[Any]:
-    """Try XGBoost first (``CRYPTO_MODEL_DIR``), fall back to the legacy
-    transformer (``LEGACY_MODEL_DIR``), fall back to None (placeholder).
+class MultiSymbolXGBoostPredictor:
+    """Per-symbol XGBoost models behind one supervisor predict_fn.
 
-    The supervisor wires this in ``main()`` and falls back to its
-    placeholder predictor if this returns ``None``.
+    Wraps multiple ``XGBoostPredictor`` instances keyed by symbol so each
+    symbol can use its own trained model + per-symbol threshold. Required
+    when the booster's probability range differs by symbol (BTC tops at
+    0.34, ETH at 0.67 even on the same timestamp), making one global
+    threshold useless.
+
+    Map format (env CRYPTO_MODEL_MAP):
+        "ETH/USD=model_crypto/eth_usd_v1:0.50,BTC/USD=model_crypto/btc_usd_v1:0.30"
+    The ``:thr`` suffix on each entry is optional; if omitted, the
+    predictor's default ``thr_long`` is used.
+
+    Symbols with no entry in the map raise ``KeyError`` at predict time
+    (rather than silently using the wrong model).
     """
-    # 1. XGBoost (preferred when present -- USD-native model).
+
+    def __init__(self, *, model_map: Dict[str, "XGBoostPredictor"]) -> None:
+        if not model_map:
+            raise ValueError("model_map cannot be empty")
+        self.model_map = model_map
+        LOGGER.info(
+            "MultiSymbolXGBoostPredictor ready for %d symbol(s): %s",
+            len(model_map),
+            ", ".join(sorted(model_map.keys())),
+        )
+
+    def __call__(
+        self, symbol: str, ticker: Any
+    ) -> Tuple[Literal["buy", "sell"], float]:
+        predictor = self.model_map.get(symbol)
+        if predictor is None:
+            LOGGER.warning(
+                "multi-symbol predictor: no model wired for %s; returning neutral",
+                symbol,
+            )
+            return _NEUTRAL_RESULT
+        return predictor(symbol, ticker)
+
+
+def _parse_crypto_model_map(raw: str) -> Dict[str, Tuple[str, Optional[float]]]:
+    """Parse ``"ETH/USD=path:0.5,BTC/USD=path"`` -> ``{symbol: (path, thr_or_None)}``.
+
+    Empty / blank input returns ``{}``. Malformed entries are dropped with
+    a warning so a single bad config line doesn't kill the whole map.
+    """
+    out: Dict[str, Tuple[str, Optional[float]]] = {}
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            LOGGER.warning(
+                "CRYPTO_MODEL_MAP: skipping malformed entry %r (no '=')", entry
+            )
+            continue
+        sym, _, rhs = entry.partition("=")
+        sym = sym.strip()
+        rhs = rhs.strip()
+        thr: Optional[float] = None
+        if ":" in rhs:
+            path, _, thr_str = rhs.rpartition(":")
+            try:
+                thr = float(thr_str)
+            except ValueError:
+                LOGGER.warning(
+                    "CRYPTO_MODEL_MAP: %s has invalid threshold %r; using default",
+                    sym,
+                    thr_str,
+                )
+                path = rhs  # treat the whole rhs as path, no threshold
+        else:
+            path = rhs
+        if not sym or not path:
+            LOGGER.warning("CRYPTO_MODEL_MAP: skipping incomplete entry %r", entry)
+            continue
+        out[sym] = (path, thr)
+    return out
+
+
+def build_default_predict_fn(exchange: Any) -> Optional[Any]:
+    """Predictor selection priority:
+    1. ``CRYPTO_MODEL_MAP`` -- multi-symbol XGBoost (one model per symbol)
+    2. ``CRYPTO_MODEL_DIR`` -- single XGBoost model used for every symbol
+    3. ``LEGACY_MODEL_DIR`` -- transformer in ``model_sanity/``
+    4. ``None`` -- supervisor falls back to its neutral placeholder.
+
+    The supervisor wires this in ``main()`` and never crashes on load
+    failures; it falls back to the placeholder if every option fails.
+    """
+    # 1. Multi-symbol XGBoost map.
+    raw_map = os.getenv("CRYPTO_MODEL_MAP", "").strip()
+    if raw_map:
+        parsed = _parse_crypto_model_map(raw_map)
+        loaded: Dict[str, XGBoostPredictor] = {}
+        for sym, (path, thr) in parsed.items():
+            if not Path(path).expanduser().exists():
+                LOGGER.warning(
+                    "predictor: %s model dir %s missing; symbol will be neutral",
+                    sym,
+                    path,
+                )
+                continue
+            try:
+                eff_thr = thr if thr is not None else 0.5
+                loaded[sym] = XGBoostPredictor(
+                    model_dir=path, exchange=exchange, thr_long=eff_thr
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "predictor: %s model load from %s failed (%s); skipping",
+                    sym,
+                    path,
+                    exc,
+                )
+        if loaded:
+            return MultiSymbolXGBoostPredictor(model_map=loaded)
+        LOGGER.warning(
+            "predictor: CRYPTO_MODEL_MAP set but no models loaded; falling back"
+        )
+
+    # 2. Single XGBoost (preferred when present -- USD-native model).
     crypto_dir = os.getenv("CRYPTO_MODEL_DIR", "").strip()
     if crypto_dir and Path(crypto_dir).expanduser().exists():
         try:

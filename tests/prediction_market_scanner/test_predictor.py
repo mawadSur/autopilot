@@ -346,5 +346,86 @@ class XGBoostPredictorIntegrationTests(unittest.TestCase):
                 XGBoostPredictor(model_dir=str(model_dir), exchange=None)
 
 
+class MultiSymbolMapParseTests(unittest.TestCase):
+    """``_parse_crypto_model_map`` quote-handling + malformed-entry fallback."""
+
+    def test_parse_simple(self) -> None:
+        from predictor import _parse_crypto_model_map
+
+        m = _parse_crypto_model_map(
+            "ETH/USD=model_crypto/eth_usd_v1,BTC/USD=model_crypto/btc_usd_v1"
+        )
+        self.assertEqual(set(m.keys()), {"ETH/USD", "BTC/USD"})
+        self.assertEqual(m["ETH/USD"], ("model_crypto/eth_usd_v1", None))
+
+    def test_parse_with_thresholds(self) -> None:
+        from predictor import _parse_crypto_model_map
+
+        m = _parse_crypto_model_map(
+            "ETH/USD=model_crypto/eth_usd_v1:0.50,BTC/USD=model_crypto/btc_usd_v1:0.30"
+        )
+        self.assertAlmostEqual(m["ETH/USD"][1], 0.50)
+        self.assertAlmostEqual(m["BTC/USD"][1], 0.30)
+
+    def test_parse_skips_malformed_entries(self) -> None:
+        from predictor import _parse_crypto_model_map
+
+        m = _parse_crypto_model_map(
+            "ETH/USD=ok_dir,GARBAGE,=missing_sym,BTC/USD="
+        )
+        # Only ETH/USD survives; the rest are malformed.
+        self.assertEqual(list(m.keys()), ["ETH/USD"])
+
+    def test_parse_empty(self) -> None:
+        from predictor import _parse_crypto_model_map
+
+        self.assertEqual(_parse_crypto_model_map(""), {})
+        self.assertEqual(_parse_crypto_model_map("  "), {})
+
+
+class MultiSymbolPredictorRoutingTests(unittest.TestCase):
+    """Test that the multi-symbol predictor routes to the right per-symbol model."""
+
+    def test_routes_to_correct_predictor_per_symbol(self) -> None:
+        from predictor import MultiSymbolXGBoostPredictor
+
+        # Two stub predictors that record which symbol they were called with.
+        class _StubPredictor:
+            def __init__(self, label: str) -> None:
+                self.label = label
+                self.calls: List[str] = []
+
+            def __call__(self, symbol, ticker):
+                self.calls.append(symbol)
+                return ("buy", 0.99 if self.label == "eth" else 0.42)
+
+        eth_stub = _StubPredictor("eth")
+        btc_stub = _StubPredictor("btc")
+        multi = MultiSymbolXGBoostPredictor(
+            model_map={"ETH/USD": eth_stub, "BTC/USD": btc_stub}
+        )
+        # ETH call goes to eth_stub.
+        side_eth, conf_eth = multi("ETH/USD", None)
+        self.assertEqual((side_eth, conf_eth), ("buy", 0.99))
+        self.assertEqual(eth_stub.calls, ["ETH/USD"])
+        self.assertEqual(btc_stub.calls, [])
+        # BTC call goes to btc_stub.
+        multi("BTC/USD", None)
+        self.assertEqual(btc_stub.calls, ["BTC/USD"])
+
+    def test_unknown_symbol_returns_neutral(self) -> None:
+        from predictor import MultiSymbolXGBoostPredictor
+
+        multi = MultiSymbolXGBoostPredictor(model_map={"ETH/USD": object()})
+        side, conf = multi("DOGE/USD", None)
+        self.assertEqual((side, conf), ("buy", 0.5))
+
+    def test_empty_map_raises(self) -> None:
+        from predictor import MultiSymbolXGBoostPredictor
+
+        with self.assertRaises(ValueError):
+            MultiSymbolXGBoostPredictor(model_map={})
+
+
 if __name__ == "__main__":
     unittest.main()
