@@ -237,6 +237,13 @@ class ThresholdPrecedenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             model_dir = Path(td) / "bundle"
             _train_and_persist_tiny_bundle(model_dir)
+            # train() may have populated optimal_threshold via the
+            # Sharpe sweep (Lane B P1 #12). Strip it to test the pure
+            # "no meta override" fallback path.
+            meta_path = model_dir / "meta.json"
+            meta = json.loads(meta_path.read_text())
+            meta["optimal_threshold"] = None
+            meta_path.write_text(json.dumps(meta))
             p = XGBoostPredictor(model_dir=str(model_dir), exchange=None)
             self.assertAlmostEqual(p.thr_long, 0.5, places=6)
             self.assertEqual(p._thr_source, "default")

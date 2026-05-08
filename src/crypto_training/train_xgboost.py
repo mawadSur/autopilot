@@ -372,6 +372,64 @@ def _simulate_strategy_pnl(
     }
 
 
+def _sweep_thresholds_for_sharpe(
+    y_val: np.ndarray,
+    proba_val: np.ndarray,
+    *,
+    candidates: Optional[np.ndarray] = None,
+    fee_bps: float = 200.0,
+) -> Tuple[float, Dict[str, Dict[str, float]]]:
+    """Sweep thresholds, return ``(best_threshold, per_threshold_metrics)``.
+
+    For each candidate threshold, simulate a long-only PnL stream via
+    ``_simulate_strategy_pnl`` and pick the threshold that maximises
+    Sharpe (D2: Sharpe-weighted, NOT F1 -- a 60% win-rate at 5% gain
+    beats a 70% win-rate at 1% gain even though F1 favours the latter).
+
+    Edge cases:
+      * Degenerate inputs (all-zero or all-one labels) -> every
+        threshold's Sharpe is 0 / NaN. Default to 0.5 with a warning.
+      * Inf or NaN Sharpe values are filtered out before argmax.
+      * No candidate produces a finite positive Sharpe -> default 0.5.
+    """
+    if candidates is None:
+        candidates = np.linspace(0.3, 0.8, 11)
+    candidates = np.asarray(candidates, dtype=float)
+
+    per_threshold: Dict[str, Dict[str, float]] = {}
+    best_threshold = 0.5
+    # Track the best *positive* Sharpe. If every candidate produces a
+    # zero-or-negative Sharpe (e.g. all-zero labels), there's no
+    # profitable threshold to pick -- fall back to 0.5 with a warning
+    # rather than silently picking the "least bad" loss.
+    best_sharpe = -np.inf
+    has_positive = False
+    for thr in candidates:
+        m = _simulate_strategy_pnl(
+            y_val, proba_val, threshold=float(thr), fee_bps=fee_bps
+        )
+        per_threshold[f"{thr:.4f}"] = m
+        sharpe = m["sharpe"]
+        if not np.isfinite(sharpe) or m["n_trades"] < 1:
+            continue
+        if sharpe > best_sharpe:
+            best_sharpe = sharpe
+            best_threshold = float(thr)
+            if sharpe > 0:
+                has_positive = True
+
+    if not has_positive:
+        # No profitable candidate. Default to 0.5 + warn so the operator
+        # reviews the data instead of trusting a "least-bad-loss" pick.
+        LOGGER.warning(
+            "_sweep_thresholds_for_sharpe: no candidate produced a positive "
+            "Sharpe; defaulting threshold to 0.5"
+        )
+        best_threshold = 0.5
+
+    return best_threshold, per_threshold
+
+
 def _evaluate(
     y_true: np.ndarray, y_prob: np.ndarray, *, label_classes: List[int]
 ) -> Dict[str, float]:
@@ -484,6 +542,23 @@ def train(
     metrics_val = _evaluate(y_val, prob_val, label_classes=label_classes)
     metrics_test = _evaluate(y_test, prob_test, label_classes=label_classes)
 
+    # D2: Sharpe-weighted threshold optimization on the validation set.
+    # Multi-class doesn't have a clean long-only policy at this layer
+    # (long argmax? long the top-2 weighted average?), so threshold
+    # tuning is binary-only for now.
+    optimal_threshold: Optional[float] = None
+    threshold_metrics: Dict[str, Dict[str, float]] = {}
+    if len(label_classes) == 2:
+        optimal_threshold, threshold_metrics = _sweep_thresholds_for_sharpe(
+            y_val, prob_val
+        )
+        LOGGER.info(
+            "threshold sweep on val: optimal_threshold=%.3f "
+            "(out of %d candidates)",
+            optimal_threshold,
+            len(threshold_metrics),
+        )
+
     # Persist.
     output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -512,6 +587,11 @@ def train(
             "val": _class_distribution(y_val),
             "test": _class_distribution(y_test),
         },
+        # Sharpe-weighted optimal threshold (D2). The predictor adapter
+        # picks this up via ``meta.optimal_threshold`` unless the
+        # operator overrides via CRYPTO_MODEL_THR_LONG / map suffix.
+        "optimal_threshold": optimal_threshold,
+        "threshold_metrics": threshold_metrics,
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
