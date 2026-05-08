@@ -554,5 +554,64 @@ class PostmortemTriggerGateTests(unittest.TestCase):
         self.assertEqual(POSTMORTEM_LOSS_PCT_THRESHOLD, 0.005)
 
 
+# ---------------------------------------------------------------------------
+# Task 4: orphan-position telemetry
+# ---------------------------------------------------------------------------
+
+
+class OrphanCountTests(unittest.TestCase):
+    """``PositionStore.orphan_count()`` exposes drift surfaces for metrics."""
+
+    def setUp(self) -> None:
+        self.fake = fakeredis.FakeRedis(decode_responses=True)
+        self.store = PositionStore(redis_client=self.fake, namespace="test")
+
+    def test_orphan_count_zero_when_no_open_positions(self) -> None:
+        self.assertEqual(self.store.orphan_count(), 0)
+
+    def test_orphan_count_zero_for_clean_open_positions(self) -> None:
+        self.store.record_open(_new_position())
+        self.store.record_open(_new_position(symbol="BTC/USDT"))
+        self.assertEqual(self.store.orphan_count(), 0)
+
+    def test_orphan_count_flags_pending_positions_older_than_orphan_age(
+        self,
+    ) -> None:
+        # Pending position with an opened_at_utc older than PENDING_ORPHAN_AGE
+        # is treated as an orphan candidate so the operator dashboard
+        # surfaces the drift before the next reconciliation pass.
+        old_iso = (
+            datetime.now(timezone.utc) - PENDING_ORPHAN_AGE - timedelta(minutes=1)
+        ).replace(microsecond=0).isoformat()
+        self.store.record_pending(
+            _new_position(status="pending", opened_at_utc=old_iso)
+        )
+        self.assertEqual(self.store.orphan_count(), 1)
+
+    def test_orphan_count_does_not_flag_fresh_pending_positions(self) -> None:
+        # A pending position younger than the orphan age is NOT an orphan;
+        # the fill confirmation may still arrive.
+        fresh_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        self.store.record_pending(
+            _new_position(status="pending", opened_at_utc=fresh_iso)
+        )
+        self.assertEqual(self.store.orphan_count(), 0)
+
+    def test_orphan_count_flags_open_positions_with_orphan_notes(self) -> None:
+        # An open position whose notes reference an orphan condition
+        # (eg. a manual orphan tag) is counted.
+        position = _new_position()
+        position = position.model_copy(update={"notes": "reconciled-orphan"})
+        # Persist directly so we can inject the note.
+        self.store._redis.set(
+            self.store._position_key(position.position_id),
+            position.model_dump_json(),
+        )
+        self.store._redis.sadd(
+            self.store._open_set_key, position.position_id
+        )
+        self.assertEqual(self.store.orphan_count(), 1)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

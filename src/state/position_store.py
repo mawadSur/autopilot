@@ -513,6 +513,43 @@ class PositionStore:
         )
 
     # ------------------------------------------------------------------
+    # Task 4: orphan-position telemetry
+    # ------------------------------------------------------------------
+    def orphan_count(self) -> int:
+        """Count currently-open positions that look like reconciled orphans.
+
+        ``PositionStore.reconcile`` rewrites stale ``pending`` positions
+        with ``status="closed"`` + ``notes="reconciled-orphan"`` — those
+        are NOT counted here (they're already closed). This helper counts
+        OPEN positions whose ``notes`` reference an orphan-tagged
+        condition, plus pending positions older than the orphan age, so
+        the operator dashboard can see drift surfaces in real time.
+
+        The reconciliation report (``ops.reconciliation``) is the
+        authoritative orphan view (it cross-checks the exchange); this
+        helper is a cheap, no-network gauge for Prometheus.
+        """
+        try:
+            opens = self.list_open()
+        except Exception:  # noqa: BLE001 - telemetry must never raise
+            return 0
+        now = _utc_now()
+        count = 0
+        for position in opens:
+            notes = (position.notes or "").lower()
+            if "orphan" in notes:
+                count += 1
+                continue
+            if position.status == "pending":
+                try:
+                    opened_at = _parse_iso_utc(position.opened_at_utc)
+                except (TypeError, ValueError):
+                    continue
+                if now - opened_at > PENDING_ORPHAN_AGE:
+                    count += 1
+        return count
+
+    # ------------------------------------------------------------------
     # reconcile
     # ------------------------------------------------------------------
     def reconcile(self, exchange: Any, *, now_utc: Optional[datetime] = None) -> Dict[str, Any]:
