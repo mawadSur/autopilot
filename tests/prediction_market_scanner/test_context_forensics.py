@@ -1,0 +1,475 @@
+"""Tests for :class:`loss_postmortem.context_forensics.ContextForensicsAgent`.
+
+Five scenarios (per the brief in autopilot_lane_e_swarm_briefs_2026_05_08.md):
+
+  (a) High-impact news in window → contributing
+  (b) Polymarket macro shift > 5pp → contributing
+  (c) Quiet market (no news, no macro shifts) → innocent
+  (d) LLM timeout → deterministic checks still emit, verdict driven by them
+  (e) Mocked clean state with stub Gemini caller → innocent
+
+Plus several supporting tests around:
+
+  - missing GEMINI_API_KEY → graceful degrade (no LLM bullet, no crash)
+  - missing signal snapshot → verdict="unknown" with explanatory error
+  - news fetch raising → "news fetch unavailable" bullet, no crash
+  - Polymarket fetch raising → "polymarket macro fetch unavailable" bullet
+  - 3+ red flags → verdict=primary_cause
+
+All external I/O (news fetch, Polymarket fetch, Gemini) is stubbed via
+constructor injection — no network calls in this suite.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+import unittest
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Sequence
+from unittest.mock import patch
+
+import fakeredis
+
+from loss_postmortem.context_forensics import (
+    HEADLINE_DENSITY_RED_FLAG,
+    ContextForensicsAgent,
+)
+from state.trade_context_store import TradeContextSnapshot, TradeContextStore
+
+
+# ---------------------------------------------------------------------------
+# Test helpers
+# ---------------------------------------------------------------------------
+
+
+TRADE_TIME = datetime(2026, 5, 8, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _store() -> TradeContextStore:
+    return TradeContextStore(
+        redis_client=fakeredis.FakeRedis(decode_responses=True),
+        namespace="test",
+    )
+
+
+def _signal_snapshot(
+    *,
+    trade_id: str = "trade-A4",
+    symbol: str = "BTC/USD",
+    captured_at: datetime = TRADE_TIME,
+    ticker_buffer: List[Dict[str, float]] | None = None,
+) -> TradeContextSnapshot:
+    return TradeContextSnapshot(
+        trade_id=trade_id,
+        symbol=symbol,
+        captured_at_utc=captured_at.isoformat(),
+        phase="signal",
+        feature_buffer={"feat_a": 1.0},
+        model_probs={"long": 0.62},
+        model_confidence=0.62,
+        ticker_buffer=ticker_buffer or [],
+    )
+
+
+def _headline(
+    *,
+    title: str,
+    published_at: datetime,
+) -> Dict[str, Any]:
+    return {
+        "title": title,
+        "link": "https://example.com/article",
+        "published": published_at.strftime("%a, %d %b %Y %H:%M:%S +0000"),
+        "published_iso": published_at.isoformat(),
+        "summary": "",
+    }
+
+
+class _StubNewsFetcher:
+    def __init__(self, headlines: Sequence[Dict[str, Any]]) -> None:
+        self._headlines = list(headlines)
+
+    def fetch_news(self) -> List[Dict[str, Any]]:
+        return list(self._headlines)
+
+
+def _news_factory(
+    headlines: Sequence[Dict[str, Any]],
+):
+    def factory(_query: str) -> _StubNewsFetcher:
+        return _StubNewsFetcher(headlines)
+
+    return factory
+
+
+def _raising_news_factory(_query: str) -> _StubNewsFetcher:
+    raise RuntimeError("simulated news outage")
+
+
+class _StubMarket:
+    """Light stand-in for src.models.Market — the agent only reads three attrs."""
+
+    def __init__(self, *, title: str, category: str, change_1h: float) -> None:
+        self.title = title
+        self.category = category
+        self.price_history = {"1h": float(change_1h), "6h": 0.0, "24h": 0.0}
+
+
+def _markets_fetcher(markets: Sequence[Any]):
+    def fetcher() -> Sequence[Any]:
+        return list(markets)
+
+    return fetcher
+
+
+def _raising_markets_fetcher() -> Sequence[Any]:
+    raise RuntimeError("simulated polymarket outage")
+
+
+def _stub_gemini(text: str = "Quiet news cycle around BTC/USD."):
+    def caller(_prompt: str) -> str:
+        return text
+
+    return caller
+
+
+def _hanging_gemini(seconds: float = 5.0):
+    def caller(_prompt: str) -> str:
+        time.sleep(seconds)
+        return "should never arrive"
+
+    return caller
+
+
+def _raising_gemini(_prompt: str) -> str:
+    raise RuntimeError("simulated Gemini failure")
+
+
+def _seed_signal(store: TradeContextStore, snap: TradeContextSnapshot) -> None:
+    store.record_snapshot(snap)
+
+
+# ---------------------------------------------------------------------------
+# Five core scenarios
+# ---------------------------------------------------------------------------
+
+
+class ContextForensicsCoreScenarios(unittest.TestCase):
+    """The five scenarios called out in the brief."""
+
+    def test_high_impact_news_in_window_yields_contributing(self) -> None:
+        """(a) > 5 headlines in the 1h window before the trade → contributing."""
+
+        store = _store()
+        snap = _signal_snapshot()
+        _seed_signal(store, snap)
+
+        # 7 headlines spread across the 1h pre-trade window (> threshold).
+        headlines = [
+            _headline(
+                title=f"Macro headline {i}",
+                published_at=TRADE_TIME - timedelta(minutes=10 + i * 5),
+            )
+            for i in range(7)
+        ]
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory(headlines),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini("Heavy news flow on BTC."),
+        )
+        finding = agent.investigate("trade-A4")
+        self.assertEqual(finding.agent, "context")
+        self.assertEqual(finding.verdict, "contributing")
+        self.assertGreaterEqual(finding.confidence, 0.4)
+        # Density red flag explicitly mentioned.
+        joined = " | ".join(finding.evidence)
+        self.assertIn(f"> {HEADLINE_DENSITY_RED_FLAG}", joined)
+        # Suggested action surfaces a feature request.
+        self.assertEqual(
+            (finding.suggested_action or {}).get("type"), "add_news_feature"
+        )
+
+    def test_polymarket_macro_shift_yields_contributing(self) -> None:
+        """(b) Macro market moved > 5pp in 1h → contributing."""
+
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+
+        markets = [
+            _StubMarket(
+                title="Will the Fed cut rates in May?",
+                category="Federal Reserve",
+                change_1h=0.08,  # 8pp move
+            ),
+            _StubMarket(  # category not macro → ignored
+                title="Will the Lakers win game 7?",
+                category="Sports",
+                change_1h=0.20,
+            ),
+        ]
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_markets_fetcher(markets),
+            gemini_caller=_stub_gemini(),
+        )
+        finding = agent.investigate("trade-A4")
+        self.assertEqual(finding.verdict, "contributing")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("Will the Fed cut rates", joined)
+        self.assertIn("8.0pp", joined)
+        # Sports market should NOT have been counted.
+        self.assertNotIn("Lakers", joined)
+
+    def test_quiet_market_yields_innocent(self) -> None:
+        """(c) No news, no macro shifts, no vol spike → innocent."""
+
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_markets_fetcher([
+                _StubMarket(
+                    title="Will SPX close above 5800?",
+                    category="Macro",
+                    change_1h=0.001,  # < 5pp → not flagged
+                )
+            ]),
+            gemini_caller=_stub_gemini(),
+        )
+        finding = agent.investigate("trade-A4")
+        self.assertEqual(finding.verdict, "innocent")
+        self.assertIsNone(finding.suggested_action)
+        joined = " | ".join(finding.evidence)
+        self.assertIn("no headlines", joined)
+        self.assertIn("no > 5pp shifts", joined)
+
+    def test_llm_timeout_does_not_lean_verdict_toward_primary(self) -> None:
+        """(d) Hanging Gemini call → deterministic checks still drive verdict.
+
+        The brief: "don't lean primary_cause just because LLM is unreachable".
+        We seed a single news headline (1 red flag worth) and let Gemini
+        hang. The verdict must follow the deterministic count (contributing
+        from the > 5 threshold not being hit means innocent here), and
+        crucially must NOT escalate to primary_cause due to the timeout.
+        """
+
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+
+        # One headline — under the > 5 threshold → 0 red flags from news.
+        headlines = [
+            _headline(
+                title="A single relevant headline",
+                published_at=TRADE_TIME - timedelta(minutes=20),
+            )
+        ]
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory(headlines),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_hanging_gemini(seconds=5.0),
+            gemini_timeout_s=0.05,  # tighten for fast test
+        )
+        finding = agent.investigate("trade-A4")
+        # 0 red flags → innocent (deterministic).
+        self.assertEqual(finding.verdict, "innocent")
+        self.assertIsNone(finding.error)
+        # No "LLM summary:" bullet should be present (timed out).
+        joined = " | ".join(finding.evidence)
+        self.assertNotIn("LLM summary:", joined)
+
+    def test_mocked_clean_state_with_stub_gemini_yields_innocent(self) -> None:
+        """(e) All inputs clean + working Gemini stub → innocent."""
+
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini("All quiet."),
+        )
+        finding = agent.investigate("trade-A4")
+        self.assertEqual(finding.verdict, "innocent")
+        self.assertIsNone(finding.error)
+
+
+# ---------------------------------------------------------------------------
+# Supporting tests around graceful degradation + edge cases
+# ---------------------------------------------------------------------------
+
+
+class ContextForensicsDegradationTests(unittest.TestCase):
+    def test_missing_signal_snapshot_yields_unknown(self) -> None:
+        store = _store()  # nothing seeded
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini(),
+        )
+        finding = agent.investigate("does-not-exist")
+        self.assertEqual(finding.verdict, "unknown")
+        self.assertEqual(finding.error, "missing_signal_snapshot")
+
+    def test_no_gemini_api_key_degrades_gracefully(self) -> None:
+        """When no API key + no injected caller, agent must not crash."""
+
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+
+        # Headlines fetched but well below the density red flag.
+        headlines = [
+            _headline(
+                title="One mild headline",
+                published_at=TRADE_TIME - timedelta(minutes=15),
+            )
+        ]
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory(headlines),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=None,  # use default which checks env
+        )
+        # Strip both possible env vars so the default caller bails out.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GEMINI_API_KEY", None)
+            os.environ.pop("GOOGLE_API_KEY", None)
+            finding = agent.investigate("trade-A4")
+        self.assertEqual(finding.verdict, "innocent")
+        self.assertIsNone(finding.error)
+        joined = " | ".join(finding.evidence)
+        # No LLM summary bullet should appear when the API key is missing.
+        self.assertNotIn("LLM summary:", joined)
+
+    def test_gemini_failure_does_not_escalate_verdict(self) -> None:
+        """Gemini raising mid-call must not push verdict above the deterministic floor."""
+
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+
+        headlines = [
+            _headline(
+                title="One single headline",
+                published_at=TRADE_TIME - timedelta(minutes=10),
+            )
+        ]
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory(headlines),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_raising_gemini,
+        )
+        finding = agent.investigate("trade-A4")
+        # 1 headline only → 0 red flags → innocent.
+        self.assertEqual(finding.verdict, "innocent")
+        joined = " | ".join(finding.evidence)
+        self.assertNotIn("LLM summary:", joined)
+
+    def test_news_fetch_failure_emits_unavailable_bullet(self) -> None:
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_raising_news_factory,
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini(),
+        )
+        finding = agent.investigate("trade-A4")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("news fetch unavailable", joined)
+        # Other checks should still complete.
+        self.assertIn("no > 5pp shifts", joined)
+
+    def test_polymarket_fetch_failure_emits_unavailable_bullet(self) -> None:
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_raising_markets_fetcher,
+            gemini_caller=_stub_gemini(),
+        )
+        finding = agent.investigate("trade-A4")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("polymarket macro fetch unavailable", joined)
+
+
+class ContextForensicsRedFlagAggregationTests(unittest.TestCase):
+    def test_three_red_flags_escalate_to_primary_cause(self) -> None:
+        """News density + macro shift + vol spike = 3 red flags → primary_cause."""
+
+        store = _store()
+        # Build a ticker buffer with a clear trailing spike: the median
+        # absolute delta is small (~1) and the last quarter contains a
+        # delta > 2x baseline (>= 5).
+        ticker_buffer: List[Dict[str, float]] = (
+            [{"price": 100.0 + (i % 2)} for i in range(12)]
+            + [{"price": 110.0}, {"price": 100.0}, {"price": 110.0}]
+        )
+        snap = _signal_snapshot(ticker_buffer=ticker_buffer)
+        _seed_signal(store, snap)
+
+        # 7 headlines → red flag #1
+        headlines = [
+            _headline(
+                title=f"Storm headline {i}",
+                published_at=TRADE_TIME - timedelta(minutes=5 + i * 4),
+            )
+            for i in range(7)
+        ]
+        # Macro market shifted 10pp → red flag #2
+        markets = [
+            _StubMarket(
+                title="Will inflation print > 3.5%?",
+                category="Macro",
+                change_1h=0.10,
+            )
+        ]
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory(headlines),
+            markets_fetcher=_markets_fetcher(markets),
+            gemini_caller=_stub_gemini("Volatile macro context."),
+        )
+        finding = agent.investigate("trade-A4")
+        self.assertEqual(finding.verdict, "primary_cause")
+        self.assertGreaterEqual(finding.confidence, 0.7)
+        # All three red flag bullets should be present.
+        joined = " | ".join(finding.evidence)
+        self.assertIn(f"> {HEADLINE_DENSITY_RED_FLAG}", joined)
+        self.assertIn("inflation", joined)
+        self.assertIn("baseline abs-delta", joined)
+
+
+# ---------------------------------------------------------------------------
+# safe_investigate integration (timeout / crash protection from base class)
+# ---------------------------------------------------------------------------
+
+
+class ContextForensicsSafeInvestigateTests(unittest.TestCase):
+    def test_safe_investigate_returns_finding_for_clean_run(self) -> None:
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini(),
+        )
+        finding = agent.safe_investigate("trade-A4")
+        self.assertEqual(finding.agent, "context")
+        self.assertEqual(finding.verdict, "innocent")
+        self.assertGreaterEqual(finding.runtime_s, 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
