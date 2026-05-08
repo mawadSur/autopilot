@@ -2998,6 +2998,33 @@ def _child_main_test_mode(
     force_daily_close = bool(child_config.get("test_force_daily_close"))
     tick_count_key = f"{namespace}:test:tick_count:{symbol}"
     leader_key_for_test = f"{namespace}:test:leader_winner:{symbol}"
+    # Filesystem-shared tick log: fakeredis is process-local so spawn-
+    # context children can't share Redis state with the parent's
+    # fakeredis. The acceptance test instead points every child at a
+    # shared temp dir and asserts on the files dropped there. Each tick
+    # appends a single line to ``<tick_log_dir>/<safe_symbol>.ticks``.
+    tick_log_dir_raw = child_config.get("test_tick_log_dir")
+    tick_log_path: Optional[Path] = None
+    if tick_log_dir_raw:
+        safe_symbol = str(symbol).replace("/", "-").replace(":", "_")
+        tick_log_path = Path(str(tick_log_dir_raw)) / f"{safe_symbol}.ticks"
+        try:
+            tick_log_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:  # noqa: BLE001 - test path is best-effort
+            tick_log_path = None
+    # Shutdown-signal file: lets the acceptance test verify that the
+    # child actually ran its shutdown branch (vs hitting max_ticks).
+    shutdown_log_dir_raw = child_config.get("test_shutdown_log_dir")
+    shutdown_signal_path: Optional[Path] = None
+    if shutdown_log_dir_raw:
+        safe_symbol = str(symbol).replace("/", "-").replace(":", "_")
+        shutdown_signal_path = (
+            Path(str(shutdown_log_dir_raw)) / f"{safe_symbol}.shutdown"
+        )
+        try:
+            shutdown_signal_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:  # noqa: BLE001
+            shutdown_signal_path = None
 
     log.info("test-child %s booted pid=%s max_ticks=%d", symbol, pid, max_ticks)
 
@@ -3012,9 +3039,11 @@ def _child_main_test_mode(
         pass
 
     ticks_done = 0
+    shutdown_observed = False
     try:
         while True:
             if _local_shutdown["requested"] or _check_shutdown_flag(redis_client):
+                shutdown_observed = True
                 log.info("test-child %s observed shutdown after %d ticks",
                          symbol, ticks_done)
                 break
@@ -3028,6 +3057,15 @@ def _child_main_test_mode(
                     redis_client.incr(tick_count_key)
                 except Exception as exc:  # noqa: BLE001 - test counter is best-effort
                     log.warning("test-child %s incr failed: %s", symbol, exc)
+            if tick_log_path is not None:
+                try:
+                    with tick_log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(
+                            f"{datetime.now(timezone.utc).isoformat()}\t"
+                            f"pid={pid}\ttick={ticks_done}\n"
+                        )
+                except Exception:  # noqa: BLE001 - filesystem is best-effort
+                    pass
 
             # Optional daily-close leader exercise: each child tries to
             # win the lease on its FIRST tick. The test asserts only one
@@ -3051,6 +3089,14 @@ def _child_main_test_mode(
     except Exception as exc:  # noqa: BLE001 - exit non-zero on crash
         log.exception("test-child %s crashed: %s", symbol, exc)
         return 1
+    finally:
+        if shutdown_observed and shutdown_signal_path is not None:
+            try:
+                shutdown_signal_path.write_text(
+                    f"pid={pid}\tticks={ticks_done}\n", encoding="utf-8"
+                )
+            except Exception:  # noqa: BLE001
+                pass
     return 0
 
 
