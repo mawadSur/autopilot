@@ -207,6 +207,51 @@ def _reliability_slope(y_true: np.ndarray, y_prob: np.ndarray, *, bins: int = 10
     return float(slope)
 
 
+def _compute_class_weights(y: np.ndarray) -> Dict[str, float]:
+    """Class-balancing weights for XGBoost.
+
+    For binary tasks: returns ``{"scale_pos_weight": count_neg / count_pos}``
+    (XGBoost's standard knob for imbalanced binary classification).
+
+    For multi-class: returns ``{"sample_weight_<k>": w_k}`` where
+    ``w_k = n / (n_classes * count_k)`` (sklearn's "balanced" recipe).
+    The trainer is binary today; multi-class entries are documented for
+    when a 3-class long/hold/short head is wired in.
+
+    Edge case: a single-class slice returns no scale_pos_weight (xgboost
+    can't fit anyway). The caller is expected to short-circuit.
+    """
+    arr = np.asarray(y, dtype=int)
+    classes, counts = np.unique(arr, return_counts=True)
+    if len(classes) < 2:
+        return {}
+    if len(classes) == 2:
+        # Standard XGBoost convention: scale_pos_weight = neg / pos.
+        # If labels aren't 0/1 we still treat the smaller-numbered class
+        # as the negative.
+        idx_neg = int(np.argmin(classes))
+        idx_pos = int(np.argmax(classes))
+        count_neg = float(counts[idx_neg])
+        count_pos = float(counts[idx_pos])
+        if count_pos == 0:
+            return {}
+        return {"scale_pos_weight": count_neg / count_pos}
+    # Multi-class: sklearn-style balanced weights, namespaced per class.
+    n = float(arr.size)
+    n_classes = float(len(classes))
+    return {
+        f"sample_weight_{int(c)}": n / (n_classes * float(cnt))
+        for c, cnt in zip(classes, counts)
+    }
+
+
+def _class_distribution(y: np.ndarray) -> Dict[str, int]:
+    """Count rows per class -- audited via meta.json on every train run."""
+    arr = np.asarray(y, dtype=int)
+    classes, counts = np.unique(arr, return_counts=True)
+    return {str(int(c)): int(cnt) for c, cnt in zip(classes, counts)}
+
+
 def _simulate_strategy_pnl(
     y_true: np.ndarray,
     proba: np.ndarray,
@@ -402,6 +447,18 @@ def train(
     booster_kwargs = dict(DEFAULT_XGB_KWARGS)
     if xgb_kwargs:
         booster_kwargs.update(xgb_kwargs)
+    # Class-balance the booster automatically. Operator-supplied
+    # scale_pos_weight wins so callers can override (e.g. tilt towards
+    # high-precision longs).
+    class_weights = _compute_class_weights(y_train)
+    for k, v in class_weights.items():
+        booster_kwargs.setdefault(k, v)
+    train_class_dist = _class_distribution(y_train)
+    LOGGER.info(
+        "train class distribution: %s ; class_weights: %s",
+        train_class_dist,
+        class_weights,
+    )
     booster = xgb.XGBClassifier(**booster_kwargs)
     booster.fit(X_train, y_train)
 
@@ -446,6 +503,15 @@ def train(
         "rows_test": int(len(test_df)),
         "metrics_val": metrics_val,
         "metrics_test": metrics_test,
+        # Audit trail: which scale_pos_weight (if any) was applied and
+        # what the train/val/test class counts looked like. Future runs
+        # can spot drift in label distribution.
+        "class_weights": class_weights,
+        "class_distribution": {
+            "train": train_class_dist,
+            "val": _class_distribution(y_val),
+            "test": _class_distribution(y_test),
+        },
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -521,7 +587,12 @@ def train_with_walk_forward_cv(
                 "walk-forward fold %d has single-class slice; skipping", i
             )
             continue
-        booster = xgb.XGBClassifier(**booster_kwargs)
+        # Per-fold class weights: each fold has its own training slice
+        # so reusing a global scale_pos_weight would be subtly wrong.
+        fold_kwargs = dict(booster_kwargs)
+        for k, v in _compute_class_weights(y_train).items():
+            fold_kwargs.setdefault(k, v)
+        booster = xgb.XGBClassifier(**fold_kwargs)
         booster.fit(X_train, y_train)
         calibrated = CalibratedClassifierCV(
             FrozenEstimator(booster), method=calibration_method

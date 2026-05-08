@@ -23,7 +23,9 @@ class RiskCalculatorTests(unittest.TestCase):
         )
 
     def test_calculates_raw_and_fractional_kelly_without_penalties(self):
-        calculator = RiskCalculator()
+        # Polymarket fees are now deducted by default (P1 #9). To exercise the
+        # pre-fee math this test always cared about, opt out with fee_bps=0.
+        calculator = RiskCalculator(polymarket_fee_bps=0)
 
         metrics = calculator.calculate_base_metrics(
             market=self._market(),

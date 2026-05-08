@@ -20,6 +20,10 @@ except Exception:
 # before importing `cfg`, e.g. `TRADING_CAPITAL=20000 python src/backtest.py`.
 
 FEATURE_VERSION = "v2026-02-119"
+# Polymarket charges a maker/taker fee on each trade (2% as of 2026-Q2).
+# Used by ``risk_management_agent.risk_engine`` to discount the calibrated
+# edge before it feeds Kelly sizing. Expressed in basis points.
+POLYMARKET_FEE_BPS: int = 200
 _CONFIG_DIR = Path(__file__).resolve().parent
 _ENV_FILES = (
     str(_CONFIG_DIR.parent / ".env"),
