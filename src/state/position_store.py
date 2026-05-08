@@ -53,11 +53,30 @@ import logging
 import os
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
 LOGGER = logging.getLogger(__name__)
+
+# Lane E E2: postmortem trigger threshold (D5).
+# A losing trade triggers the swarm when ``|loss| >= 0.5% * bankroll``
+# OR the trade was force-flatted by a circuit breaker / kill-switch.
+POSTMORTEM_LOSS_PCT_THRESHOLD = 0.005
+
+# Substrings on Position.notes that indicate a forced-flat close. Match the
+# breaker reasons live_supervisor + circuit_breakers emit today; new reasons
+# can be added here without touching the trigger logic.
+_FORCED_FLAT_NOTE_SIGNALS: tuple[str, ...] = (
+    "force_flat",
+    "forced_flat",
+    "force-flat",
+    "force_flatted",
+    "kill_switch",
+    "daily_loss_limit",
+    "halt_new_entries",
+    "reconciled-orphan",
+)
 
 REDIS_URL_ENV_VAR = "REDIS_URL"
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
@@ -136,9 +155,24 @@ class PositionStore:
         redis_url: Optional[str] = None,
         namespace: str = DEFAULT_NAMESPACE,
         redis_client: Any | None = None,
+        postmortem_queue: Optional[Any] = None,
+        bankroll_provider: Optional[Callable[[], float]] = None,
     ) -> None:
+        # Lane E E2 wiring (D5 trigger gate):
+        # ``postmortem_queue`` is any object with an ``enqueue(trade_id)``
+        # method (typically ``RedisPostmortemQueue`` from
+        # ``state.trade_context_store``). When None, the trigger evaluates
+        # but only logs — never raises — so existing callers keep working
+        # without code changes.
+        # ``bankroll_provider`` is a callable returning the current bankroll
+        # in USD. Chosen seam: callable, not a value, so a long-running
+        # supervisor can grow its bankroll over time and the trigger uses
+        # the current value at close time. ``record_close`` also accepts a
+        # ``bankroll_usd=`` keyword for explicit per-call override.
         self.namespace = namespace
         self._lock = threading.Lock()
+        self._postmortem_queue = postmortem_queue
+        self._bankroll_provider = bankroll_provider
 
         if redis_client is not None:
             self._redis = redis_client
@@ -260,12 +294,32 @@ class PositionStore:
         exit_price: float,
         exit_quote_usd: float,
         fees_usd: float = 0.0,
+        bankroll_usd: Optional[float] = None,
     ) -> Position:
         """Mark a position closed, compute realized PnL, move sets atomically.
 
         Adds ``fees_usd`` (the close-side fees) to the position's running total
         before computing PnL. Removes from ``open_set`` and adds to the
         UTC-dated ``closed:{date}`` set in the same ``MULTI/EXEC`` block.
+
+        Lane E E2 trigger gate (D5)
+        ----------------------------
+        After the close lands, evaluates whether the trade should be enqueued
+        for postmortem investigation. The condition is::
+
+            realized_pnl_usd < 0
+              AND (
+                |realized_pnl_usd| >= 0.005 * bankroll_usd
+                OR position.notes signals a forced flat
+              )
+
+        Bankroll is taken from (in priority order): the explicit
+        ``bankroll_usd=`` kwarg, then the constructor ``bankroll_provider``
+        callable. If neither is available we still trigger on the
+        forced-flat path (size-relative threshold can't be evaluated, but
+        the breaker-driven path is unambiguous). The enqueue itself is a
+        best-effort call — failures are logged, never raised, so a
+        misbehaving queue cannot prevent a close from completing.
         """
 
         existing = self.get(position_id)
@@ -303,7 +357,99 @@ class PositionStore:
             pipe.srem(self._open_set_key, position_id)
             pipe.sadd(self._closed_set_key(now), position_id)
             pipe.execute()
+
+        # Lane E E2 trigger gate (D5) — evaluate after the close has landed
+        # so a queue failure cannot strand the close write half-done.
+        self._maybe_enqueue_postmortem(updated, bankroll_usd=bankroll_usd)
         return updated
+
+    # ------------------------------------------------------------------
+    # Lane E E2: postmortem trigger gate
+    # ------------------------------------------------------------------
+    def _resolve_bankroll(
+        self, *, bankroll_usd: Optional[float]
+    ) -> Optional[float]:
+        """Pick the best available bankroll value for trigger evaluation."""
+        if bankroll_usd is not None:
+            try:
+                return float(bankroll_usd)
+            except (TypeError, ValueError):
+                return None
+        if self._bankroll_provider is not None:
+            try:
+                return float(self._bankroll_provider())
+            except Exception as exc:  # noqa: BLE001 - tolerate flaky providers
+                LOGGER.warning(
+                    "bankroll_provider raised during postmortem trigger eval: %r",
+                    exc,
+                )
+                return None
+        return None
+
+    @staticmethod
+    def _is_forced_flat(position: Position) -> bool:
+        notes = (position.notes or "").lower()
+        if not notes:
+            return False
+        return any(sig.lower() in notes for sig in _FORCED_FLAT_NOTE_SIGNALS)
+
+    def _should_enqueue_postmortem(
+        self, position: Position, *, bankroll_usd: Optional[float]
+    ) -> bool:
+        """Evaluate the D5 threshold-gated trigger. Pure function — no I/O."""
+        realized = position.realized_pnl_usd
+        if realized is None or realized >= 0:
+            return False  # winners and even-money closes never trigger
+        forced = self._is_forced_flat(position)
+        if forced:
+            return True
+        # Size-relative threshold path — needs a bankroll number to evaluate.
+        if bankroll_usd is None or bankroll_usd <= 0:
+            return False
+        return abs(float(realized)) >= POSTMORTEM_LOSS_PCT_THRESHOLD * float(
+            bankroll_usd
+        )
+
+    def _maybe_enqueue_postmortem(
+        self, position: Position, *, bankroll_usd: Optional[float] = None
+    ) -> bool:
+        """Evaluate the trigger and enqueue if it fires. Returns whether enqueued."""
+        try:
+            br = self._resolve_bankroll(bankroll_usd=bankroll_usd)
+            should_fire = self._should_enqueue_postmortem(
+                position, bankroll_usd=br
+            )
+        except Exception as exc:  # noqa: BLE001 - never let evaluation crash a close
+            LOGGER.warning(
+                "postmortem trigger evaluation crashed for %s: %r",
+                position.position_id,
+                exc,
+            )
+            return False
+
+        if not should_fire:
+            return False
+
+        if self._postmortem_queue is None:
+            LOGGER.debug(
+                "postmortem trigger fired for %s (pnl=%.4f forced=%s) "
+                "but no queue wired; skipping enqueue",
+                position.position_id,
+                float(position.realized_pnl_usd or 0.0),
+                self._is_forced_flat(position),
+            )
+            return False
+
+        try:
+            self._postmortem_queue.enqueue(position.position_id)
+        except Exception as exc:  # noqa: BLE001 - queue is best-effort
+            LOGGER.warning(
+                "postmortem queue enqueue failed for %s: %r",
+                position.position_id,
+                exc,
+            )
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # reads
@@ -582,6 +728,7 @@ __all__ = [
     "DEFAULT_NAMESPACE",
     "DEFAULT_REDIS_URL",
     "PENDING_ORPHAN_AGE",
+    "POSTMORTEM_LOSS_PCT_THRESHOLD",
     "Position",
     "PositionStatus",
     "PositionStore",

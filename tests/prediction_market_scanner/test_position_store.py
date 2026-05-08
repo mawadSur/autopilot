@@ -15,9 +15,23 @@ from pydantic import ValidationError
 
 from state.position_store import (
     PENDING_ORPHAN_AGE,
+    POSTMORTEM_LOSS_PCT_THRESHOLD,
     Position,
     PositionStore,
 )
+
+
+class _StubPostmortemQueue:
+    """In-memory PostmortemQueue stub for trigger-gate tests."""
+
+    def __init__(self, *, raise_on_enqueue: bool = False) -> None:
+        self.enqueued: list[str] = []
+        self._raise = raise_on_enqueue
+
+    def enqueue(self, trade_id: str) -> None:
+        if self._raise:
+            raise RuntimeError("simulated queue failure")
+        self.enqueued.append(trade_id)
 
 
 def _new_position(
@@ -359,6 +373,185 @@ class PositionStoreTests(unittest.TestCase):
             store_b.increment_error("ETH/USD")
         self.assertEqual(self.store.errors_today("ETH/USD"), 8)
         self.assertEqual(store_b.errors_today("ETH/USD"), 8)
+
+
+class PostmortemTriggerGateTests(unittest.TestCase):
+    """Lane E E2 trigger gate (D5).
+
+    The trigger fires on ``record_close`` when:
+      realized_pnl_usd < 0 AND
+        (|loss| >= 0.005 * bankroll OR forced_flat-style notes)
+    """
+
+    def setUp(self) -> None:
+        self.fake = fakeredis.FakeRedis(decode_responses=True)
+        self.queue = _StubPostmortemQueue()
+        # Provider returns a fixed bankroll so the threshold is deterministic.
+        self.bankroll_usd = 10_000.0
+        self.store = PositionStore(
+            redis_client=self.fake,
+            namespace="test",
+            postmortem_queue=self.queue,
+            bankroll_provider=lambda: self.bankroll_usd,
+        )
+
+    # --- (a) loss above threshold ------------------------------------
+    def test_trigger_fires_when_loss_meets_threshold(self) -> None:
+        # Loss of 0.5% * 10_000 = 50 USD threshold. Position long 100 → 95
+        # for base_size=10 yields -50 USD exactly.
+        pos = self.store.record_open(
+            _new_position(entry_price=100.0, base_size=10.0)
+        )
+        closed = self.store.record_close(
+            pos.position_id, exit_price=95.0, exit_quote_usd=950.0
+        )
+        self.assertLess(closed.realized_pnl_usd or 0.0, 0)
+        self.assertEqual(self.queue.enqueued, [pos.position_id])
+
+    def test_trigger_fires_when_loss_clearly_above_threshold(self) -> None:
+        pos = self.store.record_open(
+            _new_position(entry_price=100.0, base_size=10.0)
+        )
+        # 100 USD loss > 50 USD threshold.
+        self.store.record_close(
+            pos.position_id, exit_price=90.0, exit_quote_usd=900.0
+        )
+        self.assertEqual(self.queue.enqueued, [pos.position_id])
+
+    # --- (b) forced_flat path ----------------------------------------
+    def test_trigger_fires_when_forced_flat_regardless_of_loss_size(self) -> None:
+        pos = self.store.record_open(
+            _new_position(entry_price=100.0, base_size=1.0)
+        )
+        # Manually rewrite notes to simulate a force-flatted close — the loss
+        # is tiny (1 USD) but force-flat marks it as worth investigating.
+        with_notes = pos.model_copy(update={"notes": "force_flat:daily_loss"})
+        self.fake.set(
+            f"test:positions:{pos.position_id}",
+            with_notes.model_dump_json(),
+        )
+        self.store.record_close(
+            pos.position_id, exit_price=99.0, exit_quote_usd=99.0
+        )
+        self.assertEqual(self.queue.enqueued, [pos.position_id])
+
+    def test_forced_flat_detection_handles_kill_switch_note(self) -> None:
+        pos = self.store.record_open(
+            _new_position(entry_price=100.0, base_size=1.0)
+        )
+        with_notes = pos.model_copy(
+            update={"notes": "kill_switch trip — manual halt"}
+        )
+        self.fake.set(
+            f"test:positions:{pos.position_id}",
+            with_notes.model_dump_json(),
+        )
+        self.store.record_close(
+            pos.position_id, exit_price=99.0, exit_quote_usd=99.0
+        )
+        self.assertEqual(self.queue.enqueued, [pos.position_id])
+
+    def test_forced_flat_detection_handles_daily_loss_limit_note(self) -> None:
+        pos = self.store.record_open(
+            _new_position(entry_price=100.0, base_size=1.0)
+        )
+        with_notes = pos.model_copy(
+            update={"notes": "halt_new_entries: daily_loss_limit reached"}
+        )
+        self.fake.set(
+            f"test:positions:{pos.position_id}",
+            with_notes.model_dump_json(),
+        )
+        self.store.record_close(
+            pos.position_id, exit_price=99.5, exit_quote_usd=99.5
+        )
+        self.assertEqual(self.queue.enqueued, [pos.position_id])
+
+    # --- (c) profitable closes -----------------------------------------
+    def test_trigger_does_not_fire_on_profitable_close(self) -> None:
+        pos = self.store.record_open(
+            _new_position(entry_price=100.0, base_size=10.0)
+        )
+        closed = self.store.record_close(
+            pos.position_id, exit_price=110.0, exit_quote_usd=1100.0
+        )
+        self.assertGreater(closed.realized_pnl_usd or 0.0, 0)
+        self.assertEqual(self.queue.enqueued, [])
+
+    def test_trigger_does_not_fire_on_breakeven_close(self) -> None:
+        pos = self.store.record_open(
+            _new_position(entry_price=100.0, base_size=1.0)
+        )
+        self.store.record_close(
+            pos.position_id, exit_price=100.0, exit_quote_usd=100.0
+        )
+        self.assertEqual(self.queue.enqueued, [])
+
+    # --- (d) loss below threshold and not forced --------------------
+    def test_trigger_does_not_fire_on_small_non_forced_loss(self) -> None:
+        # Tiny loss: -1 USD on 10_000 bankroll = 0.01% << 0.5% threshold.
+        pos = self.store.record_open(
+            _new_position(entry_price=100.0, base_size=1.0)
+        )
+        closed = self.store.record_close(
+            pos.position_id, exit_price=99.0, exit_quote_usd=99.0
+        )
+        self.assertLess(closed.realized_pnl_usd or 0.0, 0)
+        self.assertEqual(self.queue.enqueued, [])
+
+    # --- (e) no queue -> no error -----------------------------------
+    def test_no_queue_wired_does_not_raise_on_qualifying_loss(self) -> None:
+        store = PositionStore(
+            redis_client=fakeredis.FakeRedis(decode_responses=True),
+            namespace="noqueue",
+            postmortem_queue=None,
+            bankroll_provider=lambda: 10_000.0,
+        )
+        pos = store.record_open(
+            _new_position(entry_price=100.0, base_size=10.0)
+        )
+        # Must not raise — debug log only.
+        closed = store.record_close(
+            pos.position_id, exit_price=90.0, exit_quote_usd=900.0
+        )
+        self.assertLess(closed.realized_pnl_usd or 0.0, 0)
+
+    def test_explicit_bankroll_kwarg_overrides_provider(self) -> None:
+        # Tiny bankroll override → 100 USD loss exceeds 0.5% threshold.
+        pos = self.store.record_open(
+            _new_position(entry_price=100.0, base_size=10.0)
+        )
+        self.store.record_close(
+            pos.position_id,
+            exit_price=99.0,
+            exit_quote_usd=990.0,
+            bankroll_usd=1_000.0,
+        )
+        # Loss is 10 USD; threshold = 0.5% * 1000 = 5 USD → triggers.
+        self.assertEqual(self.queue.enqueued, [pos.position_id])
+
+    def test_queue_enqueue_failure_does_not_break_record_close(self) -> None:
+        flaky_queue = _StubPostmortemQueue(raise_on_enqueue=True)
+        store = PositionStore(
+            redis_client=fakeredis.FakeRedis(decode_responses=True),
+            namespace="flaky",
+            postmortem_queue=flaky_queue,
+            bankroll_provider=lambda: 10_000.0,
+        )
+        pos = store.record_open(
+            _new_position(entry_price=100.0, base_size=10.0)
+        )
+        # The close itself must succeed even though the queue throws.
+        closed = store.record_close(
+            pos.position_id, exit_price=90.0, exit_quote_usd=900.0
+        )
+        self.assertEqual(closed.status, "closed")
+
+    def test_threshold_is_documented_constant(self) -> None:
+        # The 0.005 (0.5%) threshold is locked by D5 — pin it as a regression
+        # guard so a future refactor can't silently change the trigger
+        # sensitivity.
+        self.assertEqual(POSTMORTEM_LOSS_PCT_THRESHOLD, 0.005)
 
 
 if __name__ == "__main__":  # pragma: no cover
