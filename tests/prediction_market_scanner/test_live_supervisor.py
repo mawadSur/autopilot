@@ -1502,5 +1502,128 @@ class TestTradeContextSnapshotCapture(unittest.TestCase):
         self.assertEqual(ticks[0].action_taken, "allowed")
 
 
+# ---------------------------------------------------------------------------
+# Task 3: kill-switch auto-trip on N consecutive errors per symbol
+# ---------------------------------------------------------------------------
+
+
+class _StubMetricsPusherForAutoTrip:
+    def __init__(self) -> None:
+        self.gauge_calls: List[Dict[str, Any]] = []
+        self.counter_calls: List[Dict[str, Any]] = []
+        self.histogram_calls: List[Dict[str, Any]] = []
+
+    def is_enabled(self) -> bool:
+        return True
+
+    def gauge(self, name: str, value: float, labels: Optional[Dict[str, str]] = None) -> None:
+        self.gauge_calls.append({"name": name, "value": float(value), "labels": labels or {}})
+
+    def counter(
+        self, name: str, increment: float = 1.0, labels: Optional[Dict[str, str]] = None
+    ) -> None:
+        self.counter_calls.append(
+            {"name": name, "increment": float(increment), "labels": labels or {}}
+        )
+
+    def histogram(
+        self, name: str, value: float, labels: Optional[Dict[str, str]] = None
+    ) -> None:
+        self.histogram_calls.append(
+            {"name": name, "value": float(value), "labels": labels or {}}
+        )
+
+    def push(self) -> bool:
+        return True
+
+
+class TestConsecutiveErrorAutoTripsKillSwitch(unittest.TestCase):
+    """Task 3: 3 consecutive errors on one symbol must auto-trip the kill
+    switch (writes file, alerts, emits metric) while OTHER symbols are
+    left tradeable until they hit their own threshold.
+    """
+
+    def test_three_consecutive_errors_on_one_symbol_auto_trips_only_that_symbol(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            kill_switch_path = Path(td) / "kill.switch"
+
+            class _RealishCircuitBreakers:
+                """Real-shaped breaker stub exposing kill_switch_file."""
+
+                def __init__(self, ks_path: Path) -> None:
+                    self.kill_switch_file = ks_path
+                    self.daily_loss_limit_usd = None
+
+                def is_kill_switch_tripped(self) -> bool:
+                    return self.kill_switch_file.exists()
+
+                def check(self, ctx: DecisionContext) -> CircuitBreakerVerdict:
+                    return CircuitBreakerVerdict(
+                        allow=True,
+                        tripped=[],
+                        reason="",
+                        recommended_action="allow",
+                        details={},
+                    )
+
+            store = StubPositionStore()
+            breakers = _RealishCircuitBreakers(kill_switch_path)
+            notifier = StubNotifier()
+            pusher = _StubMetricsPusherForAutoTrip()
+
+            class _SelectiveExchange(StubExchange):
+                def get_ticker(self, symbol: str) -> Ticker:
+                    self.ticker_calls.append(symbol)
+                    if symbol == "ETH/USDT":
+                        raise ExchangeError("eth ticker fail")
+                    return StubTicker(symbol=symbol, mid=2_000.0)._inner
+
+            exchange = _SelectiveExchange()
+
+            sup, _refs = _build_supervisor(
+                symbols=["ETH/USDT", "BTC/USDT"],
+                exchange=exchange,
+                position_store=store,
+                circuit_breakers=breakers,
+                notifier=notifier,
+            )
+            sup.metrics_pusher = pusher
+
+            for _ in range(3):
+                sup.run_once()
+
+            self.assertTrue(
+                kill_switch_path.exists(),
+                "auto-trip must write the kill-switch file",
+            )
+            auto_trip_counters = [
+                c for c in pusher.counter_calls
+                if c["name"] == "auto_trip_total"
+                and c["labels"].get("symbol") == "ETH/USDT"
+            ]
+            self.assertEqual(
+                len(auto_trip_counters), 1,
+                f"expected one auto_trip_total for ETH, got {auto_trip_counters}",
+            )
+            self.assertEqual(
+                auto_trip_counters[0]["labels"].get("reason"),
+                "consecutive_errors",
+            )
+            btc_trips = [
+                c for c in pusher.counter_calls
+                if c["name"] == "auto_trip_total"
+                and c["labels"].get("symbol") == "BTC/USDT"
+            ]
+            self.assertEqual(len(btc_trips), 0)
+            self.assertTrue(
+                len(notifier.kill_switch_calls) >= 1,
+                "auto-trip must send the kill-switch alert",
+            )
+            self.assertIn("ETH/USDT", sup._auto_tripped_symbols)
+            self.assertNotIn("BTC/USDT", sup._auto_tripped_symbols)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
