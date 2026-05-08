@@ -442,6 +442,75 @@ ls -la ~/.autopilot_auto_paused 2>/dev/null
 rm ~/.autopilot_auto_paused
 ```
 
+#### Retrain all crypto models
+
+`scripts/retrain_all_crypto_models.sh` retrains the BTC/ETH/SOL XGBoost
+calibration bundles in-place and verifies that each emitted `meta.json`
+populates the `feature_means` + `feature_stds` fields required by A1
+SignalForensics' Mahalanobis OOD check. Estimated runtime: ~30-60 minutes
+on a developer machine.
+
+```bash
+# One-time after checkout (git tracks the executable bit but a fresh
+# clone from some hosts may need this).
+chmod +x scripts/retrain_all_crypto_models.sh
+
+# Run all three retrains; prints a per-symbol summary table at the end
+# (status / feature_means populated / feature_stds populated / AUC / slope).
+bash scripts/retrain_all_crypto_models.sh
+```
+
+The script does NOT push to origin; the operator commits the regenerated
+`model_crypto/<symbol>/` artefacts after spot-checking AUC and
+`reliability_slope` against the previous bundle.
+
+#### Grafana dashboard
+
+`observability/grafana_dashboard.json` is a v0 Grafana dashboard
+covering the Phase-16 metrics (tick duration, model confidence, order
+latency, daily PnL by symbol, shakedown clean-days, kill switch /
+auto-trip / auto-pause, reconciliation orphans/ghosts/drift, open
+positions). Default data-source UID is `prometheus`; rename via the
+Grafana UI or before import if your setup uses a different label.
+
+```bash
+# Import via the Grafana CLI (8.x+; replace --insecure with --token for
+# auth-aware setups).
+grafana-cli --homepath /usr/share/grafana dashboard import \
+    observability/grafana_dashboard.json
+
+# Or via the HTTP API.
+curl -s -X POST 'http://admin:admin@localhost:3000/api/dashboards/db' \
+    -H 'content-type: application/json' \
+    -d @observability/grafana_dashboard.json
+```
+
+Operator should sanity-check the panel queries against their Prometheus
+instance after import — the v0 dashboard ships with assumed query labels
+(`symbol`, `reason`) that may need adjusting.
+
+### Commit history notes
+
+A small audit-trail wart lives at commit `5ffbb91`. Its commit message
+reads "Lane E: loss-postmortem integration tests + 5 fixture scenarios"
+but the actual diff is **W1C Task 1** — auto-pause + confidence-history
+CLI wiring (3 files, +318 lines on `src/live_supervisor.py` and 2 test
+files). The mistitling was caused by a staging race during W1A's first
+commit attempt.
+
+The actual Lane E integration tests + 5 simulated-loss fixtures landed
+at commit `b8ed10b` ("Lane E: integration tests + 5 simulated-loss
+fixtures (W1A recovery)").
+
+Future archaeologists reading `git log` should treat `5ffbb91` as the
+canonical auto-pause CLI commit and `b8ed10b` as the canonical Lane E
+integration tests commit. The commits are functionally correct; the
+title swap was not rewritten because:
+1. The harness forbids `git rebase -i` (interactive flag).
+2. The branch is already pushed to origin, so a non-interactive
+   `git filter-branch` rewrite would force-push and is riskier than
+   the wart it would clean up.
+
 ### Loss Postmortem Swarm
 
 Every losing trade ≥0.5% of bankroll (or any breaker-forced-flat exit) triggers a 5-agent forensics swarm. The swarm runs as a separate process (or batch job) that drains the Redis queue `postmortem:queue` populated by the supervisor.
