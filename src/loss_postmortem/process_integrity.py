@@ -79,6 +79,14 @@ _STOPLOSS_PRICE_DRIFT_CONTRIB = 0.004
 # we say nothing.
 _RACE_CONCURRENCY_THRESHOLD = 5
 
+# Very-high cluster tier: at this level the per-symbol error counter is
+# extreme enough that the contention is the headline finding, not just
+# something to keep an eye on. W1A's integration test agent flagged that
+# A5 capped at "contributing" even on genuinely strong cluster signals
+# (e.g. counter=12 still produced only contributing). At >= 15 we promote
+# to ``primary_cause`` so the swarm can label root_cause="Process".
+_VERY_HIGH_RACE_CLUSTER = 15
+
 # Substrings on snapshots indicating paper-mode origin.
 _PAPER_MARKERS: tuple[str, ...] = (
     "paper",
@@ -187,6 +195,7 @@ class ProcessIntegrityAgent(BaseForensicsAgent):
                 "kill_switch_supposed_to_trip": flag_killswitch == "primary",
                 "breaker_decision_lost": flag_breaker == "primary",
                 "paper_live_divergence": flag_paper == "primary",
+                "race_extreme": flag_race == "primary",
             },
             contributing_flags={
                 "stop_drift": flag_stop == "contributing",
@@ -396,6 +405,14 @@ class ProcessIntegrityAgent(BaseForensicsAgent):
             count = int(raw)
         except (TypeError, ValueError):
             return None, None
+        if count >= _VERY_HIGH_RACE_CLUSTER:
+            # Extreme contention — this is the headline, not a side note.
+            return (
+                "primary",
+                f"extreme error contention (counter={count}) for {symbol} on "
+                f"{date_part} (>= {_VERY_HIGH_RACE_CLUSTER}); "
+                "concurrent error writes very likely the primary cause",
+            )
         if count >= _RACE_CONCURRENCY_THRESHOLD:
             return (
                 "contributing",
@@ -629,6 +646,12 @@ class ProcessIntegrityAgent(BaseForensicsAgent):
                 "type": "fix_paper_live_divergence",
                 "trade_id": trade_id,
             }
+        if primary_flags.get("race_extreme"):
+            return {
+                "type": "investigate_error_contention",
+                "trade_id": trade_id,
+                "details": "extreme error counter cluster — likely concurrency bug",
+            }
         return {"type": "investigate_breaker_log", "trade_id": trade_id}
 
     # ------------------------------------------------------------------
@@ -656,4 +679,8 @@ class ProcessIntegrityAgent(BaseForensicsAgent):
         return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
 
 
-__all__ = ["ProcessIntegrityAgent"]
+__all__ = [
+    "ProcessIntegrityAgent",
+    "_RACE_CONCURRENCY_THRESHOLD",
+    "_VERY_HIGH_RACE_CLUSTER",
+]

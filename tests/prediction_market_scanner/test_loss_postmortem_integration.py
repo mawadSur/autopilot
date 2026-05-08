@@ -408,19 +408,33 @@ class LossPostmortemIntegrationTests(unittest.TestCase):
         findings = _findings_by_agent(report)
         proc_finding = findings.get("process")
         self.assertIsNotNone(proc_finding, "process finding missing")
-        self.assertIn(
+        # With the W1A verdict-ladder tightening (counter >= 15 promotes
+        # to primary_cause) the canonical fixture seeds at the very-high
+        # tier so A5 returns primary_cause and the swarm's root_cause
+        # label includes "Process".
+        self.assertEqual(
             proc_finding.verdict,
-            {"contributing", "primary_cause"},
+            "primary_cause",
             msg=(
-                f"process expected contributing/primary_cause from race "
-                f"condition; got {proc_finding.verdict!r}. Evidence: "
+                f"process expected primary_cause from very-high race "
+                f"cluster; got {proc_finding.verdict!r}. Evidence: "
                 f"{proc_finding.evidence}"
+            ),
+        )
+        self.assertIn(
+            "Process",
+            report.root_cause,
+            msg=(
+                f"race_condition expected Process in root_cause; "
+                f"got {report.root_cause!r}. Findings: "
+                f"{[(f.agent, f.verdict) for f in report.findings]}"
             ),
         )
         # Verify the evidence references the race / error counter.
         joined = " ".join(proc_finding.evidence).lower()
         self.assertTrue(
-            "error counter" in joined or "concurrent" in joined or "race" in joined,
+            "error counter" in joined or "concurrent" in joined or "race" in joined
+            or "extreme error contention" in joined,
             msg=f"no race-related evidence bullet; got {proc_finding.evidence!r}",
         )
 

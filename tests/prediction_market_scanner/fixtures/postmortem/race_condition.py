@@ -3,18 +3,25 @@
 A losing trade where the per-symbol error counter is elevated, implying
 concurrent error writes on the same trade date. ProcessIntegrityAgent's
 ``_check_race_condition_trail`` reads the Redis HASH
-``{ns}:errors:by_symbol:{date}`` and, when the per-symbol counter is at
-or above ``_RACE_CONCURRENCY_THRESHOLD`` (5), emits a ``contributing``
-verdict with a race-related evidence bullet.
+``{ns}:errors:by_symbol:{date}`` and emits findings on a two-tier ladder:
+
+* counter >= ``_RACE_CONCURRENCY_THRESHOLD`` (5) → ``contributing``
+* counter >= ``_VERY_HIGH_RACE_CLUSTER`` (15) → ``primary_cause``
+
+This fixture seeds a counter at the **very-high** tier by default
+(``ERROR_COUNTER_VALUE = 18``) so the canonical integration scenario
+exercises the new primary tier and the swarm root_cause label resolves
+to "Process". Tests that want to assert the lower tier explicitly can
+pass ``error_counter_value=...`` to ``build_fixture``.
 
 To exercise that path we:
-1. Populate a fakeredis client's ``test:errors:by_symbol:2026-05-08``
-   hash with ``{symbol: "12"}`` (well above the threshold of 5).
+1. Populate a fakeredis client's ``{ns}:errors:by_symbol:2026-05-08``
+   hash with ``{symbol: str(error_counter_value)}``.
 2. Hand the same fakeredis client to the ProcessIntegrityAgent through
    the ``redis_client`` constructor arg.
 3. Wire a TradeContextSnapshot for the signal phase so A5 has a date +
    symbol anchor; nothing else needs to be inconsistent — the race
-   trail alone gives at least ``contributing``.
+   trail alone gives the verdict.
 
 Returned: trade_id (the test owns the redis_client / namespace and
 threads them into the agent factory itself).
@@ -33,7 +40,10 @@ from state.trade_context_store import TradeContextSnapshot, TradeContextStore
 
 SYMBOL = "ETH/USD"
 TRADE_ID = "fixture-race-condition-trade-1"
-ERROR_COUNTER_VALUE = 12  # >> _RACE_CONCURRENCY_THRESHOLD (5)
+# Default at the very-high cluster tier (>= _VERY_HIGH_RACE_CLUSTER = 15)
+# so the integration test's root_cause assertion reaches "Process".
+# Tests may override via the ``error_counter_value`` kwarg.
+ERROR_COUNTER_VALUE = 18  # >= _VERY_HIGH_RACE_CLUSTER (15) => primary_cause
 
 
 def build_fixture(
@@ -45,6 +55,7 @@ def build_fixture(
     symbol: str = SYMBOL,
     redis_client=None,
     namespace: str = "autopilot",
+    error_counter_value: int = ERROR_COUNTER_VALUE,
 ) -> str:
     """Populate stores + Redis error counter for a race-condition scenario.
 
@@ -85,7 +96,7 @@ def build_fixture(
         date_part = captured_at.astimezone(timezone.utc).strftime("%Y-%m-%d")
         key = f"{namespace}:errors:by_symbol:{date_part}"
         try:
-            redis_client.hset(key, symbol, str(ERROR_COUNTER_VALUE))
+            redis_client.hset(key, symbol, str(int(error_counter_value)))
         except Exception:  # noqa: BLE001 - tolerate odd client mocks
             pass
 

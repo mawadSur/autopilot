@@ -23,6 +23,7 @@ import fakeredis
 
 from loss_postmortem.process_integrity import (
     _RACE_CONCURRENCY_THRESHOLD,
+    _VERY_HIGH_RACE_CLUSTER,
     ProcessIntegrityAgent,
 )
 from state.trade_context_store import (
@@ -435,6 +436,71 @@ class ProcessIntegrityAgentTests(unittest.TestCase):
         finding = agent.investigate("trade-1")
         # The legacy trigger_price probe still works — primary cause.
         self.assertEqual(finding.verdict, "primary_cause")
+
+    # ---------------------------------------------------------------
+    # Race-condition verdict ladder (W1A tightening)
+    # ---------------------------------------------------------------
+    def _race_agent_with_counter(
+        self,
+        counter: int,
+        *,
+        symbol: str = "BTC/USD",
+    ) -> "ProcessIntegrityAgent":
+        """Helper: build A5 + seed Redis with a per-symbol error counter."""
+        redis_client = fakeredis.FakeRedis(decode_responses=True)
+        store = _store(redis_client=redis_client)
+        signal = _signal_snap(symbol=symbol, notes=None)
+        store.record_snapshot(signal)
+        store.record_snapshot(_fill_snap(symbol=symbol, notes="paper-deferred-fill"))
+        date_part = signal.captured_at_utc[:10]
+        err_key = f"test:errors:by_symbol:{date_part}"
+        if counter > 0:
+            redis_client.hset(err_key, symbol, str(int(counter)))
+        return ProcessIntegrityAgent(
+            context_store=store,
+            redis_client=redis_client,
+            namespace="test",
+        )
+
+    def test_race_counter_at_existing_threshold_stays_contributing(self) -> None:
+        """counter=5 (== _RACE_CONCURRENCY_THRESHOLD) → contributing (preserved)."""
+        agent = self._race_agent_with_counter(_RACE_CONCURRENCY_THRESHOLD)
+        finding = agent.investigate("trade-1")
+        self.assertEqual(finding.verdict, "contributing")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("error counter", joined)
+        # Existing-tier wording, NOT the new "extreme" wording.
+        self.assertNotIn("extreme error contention", joined)
+
+    def test_race_counter_at_very_high_cluster_promotes_to_primary(self) -> None:
+        """counter=15 (== _VERY_HIGH_RACE_CLUSTER) → primary_cause with extreme bullet."""
+        agent = self._race_agent_with_counter(_VERY_HIGH_RACE_CLUSTER)
+        finding = agent.investigate("trade-1")
+        self.assertEqual(finding.verdict, "primary_cause")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("extreme error contention", joined)
+        self.assertIn(f"counter={_VERY_HIGH_RACE_CLUSTER}", joined)
+        # Suggested action should point to the contention investigation path.
+        action = finding.suggested_action or {}
+        self.assertEqual(action.get("type"), "investigate_error_contention")
+
+    def test_race_counter_far_above_very_high_still_primary(self) -> None:
+        """counter=100 → primary_cause (no upper bound issue)."""
+        agent = self._race_agent_with_counter(100)
+        finding = agent.investigate("trade-1")
+        self.assertEqual(finding.verdict, "primary_cause")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("extreme error contention", joined)
+        self.assertIn("counter=100", joined)
+
+    def test_race_counter_zero_yields_innocent(self) -> None:
+        """counter=0 (no Redis entry) → innocent (preserved)."""
+        agent = self._race_agent_with_counter(0)
+        finding = agent.investigate("trade-1")
+        self.assertEqual(finding.verdict, "innocent")
+        joined = " | ".join(finding.evidence)
+        self.assertNotIn("extreme error contention", joined)
+        self.assertNotIn("error counter", joined)
 
     def test_safe_investigate_swallows_store_failure(self) -> None:
         class _ExplodingStore:
