@@ -252,6 +252,64 @@ def _class_distribution(y: np.ndarray) -> Dict[str, int]:
     return {str(int(c)): int(cnt) for c, cnt in zip(classes, counts)}
 
 
+def _compute_feature_stats(
+    df: pd.DataFrame, feature_cols: List[str]
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Compute per-feature mean + std over the training slice.
+
+    Persisted into ``meta.json`` so A1 SignalForensics can run the
+    Mahalanobis distance check between training distribution and the
+    feature buffer recorded at signal time.
+
+    Edge cases handled:
+
+      * NaN values in a column are dropped before the per-column stats
+        are computed (so a single bad bar doesn't poison the whole
+        column's mean/std). Empty columns post-NaN-drop record mean=0.0,
+        std=1.0 so the downstream Mahalanobis math doesn't divide by zero.
+      * Constant columns (std == 0 in numpy's ddof=0 sense) are bumped to
+        ``std=1e-9`` so a feature buffer that perfectly matches the
+        training mean still produces a finite distance contribution. The
+        Tasks brief flags this as a "dead feature" -- preserving the raw
+        zero would make tests easier but obscure the real issue, so we
+        log a warning AND store the small floor.
+      * Non-numeric / missing-from-df columns are silently skipped. The
+        meta.json call site already only writes columns that survived
+        ``df[feature_cols]`` selection, so this is a belt-and-braces
+        guard.
+    """
+    means: Dict[str, float] = {}
+    stds: Dict[str, float] = {}
+    dead_cols: List[str] = []
+    for col in feature_cols:
+        if col not in df.columns:
+            continue
+        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        if series.empty:
+            means[col] = 0.0
+            stds[col] = 1.0
+            continue
+        mu = float(series.mean())
+        sigma = float(series.std(ddof=0))
+        if not np.isfinite(mu):
+            mu = 0.0
+        if not np.isfinite(sigma) or sigma == 0.0:
+            # Dead feature -- never varies. Floor to a tiny non-zero so
+            # downstream A1 Mahalanobis math (z = (x - mu) / sigma) is
+            # finite. Tests assert >0 to flag dead features.
+            sigma = 1e-9
+            dead_cols.append(col)
+        means[col] = mu
+        stds[col] = sigma
+    if dead_cols:
+        LOGGER.warning(
+            "feature_stats: %d dead feature(s) (std=0) flagged: %s",
+            len(dead_cols),
+            dead_cols[:8],
+        )
+    return means, stds
+
+
 def _simulate_strategy_pnl(
     y_true: np.ndarray,
     proba: np.ndarray,
@@ -559,6 +617,12 @@ def train(
             len(threshold_metrics),
         )
 
+    # Per-feature training-set distribution stats. A1 SignalForensics uses
+    # these to compute Mahalanobis distance between the latest signal-time
+    # feature buffer and the training distribution; without them the check
+    # silently skips on every real meta file.
+    feature_means, feature_stds = _compute_feature_stats(train_df, feature_cols)
+
     # Persist.
     output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -592,6 +656,12 @@ def train(
         # operator overrides via CRYPTO_MODEL_THR_LONG / map suffix.
         "optimal_threshold": optimal_threshold,
         "threshold_metrics": threshold_metrics,
+        # Training-distribution stats for A1 Mahalanobis check.
+        # signal_forensics._extract_means_stds() reads the dict-form
+        # ``feature_means`` / ``feature_stds`` first; we use exactly that
+        # shape so the consumer needs no changes.
+        "feature_means": feature_means,
+        "feature_stds": feature_stds,
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 

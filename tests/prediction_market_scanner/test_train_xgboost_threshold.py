@@ -183,5 +183,180 @@ class XGBoostPredictorReadsMetaThresholdTests(unittest.TestCase):
             self.assertEqual(p2._thr_source, "explicit")
 
 
+class TrainPersistsFeatureStatsTests(unittest.TestCase):
+    """meta.json carries feature_means + feature_stds for A1 Mahalanobis.
+
+    Closes the second SignalForensics gap (Lane B / A1): without per-feature
+    training-distribution stats in meta.json, A1's Mahalanobis check silently
+    skips on every real meta file.
+    """
+
+    def test_meta_carries_feature_means_and_stds(self) -> None:
+        df = _signal_dataset(n=900)
+        with tempfile.TemporaryDirectory() as td:
+            ds_path = Path(td) / "ds.csv"
+            df.to_csv(ds_path, index=False)
+            out_dir = Path(td) / "model"
+            train(
+                dataset_path=ds_path,
+                output_dir=out_dir,
+                val_frac=0.2,
+                test_frac=0.2,
+                xgb_kwargs={"n_estimators": 30, "max_depth": 3},
+            )
+            meta = json.loads((out_dir / "meta.json").read_text())
+
+        self.assertIn("feature_means", meta)
+        self.assertIn("feature_stds", meta)
+        feature_cols = meta["feature_cols"]
+        # One entry per training feature.
+        self.assertEqual(set(meta["feature_means"].keys()), set(feature_cols))
+        self.assertEqual(set(meta["feature_stds"].keys()), set(feature_cols))
+        # Means are finite floats.
+        for col in feature_cols:
+            mu = meta["feature_means"][col]
+            self.assertIsInstance(mu, float)
+            self.assertTrue(np.isfinite(mu))
+
+    def test_meta_feature_stds_are_strictly_positive(self) -> None:
+        # All-positive stds is the contract A1 relies on. A zero std means
+        # a dead feature -- the test should flag it as a failure so the
+        # trainer never silently emits a meta that would crash downstream.
+        df = _signal_dataset(n=900)
+        with tempfile.TemporaryDirectory() as td:
+            ds_path = Path(td) / "ds.csv"
+            df.to_csv(ds_path, index=False)
+            out_dir = Path(td) / "model"
+            train(
+                dataset_path=ds_path,
+                output_dir=out_dir,
+                val_frac=0.2,
+                test_frac=0.2,
+                xgb_kwargs={"n_estimators": 30, "max_depth": 3},
+            )
+            meta = json.loads((out_dir / "meta.json").read_text())
+
+        for col, sigma in meta["feature_stds"].items():
+            self.assertGreater(
+                sigma, 0.0, f"feature_stds[{col!r}] must be > 0 (dead feature)"
+            )
+            self.assertTrue(np.isfinite(sigma))
+
+    def test_dead_feature_is_flagged_with_floor_std(self) -> None:
+        # A constant column produces std=0 in plain numpy; the trainer
+        # should floor it to 1e-9 (so Mahalanobis math stays finite) AND
+        # emit a warning so the operator sees the dead feature.
+        import logging as _logging
+
+        n = 500
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.date_range(
+                    "2026-01-01", periods=n, freq="1min"
+                ).astype(str),
+                "f1": np.random.default_rng(0).normal(0, 1, size=n),
+                "f_dead": np.full(n, 0.5),  # constant -> std == 0
+                "label": np.random.default_rng(1).binomial(1, 0.5, size=n),
+            }
+        )
+        with tempfile.TemporaryDirectory() as td:
+            ds_path = Path(td) / "ds.csv"
+            df.to_csv(ds_path, index=False)
+            out_dir = Path(td) / "model"
+            with self.assertLogs(
+                "crypto_training.train_xgboost", level=_logging.WARNING
+            ) as cm:
+                train(
+                    dataset_path=ds_path,
+                    output_dir=out_dir,
+                    val_frac=0.2,
+                    test_frac=0.2,
+                    xgb_kwargs={"n_estimators": 20, "max_depth": 3},
+                )
+            meta = json.loads((out_dir / "meta.json").read_text())
+        # Floor applied -- still finite and positive (so A1's math survives).
+        self.assertGreater(meta["feature_stds"]["f_dead"], 0.0)
+        self.assertLess(meta["feature_stds"]["f_dead"], 1e-6)
+        # Warning fired with the dead feature name in the message.
+        self.assertTrue(any("f_dead" in msg for msg in cm.output))
+
+    def test_meta_round_trips_through_signal_forensics_extract(self) -> None:
+        # Direct end-to-end: trainer-written meta.json must be readable
+        # by signal_forensics._extract_means_stds without any adapter.
+        # This is the bug we're fixing -- if this test passes, A1's
+        # Mahalanobis check fires on a real meta file produced by the
+        # current trainer.
+        from loss_postmortem.signal_forensics import _extract_means_stds
+
+        df = _signal_dataset(n=900)
+        with tempfile.TemporaryDirectory() as td:
+            ds_path = Path(td) / "ds.csv"
+            df.to_csv(ds_path, index=False)
+            out_dir = Path(td) / "model"
+            train(
+                dataset_path=ds_path,
+                output_dir=out_dir,
+                val_frac=0.2,
+                test_frac=0.2,
+                xgb_kwargs={"n_estimators": 30, "max_depth": 3},
+            )
+            meta = json.loads((out_dir / "meta.json").read_text())
+
+        means, stds = _extract_means_stds(meta)
+        self.assertGreater(len(means), 0)
+        self.assertGreater(len(stds), 0)
+        self.assertEqual(set(means.keys()), set(stds.keys()))
+        # Every std picked up by the consumer must be > 0 (otherwise A1's
+        # divide-by-zero guard skips the feature).
+        for col, sigma in stds.items():
+            self.assertGreater(sigma, 0.0)
+
+
+class TrainThresholdMetricsHaveExpectedShapeTests(unittest.TestCase):
+    """``threshold_metrics`` retains the per-bin keys A1 expects.
+
+    Belt-and-braces: the trainer already writes ``threshold_metrics``
+    (Lane B P1 #12) but the format is the consumer surface for A1's
+    reliability-bin check. If anyone changes the keys in the future,
+    this test fails before the consumer silently skips.
+    """
+
+    def test_threshold_metrics_keys_are_consumer_compatible(self) -> None:
+        df = _signal_dataset(n=900)
+        with tempfile.TemporaryDirectory() as td:
+            ds_path = Path(td) / "ds.csv"
+            df.to_csv(ds_path, index=False)
+            out_dir = Path(td) / "model"
+            train(
+                dataset_path=ds_path,
+                output_dir=out_dir,
+                val_frac=0.2,
+                test_frac=0.2,
+                xgb_kwargs={"n_estimators": 30, "max_depth": 3},
+            )
+            meta = json.loads((out_dir / "meta.json").read_text())
+
+        threshold_metrics = meta["threshold_metrics"]
+        self.assertGreater(len(threshold_metrics), 0)
+        # Keys are 4-decimal threshold strings (A1's _reliability_at_bin
+        # parses the key with float()).
+        for k in threshold_metrics:
+            try:
+                float(k)
+            except ValueError:
+                self.fail(
+                    f"threshold_metrics key {k!r} is not float-parseable; "
+                    f"A1's _reliability_at_bin would skip"
+                )
+        # Each entry has the keys A1 reads (sharpe, max_drawdown, win_rate).
+        for thr_str, m in threshold_metrics.items():
+            for required_key in ("sharpe", "max_drawdown", "win_rate"):
+                self.assertIn(
+                    required_key,
+                    m,
+                    f"threshold_metrics[{thr_str!r}] missing {required_key!r}",
+                )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
