@@ -65,12 +65,19 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from alerts.notifier import Notifier
 from exchanges.coinbase import CoinbaseExchange, ExchangeError, OrderResult, Ticker
+from risk.auto_pause import AutoPauseGate
 from risk.circuit_breakers import (
     CircuitBreakerSet,
     CircuitBreakerVerdict,
     DecisionContext,
 )
+from state.confidence_history import ConfidenceHistory
 from state.position_store import Position, PositionStore
+from state.trade_context_store import (
+    TradeContextSnapshot,
+    TradeContextStore,
+    utc_now_iso,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -228,6 +235,10 @@ class PendingPaperFill:
     signal_tick_at: str
     slippage_bps: float
     enqueued_tick_index: int = 0
+    # Lane E E1: optional trade_id that paper-fill drains will reuse so the
+    # signal + fill snapshots share a key. None when no snapshot store is
+    # wired (snapshot capture is a no-op anyway).
+    trade_id: Optional[str] = None
 
 
 _ActionTaken = Literal[
@@ -412,6 +423,10 @@ class Supervisor:
         sleep_fn: Callable[[float], None] = time.sleep,
         now_fn: Callable[[], datetime] = _utcnow,
         metrics_pusher: Optional[Any] = None,
+        auto_pause_gate: Optional[AutoPauseGate] = None,
+        confidence_history: Optional[ConfidenceHistory] = None,
+        auto_trip_threshold: int = 3,
+        trade_context_store: Optional[TradeContextStore] = None,
     ) -> None:
         self.config = config
         self.exchange = exchange
@@ -422,6 +437,31 @@ class Supervisor:
         self._sleep = sleep_fn
         self._now = now_fn
         self.metrics_pusher = metrics_pusher
+        # Lane E E1 wiring: optional snapshot store for the loss-postmortem
+        # forensics swarm. When None, the three snapshot capture points
+        # (signal / fill / breaker) are no-ops, so legacy callers and
+        # existing tests continue working without code changes.
+        self.trade_context_store = trade_context_store
+        # symbol → pre-allocated trade_id picked at signal time so the
+        # fill snapshot binds to the same id as the signal snapshot.
+        # Cleared by _consume_pending_trade_id after the fill is recorded.
+        self._pending_trade_ids: Dict[str, str] = {}
+        # Task 2: optional auto-pause gate. When None, the gate is
+        # disabled and ``daily_close`` skips the check entirely (preserves
+        # existing test fixtures that don't supply it).
+        self.auto_pause_gate = auto_pause_gate
+        # Task 2: rolling confidence history for the auto-pause baseline.
+        # Defaults to an in-process buffer so tests don't need Redis.
+        self.confidence_history = confidence_history or ConfidenceHistory(
+            redis_client=None
+        )
+        # Task 3: N consecutive errors on the same symbol auto-trips the
+        # kill switch by writing the configured kill-switch file. The
+        # threshold is conservative (3 errors) and bounded; the supervisor
+        # keeps an in-process latch so we only emit the alert + metric
+        # once per trip.
+        self.auto_trip_threshold = int(auto_trip_threshold)
+        self._auto_tripped_symbols: set[str] = set()
 
         # Kill-switch trips are account-level (every symbol resets) and
         # remain in-process: the only writer is the supervisor itself,
@@ -604,6 +644,68 @@ class Supervisor:
                 "increment_error failed for %s: %s; continuing", symbol, exc
             )
 
+    def _handle_tick_error(self, symbol: str) -> None:
+        """Increment the per-symbol error counter and auto-trip kill switch
+        if it crosses ``self.auto_trip_threshold`` consecutive errors.
+
+        Task 3: after incrementing, if the count for THIS symbol >=
+        threshold AND we haven't already tripped on this symbol in this
+        process, write the kill-switch file (if configured), emit the
+        ``autopilot_auto_trip_total`` metric, and send a critical alert.
+        Each symbol can only trip once per process to avoid alert storms;
+        the operator must clear the switch + restart to re-arm.
+        """
+        self._increment_symbol_errors(symbol)
+        # Read the latest count back from Redis so we cross-check against
+        # the persisted view (other symbol-supervisor processes may have
+        # racing increments).
+        count = self._errors_today_for_symbol(symbol)
+        if count < int(self.auto_trip_threshold):
+            return
+        if symbol in self._auto_tripped_symbols:
+            return
+        self._auto_tripped_symbols.add(symbol)
+        reason = (
+            f"{count} consecutive errors on {symbol} >= "
+            f"threshold {self.auto_trip_threshold}"
+        )
+        LOGGER.error("AUTO-TRIPPING KILL SWITCH: %s", reason)
+        # Write the kill-switch file if configured. Best-effort.
+        try:
+            ks_path = getattr(self.circuit_breakers, "kill_switch_file", None)
+            if ks_path is not None:
+                Path(ks_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(ks_path).write_text(
+                    f"auto-tripped: {reason}\n", encoding="utf-8"
+                )
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            LOGGER.warning(
+                "auto-trip kill-switch file write failed: %s", exc
+            )
+        # Sentry breadcrumb (capture_exception with synthesized error).
+        try:
+            _capture_exception(RuntimeError(reason))
+        except Exception:  # noqa: BLE001
+            pass
+        self._safe_metric_call(
+            lambda: self._emit_auto_trip_metric(symbol=symbol)
+        )
+        # Alert via the notifier; route through kill_switch_tripped so it
+        # goes to BOTH Discord and Telegram.
+        try:
+            self.notifier.kill_switch_tripped(reason)
+        except Exception as exc:  # noqa: BLE001 - notifier best-effort
+            LOGGER.warning("auto-trip notifier raised: %s", exc)
+
+    def _emit_auto_trip_metric(self, *, symbol: str) -> None:
+        if not self._pusher_enabled():
+            return
+        self.metrics_pusher.counter(
+            "auto_trip_total",
+            1.0,
+            labels={"symbol": symbol, "reason": "consecutive_errors"},
+        )
+
     def _errors_today_for_symbol(self, symbol: str) -> int:
         """Read today's error count from the store. Returns 0 on any failure."""
         try:
@@ -702,7 +804,7 @@ class Supervisor:
                 # Genuinely uncaught path -- tick_symbol should catch
                 # ExchangeError / generic exceptions itself, but if something
                 # leaks through (eg pydantic validation), don't kill the loop.
-                self._increment_symbol_errors(symbol)
+                self._handle_tick_error(symbol)
                 LOGGER.exception("Unhandled tick error on %s", symbol)
                 _capture_exception(exc)
                 self._safe_alert(
@@ -937,6 +1039,13 @@ class Supervisor:
         except Exception as exc:  # noqa: BLE001 - notifier is best-effort
             LOGGER.warning("notifier.daily_summary raised: %s", exc)
 
+        # Task 2: auto-pause check. The gate is opt-in -- if no gate was
+        # injected, this block is a no-op. Combined daily-loss + confidence-
+        # shift trip writes a marker file + alerts + metric. The next tick
+        # observes the marker and halts via ``_check_auto_pause_marker``.
+        if self.auto_pause_gate is not None:
+            self._check_auto_pause(daily_pnl_usd=daily_pnl)
+
         # Roll today's evidence into shakedown (this also persists).
         state = self.evaluate_shakedown()
 
@@ -993,7 +1102,7 @@ class Supervisor:
         try:
             ticker = self.exchange.get_ticker(symbol)
         except ExchangeError as exc:
-            self._increment_symbol_errors(symbol)
+            self._handle_tick_error(symbol)
             self._safe_alert(
                 f"get_ticker failed for {symbol}: {exc}", severity="alert"
             )
@@ -1041,7 +1150,7 @@ class Supervisor:
         try:
             side, confidence = self.model_predict_fn(symbol, ticker)
         except Exception as exc:  # noqa: BLE001 - model errors should not crash
-            self._increment_symbol_errors(symbol)
+            self._handle_tick_error(symbol)
             self._safe_alert(
                 f"model_predict_fn failed for {symbol}: {exc}",
                 severity="alert",
@@ -1053,6 +1162,16 @@ class Supervisor:
                 model_confidence=None,
                 action_taken="errored",
                 notes=f"predict: {exc!r}",
+            )
+
+        # Task 2: record confidence into the rolling baseline buffer.
+        # Best-effort and silent on failure.
+        try:
+            if math.isfinite(float(confidence)):
+                self.confidence_history.record(symbol, float(confidence))
+        except Exception as exc:  # noqa: BLE001 - never let history kill trader
+            LOGGER.warning(
+                "confidence_history.record failed for %s: %s", symbol, exc
             )
 
         ctx = DecisionContext(
@@ -1125,6 +1244,21 @@ class Supervisor:
                 ),
             )
 
+        # 5b. Lane E E1: capture the signal snapshot BEFORE the mode gate
+        # AND before order placement so a forensics agent can reconstruct
+        # decision-time context even if the order itself fails or the
+        # tick falls back to paper because shakedown isn't unlocked.
+        # Pre-allocate a trade_id so the fill snapshot binds to the same id.
+        signal_trade_id = self._allocate_trade_id(symbol)
+        self._safe_snapshot_signal(
+            symbol=symbol,
+            trade_id=signal_trade_id,
+            side=side,
+            confidence=confidence,
+            ticker=ticker,
+            ctx=ctx,
+        )
+
         # 6. Mode gate -- live falls back to paper if THIS symbol's shakedown
         # isn't unlocked. Other symbols can still trade live.
         effective_mode: Literal["paper", "live"] = "paper"
@@ -1180,7 +1314,7 @@ class Supervisor:
                 )
                 notes_extra = "paper"
         except ExchangeError as exc:
-            self._increment_symbol_errors(symbol)
+            self._handle_tick_error(symbol)
             self._safe_alert(
                 f"place_market_order failed for {symbol}: {exc}",
                 severity="alert",
@@ -1194,7 +1328,7 @@ class Supervisor:
                 notes=f"order: {exc!r}",
             )
         except Exception as exc:  # noqa: BLE001 - keep loop alive
-            self._increment_symbol_errors(symbol)
+            self._handle_tick_error(symbol)
             LOGGER.exception("Unexpected order error on %s", symbol)
             self._safe_alert(
                 f"unexpected order error for {symbol}: {exc}",
@@ -1238,10 +1372,40 @@ class Supervisor:
         position = self._position_from_order(
             order=order, symbol=symbol, side=side, fallback_price=ticker.mid
         )
+        # Lane E E1: rebind position_id to the trade_id pre-allocated at
+        # signal time so signal + fill snapshots share the same key. If
+        # there's no pending trade_id (capture path disabled / no signal
+        # snapshot taken) the original UUID stays.
+        pending_trade_id = self._consume_pending_trade_id(symbol)
+        if pending_trade_id is not None:
+            position = position.model_copy(
+                update={"position_id": pending_trade_id}
+            )
         if order.status == "filled":
             self.position_store.record_open(position)
         else:
             self.position_store.record_pending(position)
+
+        # Lane E E1: fill snapshot — captures observed fill price + slippage
+        # vs the signal-time ticker mid. Bound to the same trade_id as the
+        # signal snapshot when possible.
+        if pending_trade_id is not None:
+            try:
+                slippage_bps = (
+                    (float(position.entry_price) - float(ticker.mid))
+                    / float(ticker.mid)
+                    * 10_000.0
+                ) if float(ticker.mid) > 0 else 0.0
+            except (TypeError, ValueError, ZeroDivisionError):
+                slippage_bps = 0.0
+            self._safe_snapshot_fill(
+                symbol=symbol,
+                trade_id=pending_trade_id,
+                position=position,
+                ticker=ticker,
+                slippage_bps=slippage_bps,
+                notes=f"live order_status={order.status}",
+            )
 
         # Best-effort fill notification.
         try:
@@ -1286,6 +1450,10 @@ class Supervisor:
         # the pending entry is drained.
         provisional_price = float(ticker.mid) or 1.0
         base_size = float(proposed_usd) / provisional_price
+        # Lane E E1: forward the signal-time trade_id (if any) so the
+        # deferred fill snapshot can rebind. Pop here so the live-mode
+        # path can't reuse a stale trade_id later in the same tick.
+        pending_trade_id = self._consume_pending_trade_id(symbol)
         self._pending_paper_fills[symbol] = PendingPaperFill(
             symbol=symbol,
             side=side,
@@ -1294,6 +1462,7 @@ class Supervisor:
             signal_tick_at=self._now().isoformat(),
             slippage_bps=PAPER_SLIPPAGE_BPS,
             enqueued_tick_index=self._symbol_tick_index.get(symbol, 0),
+            trade_id=pending_trade_id,
         )
         LOGGER.info(
             "paper signal queued for next-tick fill: %s side=%s notional=%.2f USD "
@@ -1342,8 +1511,12 @@ class Supervisor:
             fill_price = float(ticker.mid) or 1.0
 
         base_size = float(pending.quote_size_usd) / fill_price
+        # Lane E E1: bind the position_id to the signal-time trade_id when
+        # one exists, so the eventual fill snapshot shares a key with the
+        # signal snapshot. Otherwise fall back to a fresh UUID.
+        position_id = pending.trade_id or str(uuid.uuid4())
         position = Position(
-            position_id=str(uuid.uuid4()),
+            position_id=position_id,
             exchange="coinbase-paper",
             symbol=symbol,
             side="long" if pending.side == "buy" else "short",
@@ -1357,6 +1530,20 @@ class Supervisor:
             notes="paper-deferred-fill",
         )
         self.position_store.record_open(position)
+
+        # Lane E E1: paper-fill snapshot. Only emit when a trade_id was
+        # carried forward from the signal — without one the fill snapshot
+        # would orphan itself.
+        if pending.trade_id is not None:
+            self._safe_snapshot_fill(
+                symbol=symbol,
+                trade_id=pending.trade_id,
+                position=position,
+                ticker=ticker,
+                slippage_bps=float(pending.slippage_bps),
+                notes="paper-deferred-fill",
+            )
+
         LOGGER.info(
             "paper fill: drained pending %s side=%s at next-tick price %.4f "
             "(signal_at=%s, fill_at=%s)",
@@ -1403,6 +1590,12 @@ class Supervisor:
         """Best-effort close of every open position. Returns count closed."""
         closed = 0
         for position in self.position_store.list_open():
+            # Lane E E1: capture a breaker snapshot per affected position
+            # BEFORE the close attempt, so the snapshot is recorded even
+            # if the exchange close call fails (for the postmortem swarm
+            # to investigate why we tried to force-flat).
+            self._safe_snapshot_breaker(position=position, reason=reason)
+
             close_side: Literal["buy", "sell"] = (
                 "sell" if position.side == "long" else "buy"
             )
@@ -1443,6 +1636,294 @@ class Supervisor:
             self.notifier.kill_switch_tripped(reason)
         except Exception as exc:  # noqa: BLE001 - notifier is best-effort
             LOGGER.warning("notifier.kill_switch_tripped raised: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Lane E E1 snapshot capture helpers
+    # ------------------------------------------------------------------
+    #
+    # Three capture points wired into _tick_symbol + force-flat:
+    #   1. signal  — after model_predict_fn returns, BEFORE order placement.
+    #   2. fill    — after the fill is recorded in position_store.
+    #   3. breaker — when a breaker forces flat, per affected position.
+    #
+    # All three helpers are no-ops when self.trade_context_store is None.
+    # All three swallow exceptions: snapshot writes must NEVER crash the
+    # tick loop. Forensics is observability, not the trading critical path.
+
+    def _allocate_trade_id(self, symbol: str) -> str:
+        """Pre-allocate the trade_id used for both signal + fill snapshots.
+
+        Stored in ``self._pending_trade_ids[symbol]`` so the fill-side path
+        can rebind to the same id without further plumbing.
+        """
+        trade_id = uuid.uuid4().hex
+        self._pending_trade_ids[symbol] = trade_id
+        return trade_id
+
+    def _consume_pending_trade_id(self, symbol: str) -> Optional[str]:
+        """Pop the trade_id pre-allocated for ``symbol`` at signal time."""
+        return self._pending_trade_ids.pop(symbol, None)
+
+    def _safe_snapshot_signal(
+        self,
+        *,
+        symbol: str,
+        trade_id: str,
+        side: Literal["buy", "sell"],
+        confidence: float,
+        ticker: Ticker,
+        ctx: DecisionContext,
+    ) -> None:
+        """Capture the signal-time snapshot. No-op if no store is wired."""
+        if self.trade_context_store is None:
+            return
+        try:
+            snap = TradeContextSnapshot(
+                trade_id=trade_id,
+                symbol=symbol,
+                captured_at_utc=utc_now_iso(),
+                phase="signal",
+                feature_buffer={},
+                feature_window=None,
+                model_probs={},
+                model_confidence=float(confidence),
+                risk_metrics_input={
+                    "side": str(side),
+                    "proposed_notional_usd": float(ctx.proposed_notional_usd),
+                    "current_open_notional_usd": float(
+                        ctx.current_open_notional_usd
+                    ),
+                    "current_per_symbol_notional_usd": float(
+                        ctx.current_per_symbol_notional_usd
+                    ),
+                    "daily_realized_pnl_usd": float(ctx.daily_realized_pnl_usd),
+                    "equity_peak_usd": float(ctx.equity_peak_usd),
+                    "equity_current_usd": float(ctx.equity_current_usd),
+                },
+                risk_metrics_output={},
+                breaker_context={},
+                ticker_buffer=[
+                    {
+                        "bid": float(ticker.bid),
+                        "ask": float(ticker.ask),
+                        "last": float(ticker.last),
+                        "mid": float(ticker.mid),
+                    }
+                ],
+                notes=None,
+            )
+            self.trade_context_store.record_snapshot(snap)
+        except Exception as exc:  # noqa: BLE001 - never crash the tick
+            LOGGER.warning(
+                "trade_context_store signal snapshot failed for %s: %r",
+                symbol,
+                exc,
+            )
+
+    def _safe_snapshot_fill(
+        self,
+        *,
+        symbol: str,
+        trade_id: str,
+        position: Position,
+        ticker: Optional[Ticker] = None,
+        slippage_bps: Optional[float] = None,
+        notes: Optional[str] = None,
+    ) -> None:
+        """Capture the fill snapshot. No-op if no store is wired."""
+        if self.trade_context_store is None:
+            return
+        try:
+            ticker_buf: List[Dict[str, float]] = []
+            if ticker is not None:
+                ticker_buf.append(
+                    {
+                        "bid": float(ticker.bid),
+                        "ask": float(ticker.ask),
+                        "last": float(ticker.last),
+                        "mid": float(ticker.mid),
+                    }
+                )
+            risk_out: Dict[str, Any] = {
+                "position_id": position.position_id,
+                "side": position.side,
+                "fill_price": float(position.entry_price),
+                "fill_size": float(position.base_size),
+                "fill_quote_usd": float(position.entry_quote_usd),
+                "fees_usd": float(position.fees_usd),
+                "exchange": position.exchange,
+                "status": position.status,
+            }
+            if slippage_bps is not None:
+                risk_out["slippage_bps"] = float(slippage_bps)
+            snap = TradeContextSnapshot(
+                trade_id=trade_id,
+                symbol=symbol,
+                captured_at_utc=utc_now_iso(),
+                phase="fill",
+                feature_buffer={},
+                feature_window=None,
+                model_probs={},
+                model_confidence=0.0,
+                risk_metrics_input={},
+                risk_metrics_output=risk_out,
+                breaker_context={},
+                ticker_buffer=ticker_buf,
+                notes=notes,
+            )
+            self.trade_context_store.record_snapshot(snap)
+        except Exception as exc:  # noqa: BLE001 - never crash the tick
+            LOGGER.warning(
+                "trade_context_store fill snapshot failed for %s: %r",
+                symbol,
+                exc,
+            )
+
+    def _safe_snapshot_breaker(
+        self,
+        *,
+        position: Position,
+        verdict: Optional[CircuitBreakerVerdict] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Capture the breaker-time snapshot for a single forced-flat position."""
+        if self.trade_context_store is None:
+            return
+        try:
+            br_ctx: Dict[str, Any] = {}
+            if verdict is not None:
+                br_ctx = {
+                    "tripped": list(verdict.tripped),
+                    "reason": verdict.reason,
+                    "recommended_action": verdict.recommended_action,
+                    "details": dict(verdict.details or {}),
+                }
+            elif reason is not None:
+                br_ctx = {"reason": reason}
+
+            snap = TradeContextSnapshot(
+                trade_id=position.position_id,
+                symbol=position.symbol,
+                captured_at_utc=utc_now_iso(),
+                phase="breaker",
+                feature_buffer={},
+                feature_window=None,
+                model_probs={},
+                model_confidence=0.0,
+                risk_metrics_input={
+                    "side": position.side,
+                    "entry_price": float(position.entry_price),
+                    "base_size": float(position.base_size),
+                    "entry_quote_usd": float(position.entry_quote_usd),
+                },
+                risk_metrics_output={},
+                breaker_context=br_ctx,
+                ticker_buffer=[],
+                notes=reason,
+            )
+            self.trade_context_store.record_snapshot(snap)
+        except Exception as exc:  # noqa: BLE001 - never crash the tick
+            LOGGER.warning(
+                "trade_context_store breaker snapshot failed for %s: %r",
+                position.position_id,
+                exc,
+            )
+
+    # ------------------------------------------------------------------
+    # Task 2: auto-pause gate
+    # ------------------------------------------------------------------
+    def _check_auto_pause(self, *, daily_pnl_usd: float) -> bool:
+        """If the auto-pause gate trips, write the marker + alert + metric.
+
+        Returns True iff the gate tripped on this call. Best-effort: no
+        path raises through the supervisor's daily_close.
+        """
+        gate = self.auto_pause_gate
+        if gate is None:
+            return False
+
+        # Aggregate the most recent confidences across all configured
+        # symbols. The gate's own ``recent_window`` truncates if needed.
+        recent: List[float] = []
+        baselines: List[Tuple[float, float, int]] = []
+        for sym in self.config.symbols:
+            try:
+                recent.extend(self.confidence_history.values(sym))
+                baselines.append(self.confidence_history.baseline(sym))
+            except Exception as exc:  # noqa: BLE001 - read is best-effort
+                LOGGER.warning(
+                    "confidence_history read failed for %s: %s", sym, exc
+                )
+
+        # Aggregate baseline = sample-size-weighted mean of per-symbol means.
+        # If only one symbol has a usable baseline, just use it.
+        usable = [(m, s, n) for (m, s, n) in baselines if n >= 2]
+        if usable:
+            total_n = sum(n for (_, _, n) in usable)
+            agg_mean = sum(m * n for (m, _, n) in usable) / max(total_n, 1)
+            # Pooled std (rough): mean of per-symbol stds, weighted by N.
+            agg_std = sum(s * n for (_, s, n) in usable) / max(total_n, 1)
+        else:
+            agg_mean = 0.0
+            agg_std = 0.0
+
+        try:
+            decision = gate.evaluate_detailed(
+                daily_pnl_usd=float(daily_pnl_usd),
+                recent_confidences=recent,
+                baseline_confidence_mean=agg_mean,
+                baseline_confidence_std=agg_std,
+                bankroll_usd=float(self.config.bankroll_usd),
+            )
+        except Exception as exc:  # noqa: BLE001 - gate must never crash trader
+            LOGGER.warning("auto_pause_gate.evaluate failed: %s", exc)
+            return False
+
+        if not decision.should_pause:
+            return False
+
+        LOGGER.warning("AUTO-PAUSE TRIPPED: %s", decision.reason)
+        try:
+            gate.write_marker(reason=decision.reason)
+        except Exception as exc:  # noqa: BLE001 - marker write is best-effort
+            LOGGER.warning("auto_pause write_marker failed: %s", exc)
+
+        self._safe_metric_call(
+            lambda: self._emit_auto_pause_metric(reason=decision.reason)
+        )
+        try:
+            self.notifier.alert(
+                f"AUTO-PAUSE TRIPPED: {decision.reason}",
+                severity="critical",
+                fields={
+                    "daily_pnl_usd": f"{decision.daily_pnl_usd:.2f}",
+                    "loss_threshold_usd": f"{decision.loss_threshold_usd:.2f}",
+                    "recent_mean": (
+                        f"{decision.recent_mean:.3f}"
+                        if decision.recent_mean is not None
+                        else "n/a"
+                    ),
+                    "baseline_mean": (
+                        f"{decision.baseline_mean:.3f}"
+                        if decision.baseline_mean is not None
+                        else "n/a"
+                    ),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - notifier best-effort
+            LOGGER.warning("auto_pause notifier.alert raised: %s", exc)
+        return True
+
+    def _emit_auto_pause_metric(self, *, reason: str) -> None:
+        if not self._pusher_enabled():
+            return
+        # Coerce reason into a label-safe truncated form (Prometheus
+        # label values are unbounded but high-cardinality reasons are
+        # bad practice; we surface the structural reason only).
+        label_reason = "loss_and_confidence_shift"
+        self.metrics_pusher.counter(
+            "auto_pause_total", 1.0, labels={"reason": label_reason}
+        )
 
     # ------------------------------------------------------------------
     # Observability helpers (defensive: monitoring failures must never

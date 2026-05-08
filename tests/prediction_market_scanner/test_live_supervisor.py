@@ -1411,5 +1411,96 @@ class TestRunDirOutputSaving(unittest.TestCase):
                     h.close()
 
 
+class TestTradeContextSnapshotCapture(unittest.TestCase):
+    """Lane E E1 snapshot capture wiring.
+
+    Asserts the supervisor records snapshots at the three lifecycle points
+    (signal, fill, breaker) when a :class:`TradeContextStore` is injected,
+    and remains a no-op when it isn't.
+    """
+
+    def _make_store(self) -> Any:
+        # Local import keeps the rest of the module unaffected if the
+        # snapshot store gets relocated.
+        import fakeredis
+
+        from state.trade_context_store import TradeContextStore
+
+        return TradeContextStore(
+            redis_client=fakeredis.FakeRedis(decode_responses=True),
+            namespace="test-snap",
+        )
+
+    def _build(
+        self,
+        *,
+        with_store: bool = True,
+        breakers: Optional[StubCircuitBreakers] = None,
+        position_store: Optional[StubPositionStore] = None,
+    ) -> Tuple[Supervisor, Dict[str, Any], Any]:
+        store = self._make_store() if with_store else None
+        sup, refs = _build_supervisor(
+            min_confidence=0.5,
+            predict_fn=lambda s, t: ("buy", 0.9),
+            position_store=position_store,
+            circuit_breakers=breakers,
+        )
+        sup.trade_context_store = store
+        return sup, refs, store
+
+    def test_signal_and_paper_fill_snapshots_captured(self) -> None:
+        sup, refs, store = self._build()
+        # First tick queues a paper fill (no snapshot for fill yet).
+        sup.run_once()
+        # Second tick drains the paper fill → records a position.
+        ticks = sup.run_once()
+        self.assertEqual(ticks[0].action_taken, "allowed")
+        self.assertGreaterEqual(len(refs["position_store"].recorded_open), 1)
+
+        # Pull the position_id of the recorded open and verify both
+        # signal + fill snapshots exist under the same trade_id.
+        pos = refs["position_store"].recorded_open[0]
+        snaps = store.get_snapshots(pos.position_id)
+        self.assertIn("signal", snaps)
+        self.assertIn("fill", snaps)
+        self.assertEqual(snaps["signal"].trade_id, pos.position_id)
+        self.assertEqual(snaps["fill"].trade_id, pos.position_id)
+        # Signal snapshot carries the model confidence.
+        self.assertAlmostEqual(snaps["signal"].model_confidence, 0.9)
+        # Fill snapshot carries the recorded fill_price.
+        self.assertEqual(
+            snaps["fill"].risk_metrics_output["fill_price"],
+            pos.entry_price,
+        )
+
+    def test_breaker_snapshot_captured_on_force_flat(self) -> None:
+        # Pre-populate the store with one open position that will be
+        # force-flatted by a kill-switch trip.
+        existing_pos = _make_position(side="long", symbol="ETH/USDT")
+        ps = StubPositionStore(open_positions=[existing_pos])
+        breakers = StubCircuitBreakers(kill_switch=True)
+        sup, refs, store = self._build(
+            with_store=True, breakers=breakers, position_store=ps
+        )
+        sup.run_once()
+
+        snaps = store.get_snapshots(existing_pos.position_id)
+        self.assertIn("breaker", snaps)
+        breaker_snap = snaps["breaker"]
+        self.assertEqual(breaker_snap.symbol, existing_pos.symbol)
+        self.assertEqual(breaker_snap.phase, "breaker")
+        # The reason is propagated into the snapshot's notes/breaker_context.
+        self.assertIsNotNone(breaker_snap.notes)
+
+    def test_no_store_wired_skips_snapshot_capture(self) -> None:
+        """Sanity: without a store, the supervisor must still tick cleanly
+        and not raise from the snapshot helpers."""
+        sup, refs, _ = self._build(with_store=False)
+        # Two ticks (queue + drain) must succeed without any snapshot store.
+        sup.run_once()
+        ticks = sup.run_once()
+        self.assertEqual(ticks[0].action_taken, "allowed")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
