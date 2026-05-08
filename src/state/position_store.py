@@ -138,6 +138,15 @@ class Position(BaseModel):
     closed_at_utc: Optional[str] = None
     model_meta: Dict[str, Any] = Field(default_factory=dict)
     notes: Optional[str] = None
+    # Phase-16 structured fill metadata for A2 ExecutionForensics. Today A2
+    # regex-scrapes ``notes`` for "partial" / "rejected" / "stop_price=...".
+    # These typed fields are the canonical seam — A2 prefers them and falls
+    # back to notes when they're None (legacy positions in Redis).
+    # ``partial_fills`` is a list of {"size": ..., "price": ..., "filled_at_utc": ...}
+    # dicts so we don't pull a second pydantic class into the schema.
+    partial_fills: Optional[List[Dict[str, Any]]] = None
+    rejection_reason: Optional[str] = None
+    stop_trigger_price: Optional[float] = None
 
 
 class PositionStore:

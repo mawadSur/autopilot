@@ -372,6 +372,164 @@ class ExecutionForensicsTests(unittest.TestCase):
             finding.evidence,
         )
 
+    # ---- Phase-16: A2 prefers canonical Position fields over notes -----
+    def test_canonical_partial_fills_field_wins_over_notes(self) -> None:
+        """A2 reads ``Position.partial_fills`` directly when populated."""
+        trade_id = f"trade-{uuid.uuid4().hex[:8]}"
+        signal_t = datetime.now(timezone.utc)
+        self.ctx.record_snapshot(
+            _signal_snapshot(trade_id=trade_id, captured_at=signal_t, mid=2000.0)
+        )
+        self.ctx.record_snapshot(
+            _fill_snapshot(
+                trade_id=trade_id,
+                captured_at=signal_t + timedelta(seconds=0.5),
+                mid=2000.5,
+            )
+        )
+        # Position has structured partial_fills, NO partial-marker in notes.
+        position = _position(
+            trade_id=trade_id,
+            entry_price=2000.5,
+            exit_price=1990.0,
+            notes=None,
+        )
+        position = position.model_copy(
+            update={
+                "partial_fills": [
+                    {"size": 0.04, "price": 2000.0, "filled_at_utc": "2026-05-08T12:00:00+00:00"},
+                    {"size": 0.06, "price": 2001.0, "filled_at_utc": "2026-05-08T12:00:01+00:00"},
+                ],
+            }
+        )
+        self.pos.record_open(position)
+        self.pos.record_close(
+            trade_id, exit_price=1990.0, exit_quote_usd=1990.0 * 0.1
+        )
+        agent = ExecutionForensicsAgent(
+            context_store=self.ctx, position_store=self.pos
+        )
+        finding = agent.investigate(trade_id)
+        # The structured field path produces evidence mentioning fills count.
+        joined = " | ".join(finding.evidence).lower()
+        self.assertIn("partial fills detected on position record", joined)
+        self.assertEqual(finding.verdict, "contributing")
+
+    def test_canonical_rejection_reason_field_wins_over_notes(self) -> None:
+        """A2 reads ``Position.rejection_reason`` directly when populated."""
+        trade_id = f"trade-{uuid.uuid4().hex[:8]}"
+        signal_t = datetime.now(timezone.utc)
+        self.ctx.record_snapshot(
+            _signal_snapshot(trade_id=trade_id, captured_at=signal_t, mid=2000.0)
+        )
+        self.ctx.record_snapshot(
+            _fill_snapshot(
+                trade_id=trade_id,
+                captured_at=signal_t + timedelta(seconds=0.5),
+                mid=2000.5,
+            )
+        )
+        position = _position(
+            trade_id=trade_id,
+            entry_price=2000.5,
+            exit_price=1990.0,
+            notes=None,
+        )
+        position = position.model_copy(
+            update={"rejection_reason": "insufficient_funds"}
+        )
+        self.pos.record_open(position)
+        self.pos.record_close(
+            trade_id, exit_price=1990.0, exit_quote_usd=1990.0 * 0.1
+        )
+        agent = ExecutionForensicsAgent(
+            context_store=self.ctx, position_store=self.pos
+        )
+        finding = agent.investigate(trade_id)
+        joined = " | ".join(finding.evidence).lower()
+        self.assertIn("rejection on position record", joined)
+        self.assertIn("insufficient_funds", joined)
+
+    def test_canonical_stop_trigger_price_field_wins_over_notes(self) -> None:
+        """A2 reads ``Position.stop_trigger_price`` directly when populated."""
+        trade_id = f"trade-{uuid.uuid4().hex[:8]}"
+        signal_t = datetime.now(timezone.utc)
+        self.ctx.record_snapshot(
+            _signal_snapshot(trade_id=trade_id, captured_at=signal_t, mid=2000.0)
+        )
+        self.ctx.record_snapshot(
+            _fill_snapshot(
+                trade_id=trade_id,
+                captured_at=signal_t + timedelta(seconds=0.5),
+                mid=2000.0,
+            )
+        )
+        # Trigger 1980 via canonical field (not via notes); exit drifted to 1960.
+        position = _position(
+            trade_id=trade_id,
+            entry_price=2000.0,
+            exit_price=1960.0,
+            notes="stop_loss closed",
+            model_meta={"closed_via_stop": True},
+        )
+        position = position.model_copy(
+            update={"stop_trigger_price": 1980.0}
+        )
+        self.pos.record_open(position)
+        self.pos.record_close(
+            trade_id, exit_price=1960.0, exit_quote_usd=1960.0 * 0.1
+        )
+        agent = ExecutionForensicsAgent(
+            context_store=self.ctx, position_store=self.pos
+        )
+        finding = agent.investigate(trade_id)
+        self.assertEqual(finding.verdict, "contributing")
+        self.assertTrue(
+            any("stop-loss" in e.lower() for e in finding.evidence),
+            finding.evidence,
+        )
+
+    def test_legacy_position_without_canonical_fields_uses_notes_fallback(
+        self,
+    ) -> None:
+        """A position with no structured fields (legacy) still works via the
+        old notes-scan path."""
+        trade_id = f"trade-{uuid.uuid4().hex[:8]}"
+        signal_t = datetime.now(timezone.utc)
+        self.ctx.record_snapshot(
+            _signal_snapshot(trade_id=trade_id, captured_at=signal_t, mid=4000.0)
+        )
+        self.ctx.record_snapshot(
+            _fill_snapshot(
+                trade_id=trade_id,
+                captured_at=signal_t + timedelta(seconds=0.5),
+                mid=4001.0,
+            )
+        )
+        # All structured fields are None (the default). Notes carry the
+        # partial-fill marker the legacy path scans for.
+        position = _position(
+            trade_id=trade_id,
+            entry_price=4001.0,
+            exit_price=3990.0,
+            notes="partial_fill at 0.05; remainder cancelled",
+        )
+        # Sanity: structured fields default None.
+        self.assertIsNone(position.partial_fills)
+        self.assertIsNone(position.rejection_reason)
+        self.assertIsNone(position.stop_trigger_price)
+        self.pos.record_open(position)
+        self.pos.record_close(
+            trade_id, exit_price=3990.0, exit_quote_usd=3990.0 * 0.1
+        )
+        agent = ExecutionForensicsAgent(
+            context_store=self.ctx, position_store=self.pos
+        )
+        finding = agent.investigate(trade_id)
+        # The notes scan still flags the partial — no regression.
+        joined = " | ".join(finding.evidence).lower()
+        self.assertIn("partial fill detected in position.notes", joined)
+
     # ---- bonus: safe_investigate timeout path ------------------------------
     def test_safe_investigate_returns_unknown_on_timeout(self) -> None:
         # Subclass that just sleeps so we exercise the BaseForensicsAgent

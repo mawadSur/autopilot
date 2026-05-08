@@ -164,11 +164,24 @@ _STOP_PRICE_PATTERNS: tuple[re.Pattern[str], ...] = (
 def _extract_stop_price(position: Position) -> Optional[float]:
     """Pull a stop-loss trigger price from position.notes or model_meta.
 
-    Looked at, in order:
+    Looked at, in order (Phase-16 priority):
+      0. ``position.stop_trigger_price`` — the canonical typed field.
       1. ``position.model_meta`` keys ``stop_price`` / ``stop_loss_price`` /
          ``stop_trigger_price`` (numeric).
       2. ``position.notes`` regex-matched on stop-related keywords.
     """
+    # Phase-16 canonical field takes precedence. Legacy positions in Redis
+    # serialized before the field existed deserialize with this as None,
+    # so the fallback paths still work.
+    canonical = getattr(position, "stop_trigger_price", None)
+    if canonical is not None:
+        try:
+            fv = float(canonical)
+            if fv > 0:
+                return fv
+        except (TypeError, ValueError):
+            pass
+
     meta = position.model_meta or {}
     for key in ("stop_price", "stop_loss_price", "stop_trigger_price"):
         v = meta.get(key)
@@ -342,11 +355,18 @@ class ExecutionForensicsAgent(BaseForensicsAgent):
                         )
 
         # ------------------------------------------------------------------
-        # 3. Partial fills
+        # 3. Partial fills (Phase-16: prefer canonical Position.partial_fills)
         # ------------------------------------------------------------------
         if position is not None:
             notes_lc = (position.notes or "").lower()
-            if any(m in notes_lc for m in PARTIAL_NOTE_MARKERS):
+            canonical_partials = getattr(position, "partial_fills", None)
+            if canonical_partials:
+                yellow_flags += 1
+                evidence.append(
+                    f"partial fills detected on position record "
+                    f"({len(canonical_partials)} fills)"
+                )
+            elif any(m in notes_lc for m in PARTIAL_NOTE_MARKERS):
                 yellow_flags += 1
                 evidence.append(
                     "partial fill detected in position.notes "
@@ -354,9 +374,17 @@ class ExecutionForensicsAgent(BaseForensicsAgent):
                 )
 
             # ------------------------------------------------------------------
-            # 5. Order rejection trail
+            # 5. Order rejection trail (Phase-16: prefer canonical
+            #    Position.rejection_reason; fall back to notes scan)
             # ------------------------------------------------------------------
-            if any(m in notes_lc for m in REJECTION_NOTE_MARKERS):
+            canonical_reject = getattr(position, "rejection_reason", None)
+            if canonical_reject:
+                yellow_flags += 1
+                evidence.append(
+                    f"order rejection on position record: "
+                    f"reason={canonical_reject!r}"
+                )
+            elif any(m in notes_lc for m in REJECTION_NOTE_MARKERS):
                 yellow_flags += 1
                 evidence.append(
                     "order rejection found in position.notes "

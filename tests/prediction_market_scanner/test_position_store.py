@@ -613,5 +613,95 @@ class OrphanCountTests(unittest.TestCase):
         self.assertEqual(self.store.orphan_count(), 1)
 
 
+class StructuredFillMetadataTests(unittest.TestCase):
+    """Phase-16: structured ``partial_fills`` / ``rejection_reason`` /
+    ``stop_trigger_price`` fields on Position. A2 ExecutionForensics reads
+    these directly instead of regex-scraping notes."""
+
+    def setUp(self) -> None:
+        self.fake = fakeredis.FakeRedis(decode_responses=True)
+        self.store = PositionStore(redis_client=self.fake, namespace="test-fill")
+
+    def test_position_with_structured_fields_round_trips_through_redis(self) -> None:
+        partial_fills = [
+            {"size": 0.05, "price": 100.0, "filled_at_utc": "2026-05-08T12:00:00+00:00"},
+            {"size": 0.03, "price": 100.2, "filled_at_utc": "2026-05-08T12:00:01+00:00"},
+        ]
+        position = Position(
+            position_id="trade-fill",
+            exchange="coinbase",
+            symbol="BTC/USD",
+            side="long",
+            status="open",
+            entry_price=100.0,
+            entry_quote_usd=8.0,
+            base_size=0.08,
+            opened_at_utc=datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            partial_fills=partial_fills,
+            rejection_reason=None,
+            stop_trigger_price=98.0,
+        )
+        self.store.record_open(position)
+        revived = self.store.get("trade-fill")
+        assert revived is not None
+        self.assertEqual(revived.partial_fills, partial_fills)
+        self.assertIsNone(revived.rejection_reason)
+        self.assertAlmostEqual(revived.stop_trigger_price, 98.0)
+
+    def test_position_with_rejection_reason_round_trips(self) -> None:
+        position = Position(
+            position_id="trade-rej",
+            exchange="coinbase",
+            symbol="BTC/USD",
+            side="long",
+            status="open",
+            entry_price=100.0,
+            entry_quote_usd=10.0,
+            base_size=0.1,
+            opened_at_utc=datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            rejection_reason="insufficient_funds",
+        )
+        self.store.record_open(position)
+        revived = self.store.get("trade-rej")
+        assert revived is not None
+        self.assertEqual(revived.rejection_reason, "insufficient_funds")
+        self.assertIsNone(revived.partial_fills)
+        self.assertIsNone(revived.stop_trigger_price)
+
+    def test_legacy_position_without_new_fields_deserializes_with_defaults(
+        self,
+    ) -> None:
+        """Backward compat: a position blob written before Phase-16 (no
+        partial_fills / rejection_reason / stop_trigger_price keys) must
+        deserialize cleanly with all three defaulted to None."""
+        import json as _json
+
+        legacy_blob = _json.dumps(
+            {
+                "position_id": "legacy-1",
+                "exchange": "coinbase",
+                "symbol": "ETH/USD",
+                "side": "long",
+                "status": "open",
+                "entry_price": 2000.0,
+                "entry_quote_usd": 100.0,
+                "base_size": 0.05,
+                "opened_at_utc": "2026-04-01T00:00:00+00:00",
+                "fees_usd": 0.5,
+                "model_meta": {},
+                "notes": "some-legacy-note",
+            }
+        )
+        # Manually persist the legacy shape.
+        self.fake.set(self.store._position_key("legacy-1"), legacy_blob)
+        self.fake.sadd(self.store._open_set_key, "legacy-1")
+        revived = self.store.get("legacy-1")
+        assert revived is not None
+        self.assertIsNone(revived.partial_fills)
+        self.assertIsNone(revived.rejection_reason)
+        self.assertIsNone(revived.stop_trigger_price)
+        self.assertEqual(revived.notes, "some-legacy-note")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

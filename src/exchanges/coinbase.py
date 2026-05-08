@@ -189,6 +189,87 @@ def _map_status(raw_status: Any) -> _Status:
 
 
 # ---------------------------------------------------------------------------
+# Phase-16 fill metadata extractors. A2 ExecutionForensics needs structured
+# partial-fill / rejection data instead of regex-scanning ``Position.notes``.
+# These best-effort extractors pull what the ccxt response provides; on
+# Coinbase US that's typically a ``trades`` list per order plus a ``status``
+# string. If a field isn't surfaced by the exchange we return None / [] —
+# never fabricate.
+# ---------------------------------------------------------------------------
+
+
+def extract_partial_fills(order: OrderResult) -> List[Dict[str, Any]]:
+    """Best-effort extraction of partial-fill records from a ccxt order.
+
+    A "partial fill" is any order where:
+      * The exchange split the requested size across multiple fills (the
+        ccxt response's ``trades`` list has more than one entry), OR
+      * ``filled_base`` is positive but less than the requested base_size.
+
+    Returns a list of ``{"size", "price", "filled_at_utc"}`` dicts. Empty
+    list when the order had a single fill (the common path) or when the
+    payload does not surface trade-level data.
+    """
+    raw = order.raw_payload or {}
+    fills: List[Dict[str, Any]] = []
+    trades = raw.get("trades") or []
+    if isinstance(trades, list) and len(trades) >= 2:
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            size = _coerce_float(
+                trade.get("amount")
+                or trade.get("size")
+                or trade.get("filled")
+            )
+            price = _coerce_float(
+                trade.get("price")
+                or trade.get("avgPrice")
+                or trade.get("avg_price")
+            )
+            ts = (
+                trade.get("datetime")
+                or trade.get("timestamp_iso")
+                or trade.get("filled_at_utc")
+            )
+            if not isinstance(ts, str):
+                ts = _utcnow_iso()
+            if size > 0 and price > 0:
+                fills.append(
+                    {"size": size, "price": price, "filled_at_utc": ts}
+                )
+    return fills
+
+
+def extract_rejection_reason(order: OrderResult) -> Optional[str]:
+    """Pull a structured rejection reason from a ccxt-style order response.
+
+    Returns ``None`` for orders that aren't in a rejected-like state.
+    Looks at the normalized status first, then falls back to known reason
+    keys in the raw payload (Coinbase's ``reject_reason``, ccxt's generic
+    ``info.reject_reason`` / ``info.message``).
+    """
+    if order.status not in ("rejected", "cancelled"):
+        return None
+    raw = order.raw_payload or {}
+    info = raw.get("info") or {}
+    candidates = [
+        raw.get("reject_reason"),
+        raw.get("rejection_reason"),
+        info.get("reject_reason") if isinstance(info, dict) else None,
+        info.get("rejection_reason") if isinstance(info, dict) else None,
+        info.get("message") if isinstance(info, dict) else None,
+        raw.get("message"),
+    ]
+    for c in candidates:
+        if c:
+            return str(c)
+    # Fall through: still return the status string so consumers know it
+    # was a rejection without a structured reason (better than ``None``).
+    return f"status={order.status}"
+
+
+# ---------------------------------------------------------------------------
 # Connector
 # ---------------------------------------------------------------------------
 

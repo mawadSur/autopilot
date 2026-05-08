@@ -1595,6 +1595,27 @@ class Supervisor:
             base_size = float(order.quote_size_usd) / fill_price
         if base_size <= 0:
             base_size = 0.0
+        # Phase-16: extract structured fill metadata for A2 forensics so we
+        # don't have to regex-scrape position.notes later. Both extractors
+        # are best-effort and return empty/None when ccxt didn't surface the
+        # underlying data.
+        partial_fills: Optional[List[Dict[str, Any]]] = None
+        rejection_reason: Optional[str] = None
+        try:
+            from exchanges.coinbase import (
+                extract_partial_fills,
+                extract_rejection_reason,
+            )
+
+            extracted = extract_partial_fills(order)
+            if extracted:
+                partial_fills = extracted
+            rejection_reason = extract_rejection_reason(order)
+        except Exception as exc:  # noqa: BLE001 - extraction must never crash
+            LOGGER.debug(
+                "fill metadata extraction raised: %r; continuing without it",
+                exc,
+            )
         return Position(
             position_id=str(uuid.uuid4()),
             exchange="coinbase",
@@ -1607,6 +1628,8 @@ class Supervisor:
             entry_order_id=order.order_id,
             opened_at_utc=self._now().isoformat(),
             fees_usd=float(order.fee_usd),
+            partial_fills=partial_fills,
+            rejection_reason=rejection_reason,
         )
 
     # ------------------------------------------------------------------
@@ -1782,6 +1805,17 @@ class Supervisor:
             }
             if slippage_bps is not None:
                 risk_out["slippage_bps"] = float(slippage_bps)
+            # Phase-16: copy the structured fill metadata onto the snapshot
+            # so A2 ExecutionForensics can read it directly without a
+            # second hop into PositionStore.
+            if position.partial_fills:
+                risk_out["partial_fills"] = list(position.partial_fills)
+            if position.rejection_reason:
+                risk_out["rejection_reason"] = str(position.rejection_reason)
+            if position.stop_trigger_price is not None:
+                risk_out["stop_trigger_price"] = float(
+                    position.stop_trigger_price
+                )
             snap = TradeContextSnapshot(
                 trade_id=trade_id,
                 symbol=symbol,
