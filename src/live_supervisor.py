@@ -44,6 +44,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -800,6 +801,21 @@ class Supervisor:
                 model_confidence=confidence,
                 action_taken="halted_breaker",
                 notes=verdict.reason or None,
+            )
+
+        # 5a. Defense-in-depth (P0 #6): predictors should already neutralise
+        # NaN/inf, but a misbehaving predict_fn could still return one. The
+        # native ``confidence < floor`` comparison silently passes NaN
+        # (NaN < anything is False), which would let a bogus signal through.
+        # Reject explicitly here as a last line of defence.
+        if not math.isfinite(float(confidence)):
+            return SupervisorTick(
+                tick_at_utc=now.isoformat(),
+                symbol=symbol,
+                verdict=verdict,
+                model_confidence=None,
+                action_taken="skipped_low_confidence",
+                notes="nan_confidence",
             )
 
         # 5. Confidence gate.

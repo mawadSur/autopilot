@@ -458,6 +458,39 @@ class TestConfidenceFloor(unittest.TestCase):
         self.assertEqual(ticks[0].action_taken, "skipped_low_confidence")
         self.assertEqual(len(refs["exchange"].market_orders), 0)
 
+    def test_run_once_skips_when_predict_returns_nan(self) -> None:
+        """Defense-in-depth (P0 #6): even if a predict_fn slips a NaN past
+        its own validator, the supervisor must not trade. NaN < floor is
+        silently False in Python, which is exactly the bug we're patching.
+        """
+        store = StubPositionStore()
+        exch = StubExchange()
+        sup, refs = _build_supervisor(
+            min_confidence=0.6,
+            predict_fn=lambda s, t: ("buy", float("nan")),
+            position_store=store,
+            exchange=exch,
+        )
+        ticks = sup.run_once()
+        self.assertEqual(ticks[0].action_taken, "skipped_low_confidence")
+        self.assertEqual(ticks[0].notes, "nan_confidence")
+        # Critical: no live order placed and no paper queue populated.
+        self.assertEqual(len(refs["exchange"].market_orders), 0)
+        self.assertNotIn("ETH/USDT", sup._pending_paper_fills)
+        self.assertEqual(len(store.recorded_open), 0)
+
+    def test_run_once_skips_when_predict_returns_pos_inf(self) -> None:
+        store = StubPositionStore()
+        sup, refs = _build_supervisor(
+            min_confidence=0.6,
+            predict_fn=lambda s, t: ("buy", float("inf")),
+            position_store=store,
+        )
+        ticks = sup.run_once()
+        self.assertEqual(ticks[0].action_taken, "skipped_low_confidence")
+        self.assertEqual(ticks[0].notes, "nan_confidence")
+        self.assertEqual(len(store.recorded_open), 0)
+
 
 class TestPaperModeSynthesisesFill(unittest.TestCase):
     def test_run_once_paper_synthesizes_fill_when_mode_paper(self) -> None:
