@@ -161,6 +161,11 @@ class SymbolShakedownState(BaseModel):
     symbols are already unlocked. Account-level events (kill switch,
     daily-loss breaker) reset every symbol; per-symbol errors only reset
     the offending symbol.
+
+    ``equity_peak_usd`` (P0 #1): per-symbol high-water mark on the
+    bankroll-plus-symbol-pnl line. Drawdown is then computed against THIS
+    symbol's peak, so one symbol's losses don't halt another symbol's
+    trading via a shared global peak.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -169,6 +174,7 @@ class SymbolShakedownState(BaseModel):
     last_evaluation_utc: Optional[str] = None
     daily_history: List[Dict[str, Any]] = Field(default_factory=list)
     live_unlocked_at_utc: Optional[str] = None
+    equity_peak_usd: float = 0.0
 
 
 class ShakedownState(BaseModel):
@@ -400,22 +406,41 @@ class Supervisor:
                 "last_evaluation_utc",
             )
         ):
+            # Legacy ``equity_peak_usd`` lived at the top level. We keep
+            # the top-level value (so ShakedownState validates) but ALSO
+            # seed every per-symbol entry with the same value, since per-
+            # symbol drawdown is now tracked separately (P0 #1).
+            legacy_equity_peak = float(raw.get("equity_peak_usd", 0.0) or 0.0)
             legacy_per_symbol_payload = {
                 "paper_days_clean": int(raw.pop("paper_days_clean", 0) or 0),
                 "last_evaluation_utc": raw.pop("last_evaluation_utc", None),
                 "daily_history": list(raw.pop("daily_history", []) or []),
                 "live_unlocked_at_utc": raw.pop("live_unlocked_at_utc", None),
+                "equity_peak_usd": legacy_equity_peak,
             }
             raw["per_symbol"] = {
-                sym: legacy_per_symbol_payload for sym in self.config.symbols
+                sym: dict(legacy_per_symbol_payload)
+                for sym in self.config.symbols
             }
             was_migrated = True
             LOGGER.info(
                 "Migrated legacy shakedown state to per-symbol layout for %d "
-                "symbol(s); preserved paper_days_clean=%d.",
+                "symbol(s); preserved paper_days_clean=%d, equity_peak=%.2f.",
                 len(self.config.symbols),
                 legacy_per_symbol_payload["paper_days_clean"],
+                legacy_equity_peak,
             )
+        # Defense for the in-between case: an existing per_symbol layout
+        # missing the new equity_peak_usd field on individual entries.
+        # Pydantic's default takes care of the nominal case, but if a
+        # caller persisted entries with explicit other fields the new
+        # field needs to inherit the global peak when promoting up.
+        elif "per_symbol" in raw:
+            global_peak = float(raw.get("equity_peak_usd", 0.0) or 0.0)
+            for sym, entry in (raw.get("per_symbol") or {}).items():
+                if isinstance(entry, dict) and "equity_peak_usd" not in entry:
+                    entry["equity_peak_usd"] = global_peak
+                    was_migrated = True
         return ShakedownState.model_validate(raw), was_migrated
 
     def _increment_symbol_errors(self, symbol: str) -> None:
@@ -622,6 +647,15 @@ class Supervisor:
             ):
                 sym_state.live_unlocked_at_utc = now.isoformat()
 
+            # Per-symbol high-water mark (P0 #1). The peak is bankroll +
+            # this symbol's realised PnL, NOT the account aggregate; that
+            # way one symbol's drawdown can't be paid for by another
+            # symbol's gains, and the breaker context can compute drawdown
+            # against THIS symbol only.
+            sym_equity_now = self.config.bankroll_usd + pnl_for_symbol
+            if sym_equity_now > sym_state.equity_peak_usd:
+                sym_state.equity_peak_usd = sym_equity_now
+
         # Account-level: update the bankroll high-water mark.
         equity_now = self.config.bankroll_usd + account_daily_pnl
         if equity_now > self.shakedown_state.equity_peak_usd:
@@ -736,11 +770,20 @@ class Supervisor:
             self.config.risk_pct_per_trade
         )
         daily_pnl = float(self.position_store.daily_realized_pnl_usd())
-        equity_current = float(self.config.bankroll_usd) + daily_pnl
-        equity_peak = max(
-            equity_current,
-            float(self.shakedown_state.equity_peak_usd),
-        )
+        # Per-symbol equity tracking (P0 #1). Drawdown is computed against
+        # THIS symbol's realised PnL only, against THIS symbol's peak. A
+        # losing symbol therefore halts only itself; its peers keep
+        # trading.
+        try:
+            symbol_pnl = float(
+                self.position_store.daily_realized_pnl_usd_for_symbol(symbol)
+            )
+        except Exception:  # noqa: BLE001 - state read is best-effort
+            symbol_pnl = 0.0
+        equity_current = float(self.config.bankroll_usd) + symbol_pnl
+        sym_state = self.shakedown_state.per_symbol.get(symbol)
+        sym_peak = float(sym_state.equity_peak_usd) if sym_state else 0.0
+        equity_peak = max(equity_current, sym_peak)
 
         # We need a tentative side for the breaker context. Predict first so
         # the breaker sees the actual side, but the canonical confidence

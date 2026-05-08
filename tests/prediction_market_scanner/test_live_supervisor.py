@@ -953,6 +953,148 @@ class TestPerSymbolShakedown(unittest.TestCase):
         )
 
 
+class TestPerSymbolEquityPeak(unittest.TestCase):
+    """P0 #1: per-symbol equity peak so one symbol's drawdown does not halt
+    other symbols' trading.
+
+    Before this fix the supervisor used a single global high-water mark,
+    so ETH crashing -50% would have ALSO halted BTC trades via the
+    drawdown breaker. After: each symbol's drawdown is computed against
+    its own peak.
+    """
+
+    def test_per_symbol_pnl_does_not_pollute_other_symbol_drawdown(self) -> None:
+        """ETH's losing PnL is invisible from BTC's DecisionContext."""
+        from state.position_store import Position
+
+        # Construct closed positions: ETH lost $5000, BTC made $0.
+        eth_loss = Position(
+            position_id="eth-1",
+            exchange="coinbase",
+            symbol="ETH/USD",
+            side="long",
+            status="closed",
+            entry_price=2000.0,
+            entry_quote_usd=20000.0,
+            base_size=10.0,
+            opened_at_utc="2026-04-26T00:00:00+00:00",
+            realized_pnl_usd=-5000.0,
+        )
+        store = StubPositionStore(
+            daily_pnl=-5000.0,
+            closed_today=[eth_loss],
+        )
+        sup, _ = _build_supervisor(
+            symbols=["ETH/USD", "BTC/USD"],
+            position_store=store,
+            predict_fn=lambda s, t: ("buy", 0.9),
+        )
+        # Pre-seed BTC's symbol equity peak above the bankroll so a
+        # drawdown query for BTC would NOT trip on ETH's losses. ETH's
+        # peak stays at default 0; only its own PnL contributes.
+        sup.shakedown_state.per_symbol["BTC/USD"].equity_peak_usd = 11_000.0
+
+        ticks = sup.run_once()
+        # One tick per symbol -> two contexts captured by StubCircuitBreakers.
+        self.assertEqual(len(ticks), 2)
+        # Find the BTC context and assert its equity_current is bankroll
+        # PLUS BTC's own pnl (0), NOT bankroll PLUS account-aggregate pnl
+        # (-5000). The "btc drawdown" check would otherwise see:
+        #   peak = 11000, current = 5000 -> 54.5% drawdown.
+        # With per-symbol semantics it sees:
+        #   peak = 11000, current = 10000 -> 9.1% drawdown only.
+        btc_ctx = next(
+            c for c in sup.circuit_breakers.check_calls if c.symbol == "BTC/USD"
+        )
+        self.assertAlmostEqual(btc_ctx.equity_current_usd, 10_000.0, places=2)
+        self.assertAlmostEqual(btc_ctx.equity_peak_usd, 11_000.0, places=2)
+
+        eth_ctx = next(
+            c for c in sup.circuit_breakers.check_calls if c.symbol == "ETH/USD"
+        )
+        # ETH's equity_current includes ITS losses: 10000 + (-5000) = 5000.
+        self.assertAlmostEqual(eth_ctx.equity_current_usd, 5_000.0, places=2)
+
+    def test_legacy_global_equity_peak_migrates_to_every_symbol(self) -> None:
+        """A pre-Lane-A shakedown JSON's global equity_peak_usd should be
+        copied into every per-symbol entry on first load (P0 #1)."""
+        legacy_blob = (
+            '{"started_at_utc": "2026-04-01T00:00:00+00:00", '
+            '"paper_days_clean": 5, '
+            '"daily_history": [], '
+            '"equity_peak_usd": 12345.67}'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "legacy.json"
+            path.write_text(legacy_blob, encoding="utf-8")
+            sup, _ = _build_supervisor(
+                symbols=["ETH/USD", "BTC/USD"],
+                shakedown_path=path,
+            )
+        for sym in ("ETH/USD", "BTC/USD"):
+            self.assertAlmostEqual(
+                sup.shakedown_state.per_symbol[sym].equity_peak_usd,
+                12345.67,
+                places=2,
+            )
+
+    def test_per_symbol_peak_advances_with_per_symbol_pnl(self) -> None:
+        """``evaluate_shakedown`` updates THIS symbol's peak from THIS
+        symbol's PnL, not the account aggregate."""
+        from state.position_store import Position
+
+        winning = Position(
+            position_id="btc-1",
+            exchange="coinbase",
+            symbol="BTC/USD",
+            side="long",
+            status="closed",
+            entry_price=30000.0,
+            entry_quote_usd=30000.0,
+            base_size=1.0,
+            opened_at_utc="2026-04-26T00:00:00+00:00",
+            realized_pnl_usd=2_000.0,
+        )
+        # Account-level pnl is +500 (-1500 ETH + 2000 BTC), but BTC's own
+        # pnl is +2000. BTC's peak should be 12000, not 10500.
+        losing = Position(
+            position_id="eth-1",
+            exchange="coinbase",
+            symbol="ETH/USD",
+            side="long",
+            status="closed",
+            entry_price=2000.0,
+            entry_quote_usd=2000.0,
+            base_size=1.0,
+            opened_at_utc="2026-04-26T00:00:00+00:00",
+            realized_pnl_usd=-1_500.0,
+        )
+        store = StubPositionStore(
+            daily_pnl=500.0,
+            closed_today=[winning, losing],
+        )
+        sup, _ = _build_supervisor(
+            symbols=["ETH/USD", "BTC/USD"],
+            position_store=store,
+        )
+        sup.evaluate_shakedown()
+        # BTC's peak: 10000 (bankroll) + 2000 (its pnl).
+        self.assertAlmostEqual(
+            sup.shakedown_state.per_symbol["BTC/USD"].equity_peak_usd,
+            12_000.0,
+            places=2,
+        )
+        # ETH's peak: bankroll-relative -1500 means equity is BELOW
+        # bankroll. Peak stays at 0 (its initial value) because the new
+        # equity_now (8500) is not greater than 0... wait, is greater.
+        # Actually 8500 > 0 so it advances to 8500.
+        self.assertAlmostEqual(
+            sup.shakedown_state.per_symbol["ETH/USD"].equity_peak_usd,
+            8_500.0,
+            places=2,
+        )
+
+
 class TestRunDirOutputSaving(unittest.TestCase):
     """``--log-dir`` flag creates a timestamped subdir + FileHandler."""
 
