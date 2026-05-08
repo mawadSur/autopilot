@@ -207,10 +207,137 @@ def _reliability_slope(y_true: np.ndarray, y_prob: np.ndarray, *, bins: int = 10
     return float(slope)
 
 
+def _simulate_strategy_pnl(
+    y_true: np.ndarray,
+    proba: np.ndarray,
+    *,
+    threshold: float = 0.5,
+    position_size: float = 1.0,
+    fee_bps: float = 200.0,
+    bars_per_year: int = 525_600,
+) -> Dict[str, float]:
+    """Simulate a long-only PnL stream from (y_true, proba) and a threshold.
+
+    Each row where ``proba >= threshold`` is a simulated trade. Outcome
+    is binary so we approximate per-trade return as ``+position_size``
+    on a win (label=1, forward return cleared the dataset's threshold)
+    and ``-position_size`` on a loss (label=0). Fees are deducted per
+    round-trip in basis-points (``fee_bps / 10_000``).
+
+    Builds an equity_curve + trade_log compatible with
+    ``compute_profitability_metrics`` from ``profitability.py`` and
+    returns a flat dict of {sharpe, max_drawdown, win_rate, avg_win,
+    avg_loss, n_trades}.
+
+    Edge cases:
+      * No triggers (or threshold > all probas) -> sharpe=0, max_dd=0,
+        win_rate=0.
+      * Equity std is 0 (all trades same direction or no trades) ->
+        compute_profitability_metrics emits sharpe=0, which we surface
+        as-is.
+      * Inf max-drawdown is clipped to a finite sentinel via
+        compute_profitability_metrics' own logic.
+    """
+    from profitability import compute_profitability_metrics
+
+    y_true = np.asarray(y_true, dtype=int)
+    proba = np.asarray(proba, dtype=float)
+    if y_true.shape != proba.shape:
+        raise ValueError(
+            f"_simulate_strategy_pnl: y_true shape {y_true.shape} != proba "
+            f"shape {proba.shape}"
+        )
+    triggers = proba >= float(threshold)
+    n_trades = int(triggers.sum())
+    fee_per_trade = float(fee_bps) / 10_000.0
+
+    # Build a per-row equity curve. Tick rows that didn't trigger leave
+    # equity flat (return = 0). Tick rows that triggered:
+    #   win:  +position_size - fee
+    #   loss: -position_size - fee
+    start_capital = max(100.0, position_size * 100.0)
+    rets = np.zeros(len(y_true), dtype=float)
+    if n_trades > 0:
+        win_mask = triggers & (y_true == 1)
+        loss_mask = triggers & (y_true == 0)
+        rets[win_mask] = (position_size - fee_per_trade) / start_capital
+        rets[loss_mask] = (-position_size - fee_per_trade) / start_capital
+
+    # Cumulative equity curve.
+    equity = start_capital * np.cumprod(1.0 + rets)
+    equity_curve = pd.DataFrame({"equity": equity})
+    end_equity = float(equity[-1]) if equity.size else start_capital
+
+    # Trade log shaped for compute_profitability_metrics: each "exit"
+    # carries pnl + ret. ret is per-trade fractional return.
+    trade_log: List[dict] = []
+    for i, trig in enumerate(triggers):
+        if not trig:
+            continue
+        if y_true[i] == 1:
+            pnl = float(position_size - fee_per_trade)
+            ret = pnl / start_capital
+        else:
+            pnl = -float(position_size + fee_per_trade)
+            ret = pnl / start_capital
+        trade_log.append({"action": "exit", "pnl": pnl, "ret": ret})
+
+    # Compute max drawdown from the equity curve directly so we can pass
+    # it to compute_profitability_metrics via the report dict (its own
+    # equity-curve-based dd math is folded into the sharpe path).
+    if equity.size:
+        running_peak = np.maximum.accumulate(equity)
+        drawdowns = (running_peak - equity) / np.maximum(running_peak, 1e-12)
+        max_dd = float(drawdowns.max()) if drawdowns.size else 0.0
+    else:
+        max_dd = 0.0
+
+    report = {
+        "portfolio": {
+            "start_capital": start_capital,
+            "end_equity": end_equity,
+            "max_drawdown": max_dd,
+        }
+    }
+    metrics = compute_profitability_metrics(
+        report, equity_curve, trade_log, bars_per_year=bars_per_year
+    )
+
+    # Win/loss aggregates straight from trade_log so callers can audit.
+    win_pnls = [t["pnl"] for t in trade_log if t["pnl"] > 0]
+    loss_pnls = [t["pnl"] for t in trade_log if t["pnl"] < 0]
+    avg_win = float(np.mean(win_pnls)) if win_pnls else 0.0
+    avg_loss = float(np.mean(loss_pnls)) if loss_pnls else 0.0
+    win_rate = float(len(win_pnls) / max(1, n_trades))
+
+    sharpe = float(metrics.get("sharpe_annualized", 0.0))
+    # Clip non-finite sharpe (zero-variance returns produce NaN under
+    # naive division). compute_profitability_metrics already maps that
+    # to 0.0 but defend against future drift.
+    if not np.isfinite(sharpe):
+        sharpe = 0.0
+
+    return {
+        "sharpe": sharpe,
+        "max_drawdown": float(metrics.get("max_drawdown_pct", 0.0)) / 100.0,
+        "win_rate": win_rate,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "n_trades": float(n_trades),
+    }
+
+
 def _evaluate(
     y_true: np.ndarray, y_prob: np.ndarray, *, label_classes: List[int]
 ) -> Dict[str, float]:
-    """Compute calibration + classification metrics."""
+    """Compute calibration + classification + simulated PnL metrics.
+
+    Calibration metrics (brier, log_loss, accuracy, AUC, reliability
+    slope) say nothing about whether a thresholded policy is actually
+    profitable. We tack on a simulated long-only PnL at threshold=0.5
+    so the trainer report includes Sharpe/max-dd alongside the
+    statistical metrics.
+    """
     out: Dict[str, float] = {}
     if len(label_classes) == 2:
         out["brier"] = float(brier_score_loss(y_true, y_prob))
@@ -226,6 +353,12 @@ def _evaluate(
             out["auc"] = float("nan")
     if len(label_classes) == 2:
         out["reliability_slope"] = _reliability_slope(y_true, y_prob)
+        # Simulated PnL is binary-classifier-only: multi-class needs a
+        # different policy mapping (long the argmax? long top-2?).
+        pnl_metrics = _simulate_strategy_pnl(y_true, y_prob, threshold=0.5)
+        for k, v in pnl_metrics.items():
+            # Namespace under sim_ to avoid clashing with calibration keys.
+            out[f"sim_{k}"] = v
     return out
 
 
