@@ -1028,6 +1028,23 @@ class Supervisor:
         closed_today = self.position_store.list_closed_today(now_utc=now)
         equity_usd = self.config.bankroll_usd + daily_pnl
 
+        # Task 5: Sentry breadcrumb so postmortems see daily-close events.
+        try:
+            from observability.monitoring import breadcrumb as _breadcrumb
+
+            _breadcrumb(
+                category="supervisor.daily_close",
+                message=f"daily_close at {now.isoformat()}",
+                data={
+                    "daily_pnl_usd": daily_pnl,
+                    "open_positions": len(open_positions),
+                    "closed_today": len(closed_today),
+                    "equity_usd": equity_usd,
+                },
+            )
+        except Exception:  # noqa: BLE001 - never let breadcrumbs crash
+            pass
+
         # Send Discord-only summary -- best-effort, never raises.
         try:
             self.notifier.daily_summary(
@@ -1364,9 +1381,18 @@ class Supervisor:
         proposed_usd: float,
     ) -> None:
         """Place a real market order. Raises ExchangeError on failure."""
-        order: OrderResult = self.exchange.place_market_order(
-            symbol, side, quote_size_usd=proposed_usd
-        )
+        order_start = time.monotonic()
+        try:
+            order: OrderResult = self.exchange.place_market_order(
+                symbol, side, quote_size_usd=proposed_usd
+            )
+        finally:
+            # Task 5: order placement latency histogram, even on failure.
+            self._safe_metric_call(
+                lambda d=time.monotonic() - order_start, sym=symbol: (
+                    self._emit_order_latency_metric(symbol=sym, duration_s=d)
+                )
+            )
         # Record the position; promote to open if the response shows fully
         # filled, otherwise keep as pending so reconcile can clean up later.
         position = self._position_from_order(
@@ -1968,6 +1994,21 @@ class Supervisor:
         self.metrics_pusher.histogram(
             "tick_duration_seconds", float(duration_s), labels={"symbol": sym}
         )
+        # Task 5: explicit per-tick duration histogram on the canonical
+        # ``autopilot_tick_duration_s`` name requested for the SLO board.
+        self.metrics_pusher.histogram(
+            "tick_duration_s", float(duration_s), labels={"symbol": sym}
+        )
+        # Task 5: model confidence distribution. Only observe when we have
+        # a finite value -- skipped/errored ticks legitimately have None.
+        if tick.model_confidence is not None and math.isfinite(
+            float(tick.model_confidence)
+        ):
+            self.metrics_pusher.histogram(
+                "model_confidence",
+                float(tick.model_confidence),
+                labels={"symbol": sym},
+            )
         if tick.action_taken == "errored":
             self.metrics_pusher.counter("errors_total", 1.0, labels={"symbol": sym})
         if tick.action_taken == "allowed":
@@ -2003,6 +2044,40 @@ class Supervisor:
         self.metrics_pusher.gauge(
             "paper_days_clean", float(self.shakedown_state.paper_days_clean)
         )
+        # Task 5: per-symbol shakedown clean days + daily PnL. Surfaces
+        # the per-symbol view that's already in the shakedown state but
+        # wasn't reaching Prometheus -- needed for the per-symbol SLO
+        # board because the global gauge collapses min(per_symbol).
+        for sym in self.config.symbols:
+            sym_state = self.shakedown_state.per_symbol.get(sym)
+            if sym_state is not None:
+                self.metrics_pusher.gauge(
+                    "shakedown_clean_days",
+                    float(sym_state.paper_days_clean),
+                    labels={"symbol": sym},
+                )
+            try:
+                pnl_for_symbol = float(
+                    self.position_store.daily_realized_pnl_usd_for_symbol(sym)
+                )
+            except Exception:  # noqa: BLE001 - read is best-effort
+                continue
+            # Per-symbol PnL goes on a distinct metric name -- the unlabeled
+            # ``autopilot_daily_pnl_usd`` collector cache would reject a
+            # labeled call (Prometheus collectors can't change label names
+            # after registration). Use ``autopilot_daily_pnl_usd_by_symbol``
+            # for the per-symbol cut.
+            self.metrics_pusher.gauge(
+                "daily_pnl_usd_by_symbol",
+                pnl_for_symbol,
+                labels={"symbol": sym},
+            )
+        # Task 4 surface: orphan position count gauge (from PositionStore).
+        try:
+            orphans = float(self.position_store.orphan_count())
+            self.metrics_pusher.gauge("orphan_positions", orphans)
+        except (AttributeError, Exception):  # noqa: BLE001 - tolerate stub stores
+            pass
 
     def _emit_daily_close_metrics(
         self,
@@ -2020,6 +2095,19 @@ class Supervisor:
         self.metrics_pusher.gauge("paper_days_clean", float(paper_days_clean))
         self.metrics_pusher.gauge(
             "shakedown_unlocked", 1.0 if self.is_live_unlocked() else 0.0
+        )
+
+    def _emit_order_latency_metric(
+        self, *, symbol: str, duration_s: float
+    ) -> None:
+        """Task 5: ``autopilot_order_latency_s`` histogram. Always called
+        from ``_place_live_order``'s finally-block so latency is recorded
+        even when the exchange call raises.
+        """
+        if not self._pusher_enabled():
+            return
+        self.metrics_pusher.histogram(
+            "order_latency_s", float(duration_s), labels={"symbol": symbol}
         )
 
 

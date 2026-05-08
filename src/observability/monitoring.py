@@ -396,11 +396,54 @@ class MetricsPusher:
         return collector
 
 
+# ---------------------------------------------------------------------------
+# Sentry helpers (best-effort, never raise)
+# ---------------------------------------------------------------------------
+
+
+def breadcrumb(
+    *,
+    category: str,
+    message: str,
+    level: str = "info",
+    data: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Emit a Sentry breadcrumb. No-op if Sentry isn't configured.
+
+    Used by the supervisor for tick start, order placed, fill received,
+    breaker decision, and daily close. The breadcrumb call must NEVER
+    raise — observability must not crash the trader.
+    """
+    try:
+        import sentry_sdk  # type: ignore[import-not-found]
+
+        sentry_sdk.add_breadcrumb(
+            category=category,
+            message=message,
+            level=level,
+            data=data or {},
+        )
+    except Exception:  # noqa: BLE001 - never raise from monitoring
+        pass
+
+
+def capture_message(message: str, level: str = "warning") -> None:
+    """Forward a message to Sentry. Best-effort, never raises."""
+    try:
+        import sentry_sdk  # type: ignore[import-not-found]
+
+        sentry_sdk.capture_message(message, level=level)
+    except Exception:  # noqa: BLE001 - never raise from monitoring
+        pass
+
+
 __all__ = [
     "DEFAULT_HISTOGRAM_BUCKETS",
     "DEFAULT_JOB_NAME",
     "METRIC_NAME_PREFIX",
     "Metric",
     "MetricsPusher",
+    "breadcrumb",
+    "capture_message",
     "init_sentry",
 ]
