@@ -1245,7 +1245,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception:  # noqa: BLE001
         pass
     args = _parse_args(argv)
-    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    raw_symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    # Dedupe preserving first-seen order. Duplicates are usually a config typo
+    # (eg. ``--symbols ETH/USD,ETH/USD``) and would otherwise spawn two
+    # supervisor entries fighting over the same Redis position keys + the
+    # same flock'ed shakedown file. Drop them with a warning per dropped
+    # entry; if the deduped list is empty (every symbol was a dup of nothing),
+    # exit 2.
+    symbols: List[str] = []
+    seen: set[str] = set()
+    for sym in raw_symbols:
+        if sym in seen:
+            LOGGER.warning(
+                "supervisor: dropping duplicate symbol %r from --symbols", sym
+            )
+            continue
+        seen.add(sym)
+        symbols.append(sym)
     if not symbols:
         print("error: --symbols must contain at least one entry", file=sys.stderr)
         return 2
