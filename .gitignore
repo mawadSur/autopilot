@@ -34,3 +34,12 @@ node_modules/
 package.json
 package-lock.json
 runs/
+
+# Generated training artifacts (regen via scripts/retrain_all_crypto_models.sh
+# or rsync model_crypto/ between machines for the small 1.4MB bundle).
+# Datasets are 200MB+ and regen via backfill_ohlcv.py from Coinbase.
+data/crypto/datasets/*.parquet
+model_crypto/
+
+# Polymarket scanner JSON exports
+output/
