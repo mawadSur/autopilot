@@ -19,6 +19,7 @@ import logging
 import json
 import math
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
@@ -108,6 +109,134 @@ def set_seed(seed: int) -> None:
 
 def get_device_str() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ---------------------------
+# LLM JSON extraction
+# ---------------------------
+
+# Common keys we will try to recover via field-level regex when full JSON parsing fails.
+_FIELD_LEVEL_NUMERIC_KEYS = (
+    "clarity_score",
+    "narrative_momentum",
+    "confidence_score",
+    "xgboost_prob",
+    "calibrated_true_prob",
+    "llm_adjustment_pct_points",
+    "edge_vs_market",
+)
+_FIELD_LEVEL_STRING_KEYS = (
+    "reasoning",
+    "rationale",
+    "action",
+    "summary",
+    "classification",
+    "process_quality",
+    "outcome_quality",
+)
+_FIELD_LEVEL_BOOL_KEYS = ("ambiguous",)
+
+
+def _strip_code_fence(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json|JSON)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _regex_field_fallback(cleaned: str) -> Dict[str, Any]:
+    """Best-effort recovery: pull individual fields out of broken JSON via regex.
+
+    Returns whatever fields we managed to find. Caller decides whether the
+    result is empty.
+    """
+    found: Dict[str, Any] = {}
+
+    for key in _FIELD_LEVEL_NUMERIC_KEYS:
+        # Match e.g. "clarity_score": 87 or clarity score = 87 or clarity_score: 87.5
+        match = re.search(
+            rf'(?:"?{key}"?|{key.replace("_", " ")})\s*[:=]\s*(-?\d+(?:\.\d+)?)',
+            cleaned,
+            re.IGNORECASE,
+        )
+        if match:
+            value_str = match.group(1)
+            try:
+                value: Any = int(value_str) if "." not in value_str else float(value_str)
+            except ValueError:
+                value = value_str
+            found[key] = value
+
+    for key in _FIELD_LEVEL_BOOL_KEYS:
+        match = re.search(
+            rf'(?:"?{key}"?)\s*[:=]\s*(true|false|yes|no)',
+            cleaned,
+            re.IGNORECASE,
+        )
+        if match:
+            found[key] = match.group(1).strip().lower() in {"true", "yes"}
+
+    for key in _FIELD_LEVEL_STRING_KEYS:
+        # Capture either a quoted string or trailing free text up to the next field/end.
+        quoted = re.search(rf'"?{key}"?\s*[:=]\s*"((?:[^"\\]|\\.)*)"', cleaned, re.IGNORECASE)
+        if quoted:
+            found[key] = quoted.group(1).strip()
+            continue
+        loose = re.search(rf'"?{key}"?\s*[:=]\s*(.+)', cleaned, re.IGNORECASE | re.DOTALL)
+        if loose:
+            value = loose.group(1).strip()
+            value = re.sub(r'^[\s:,\-]+', '', value)
+            value = value.rstrip('}\"` \n')
+            if value:
+                found[key] = value
+
+    return found
+
+
+def extract_json_object(text: str) -> Dict[str, Any]:
+    """Extract a JSON object from possibly-noisy LLM output.
+
+    Tries, in order:
+    1. Direct ``json.loads`` after stripping Markdown code fences.
+    2. Bracket extraction (substring from the first ``{`` to the last ``}``).
+    3. Field-level regex fallback for the most common keys (``clarity_score``,
+       ``narrative_momentum``, ``reasoning``, etc.).
+
+    Raises:
+        ValueError: if the input is None/empty, or if no JSON-like content
+            can be recovered. Always returns a non-empty ``dict`` on success.
+    """
+    if text is None:
+        raise ValueError("extract_json_object received None")
+    if not isinstance(text, str):
+        raise TypeError(f"extract_json_object expected str, got {type(text)!r}")
+
+    cleaned = _strip_code_fence(text)
+    if not cleaned:
+        raise ValueError("extract_json_object received empty input")
+
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict) and parsed:
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(cleaned[start : end + 1])
+            if isinstance(parsed, dict) and parsed:
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    fallback = _regex_field_fallback(cleaned)
+    if not fallback:
+        raise ValueError("Could not extract a JSON object from the input")
+    return fallback
 
 
 # ---------------------------

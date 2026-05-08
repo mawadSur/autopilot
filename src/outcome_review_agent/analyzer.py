@@ -9,6 +9,7 @@ from google.genai import types
 
 from config import cfg
 from outcome_review_agent.models import OutcomeReview
+from utils import extract_json_object
 
 
 DEFAULT_MODEL_NAME = "gemini-2.5-pro"
@@ -90,21 +91,7 @@ def _parse_review_response(response: Any) -> OutcomeReview:
         return _coerce_review(parsed)
 
     raw_text = _extract_response_text(response)
-    cleaned = raw_text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.removeprefix("```")
-        if cleaned.startswith("json"):
-            cleaned = cleaned[4:]
-        cleaned = cleaned.removesuffix("```").strip()
-
-    try:
-        return OutcomeReview.model_validate_json(cleaned)
-    except Exception:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise
-        return OutcomeReview.model_validate(json.loads(cleaned[start : end + 1]))
+    return _coerce_review(extract_json_object(raw_text))
 
 
 def _build_review_prompt(

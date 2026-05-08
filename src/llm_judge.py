@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from config import cfg
+from utils import extract_json_object
 
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
@@ -138,46 +139,13 @@ def _extract_response_text(response_json: Dict[str, Any]) -> str:
 
 
 def _extract_json_object(text: str) -> Dict[str, Any]:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
+    """Thin shim around :func:`utils.extract_json_object` for back-compat.
 
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            parsed = json.loads(cleaned[start : end + 1])
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    clarity_match = re.search(r'(?:"?clarity[_ ]score"?|clarity score)\s*[:=]\s*(\d{1,3})', cleaned, re.IGNORECASE)
-    momentum_match = re.search(r'(?:"?narrative[_ ]momentum"?|narrative momentum)\s*[:=]\s*(\d{1,3})', cleaned, re.IGNORECASE)
-    ambiguous_match = re.search(r'(?:"?ambiguous"?)\s*[:=]\s*(true|false|yes|no)', cleaned, re.IGNORECASE)
-    reasoning_match = re.search(r'(?:"?reasoning"?|reasoning)\s*[:=]\s*"?(.+)', cleaned, re.IGNORECASE | re.DOTALL)
-    if not clarity_match and not momentum_match:
-        raise ValueError("Could not find a JSON object in Gemini response")
-
-    reasoning = ""
-    if reasoning_match:
-        reasoning = reasoning_match.group(1).strip()
-        reasoning = re.sub(r'^[\s:,-]+', '', reasoning)
-        reasoning = reasoning.rstrip('}\"` \n')
-
-    return {
-        "clarity_score": int(clarity_match.group(1)) if clarity_match else 50,
-        "narrative_momentum": int(momentum_match.group(1)) if momentum_match else 50,
-        "ambiguous": ambiguous_match.group(1).strip().lower() in {"true", "yes"} if ambiguous_match else False,
-        "reasoning": reasoning,
-    }
+    The shared helper handles Markdown fences, bracket extraction, and
+    field-level regex fallback. We reuse it here so all three LLM call
+    sites have consistent JSON-recovery behavior.
+    """
+    return extract_json_object(text)
 
 
 _MISSING = object()
