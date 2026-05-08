@@ -2183,6 +2183,50 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "Recommended: --log-dir runs"
         ),
     )
+    # Auto-pause + confidence-history wiring (Phase 16 ops polish). The
+    # gate is OFF by default — operators must opt in. When --auto-pause-
+    # enabled is set, daily_close evaluates the combined daily-loss +
+    # confidence-shift gate and, if it trips, writes the marker file the
+    # next tick observes. The three other flags expose the gate's tunables
+    # and the rolling confidence-baseline window size.
+    p.add_argument(
+        "--auto-pause-enabled",
+        action="store_true",
+        help=(
+            "Enable the combined daily-loss + confidence-shift auto-pause "
+            "gate. When tripped, writes ~/.autopilot_auto_paused marker so "
+            "the next tick halts."
+        ),
+    )
+    p.add_argument(
+        "--auto-pause-loss-pct",
+        type=float,
+        default=0.02,
+        help=(
+            "Auto-pause daily-loss threshold as a fraction of bankroll "
+            "(0.02 = 2%%). Only used when --auto-pause-enabled."
+        ),
+    )
+    p.add_argument(
+        "--auto-pause-confidence-window",
+        type=int,
+        default=200,
+        help=(
+            "Rolling window size for the confidence-history baseline "
+            "(per symbol). Default 200 ticks. Only used when "
+            "--auto-pause-enabled."
+        ),
+    )
+    p.add_argument(
+        "--auto-pause-confidence-sigma",
+        type=float,
+        default=2.0,
+        help=(
+            "How many baseline std-deviations recent mean confidence must "
+            "fall below for the gate's confidence condition to fire. "
+            "Default 2.0 (a roughly 2.3%% tail event)."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -2321,6 +2365,42 @@ def main(argv: Optional[List[str]] = None) -> int:
             "supervisor: predictor bootstrap failed (%s); using placeholder", exc
         )
 
+    # Auto-pause + confidence-history wiring (opt-in via CLI flag). The
+    # gate's daily-loss threshold + sigma come straight from argv; the
+    # confidence-history window is the per-symbol rolling buffer length.
+    auto_pause_gate: Optional[AutoPauseGate] = None
+    confidence_history: Optional[ConfidenceHistory] = None
+    if getattr(args, "auto_pause_enabled", False):
+        try:
+            auto_pause_gate = AutoPauseGate(
+                loss_threshold_pct=float(args.auto_pause_loss_pct),
+                z_threshold=float(args.auto_pause_confidence_sigma),
+                recent_window=int(args.auto_pause_confidence_window),
+            )
+        except Exception as exc:  # noqa: BLE001 - never crash boot on knob errors
+            LOGGER.warning(
+                "auto-pause gate construction failed (%s); disabling", exc
+            )
+            auto_pause_gate = None
+        # Wire the rolling confidence buffer through the same Redis client
+        # the position store already uses (when available) so baseline reads
+        # survive process restarts.
+        try:
+            redis_client = getattr(position_store, "_redis", None)
+            confidence_history = ConfidenceHistory(
+                redis_client=redis_client,
+                window_size=int(args.auto_pause_confidence_window),
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to in-process buffer
+            LOGGER.warning(
+                "confidence-history wiring failed (%s); using in-process buffer",
+                exc,
+            )
+            confidence_history = ConfidenceHistory(
+                redis_client=None,
+                window_size=int(args.auto_pause_confidence_window),
+            )
+
     supervisor = Supervisor(
         config=config,
         exchange=exchange,
@@ -2329,6 +2409,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         notifier=notifier,
         model_predict_fn=predict_fn,
         metrics_pusher=metrics_pusher,
+        auto_pause_gate=auto_pause_gate,
+        confidence_history=confidence_history,
     )
 
     run_dir = _setup_run_dir(args.log_dir, symbols=symbols)

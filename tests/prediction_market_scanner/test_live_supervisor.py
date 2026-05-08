@@ -1625,5 +1625,110 @@ class TestConsecutiveErrorAutoTripsKillSwitch(unittest.TestCase):
             self.assertNotIn("BTC/USDT", sup._auto_tripped_symbols)
 
 
+# ---------------------------------------------------------------------------
+# Phase 16: Auto-pause + confidence-history wiring
+# ---------------------------------------------------------------------------
+
+
+class TestAutoPauseWiring(unittest.TestCase):
+    """Auto-pause gate trips on daily_close when both legs of the AND fire.
+
+    The supervisor's gate is opt-in: ``daily_close`` only evaluates the
+    gate when ``self.auto_pause_gate is not None``. With the gate wired
+    and synthetic loss + below-baseline confidence, the marker file must
+    be written and the alert must go out.
+    """
+
+    def test_default_supervisor_has_no_gate_no_marker(self) -> None:
+        """No gate wired ⇒ daily_close never trips, never writes marker."""
+        sup, refs = _build_supervisor()
+        self.assertIsNone(sup.auto_pause_gate)
+        # daily_close runs cleanly without a gate.
+        sup.daily_close()
+        # Sanity: notifier got the daily summary but no auto-pause alert.
+        self.assertEqual(len(refs["notifier"].daily_summary_calls), 1)
+
+    def test_auto_pause_trips_on_loss_and_confidence_shift(self) -> None:
+        """Wired gate + synthetic loss + bad confidence → marker written."""
+        from risk.auto_pause import AutoPauseGate
+        from state.confidence_history import ConfidenceHistory
+
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "auto_paused_marker"
+            gate = AutoPauseGate(
+                loss_threshold_pct=0.01,  # 1% of bankroll
+                z_threshold=1.0,  # easy to trip
+                recent_window=10,
+                marker_path=marker,
+            )
+            history = ConfidenceHistory(redis_client=None, window_size=50)
+
+            # Loss exceeds the threshold (10000 * 0.01 = $100; we set -$200).
+            store = StubPositionStore(daily_pnl=-200.0)
+            sup, refs = _build_supervisor(
+                position_store=store,
+                bankroll_usd=10_000.0,
+            )
+            sup.auto_pause_gate = gate
+            sup.confidence_history = history
+
+            # Seed the baseline buffer with high-confidence values, then
+            # add several recent low-confidence values to trip the second
+            # condition (recent mean < baseline_mean - 1*sigma).
+            for _ in range(20):
+                history.record("ETH/USDT", 0.85)
+            for _ in range(10):
+                history.record("ETH/USDT", 0.30)
+
+            self.assertFalse(marker.exists())
+            sup.daily_close()
+            self.assertTrue(
+                marker.exists(),
+                "auto-pause should have written the marker file",
+            )
+            # And the alert must have gone out at critical severity.
+            critical_alerts = [
+                a
+                for a in refs["notifier"].alert_calls
+                if a.get("severity") == "critical"
+            ]
+            self.assertGreaterEqual(len(critical_alerts), 1)
+            self.assertTrue(
+                any(
+                    "AUTO-PAUSE" in a["message"] for a in critical_alerts
+                ),
+                f"expected AUTO-PAUSE alert message, got {critical_alerts!r}",
+            )
+
+    def test_auto_pause_gate_does_not_trip_on_loss_alone(self) -> None:
+        """Loss alone without confidence-shift must not trip (AND semantics)."""
+        from risk.auto_pause import AutoPauseGate
+        from state.confidence_history import ConfidenceHistory
+
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "auto_paused_marker"
+            gate = AutoPauseGate(
+                loss_threshold_pct=0.01,
+                z_threshold=2.0,
+                recent_window=10,
+                marker_path=marker,
+            )
+            history = ConfidenceHistory(redis_client=None, window_size=50)
+            # Only high-confidence samples — confidence leg can't fire.
+            for _ in range(20):
+                history.record("ETH/USDT", 0.85)
+
+            store = StubPositionStore(daily_pnl=-500.0)  # big loss
+            sup, _ = _build_supervisor(position_store=store)
+            sup.auto_pause_gate = gate
+            sup.confidence_history = history
+
+            sup.daily_close()
+            self.assertFalse(
+                marker.exists(),
+                "loss-only condition must not trip the AND-gated auto-pause",
+            )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
