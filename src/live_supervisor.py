@@ -1812,7 +1812,13 @@ class Supervisor:
         verdict: Optional[CircuitBreakerVerdict] = None,
         reason: Optional[str] = None,
     ) -> None:
-        """Capture the breaker-time snapshot for a single forced-flat position."""
+        """Capture the breaker-time snapshot for a single forced-flat position.
+
+        Phase-16: also populates the canonical ``kill_switch_reason``,
+        ``stop_loss_trigger_price``, and ``breaker_decision`` fields on the
+        snapshot so A5 ProcessIntegrity can declare primary-cause findings
+        without substring-matching the freeform ``notes``.
+        """
         if self.trade_context_store is None:
             return
         try:
@@ -1826,6 +1832,53 @@ class Supervisor:
                 }
             elif reason is not None:
                 br_ctx = {"reason": reason}
+
+            # Canonical fields (Phase-16). A5 prefers these over scanning
+            # the freeform notes/breaker_context dicts. Best-effort
+            # population from whichever inputs are available.
+            kill_switch_reason: Optional[str] = None
+            breaker_decision: Optional[str] = None
+            stop_loss_trigger_price: Optional[float] = None
+            tripped_lc = [
+                str(t).lower() for t in (verdict.tripped if verdict else [])
+            ]
+            reason_lc = (reason or (verdict.reason if verdict else "") or "").lower()
+            if "kill_switch" in tripped_lc or "kill_switch" in reason_lc:
+                kill_switch_reason = "kill_switch"
+            elif "daily_loss" in tripped_lc or "daily_loss" in reason_lc:
+                kill_switch_reason = "daily_loss_limit"
+            elif "consecutive_errors" in tripped_lc or "consecutive_errors" in reason_lc:
+                kill_switch_reason = "consecutive_errors"
+            elif "auto_pause" in tripped_lc or "auto_pause" in reason_lc:
+                kill_switch_reason = "auto_pause"
+            elif "manual" in reason_lc:
+                kill_switch_reason = "manual"
+            if verdict is not None:
+                breaker_decision = str(verdict.recommended_action) or None
+            elif reason is not None:
+                # Reason-only path (force_flat from kill switch) implies the
+                # breaker decision was force_flat — every caller of this
+                # helper is on the close-now path.
+                breaker_decision = "force_flat"
+            # Stop-loss trigger price: pull from verdict.details if the
+            # breaker emitted one (canonical key) or from position metadata.
+            details = dict(verdict.details or {}) if verdict else {}
+            for k in ("stop_loss_trigger", "stop_trigger_price", "stop_loss_price"):
+                if details.get(k) is not None:
+                    try:
+                        stop_loss_trigger_price = float(details[k])
+                        break
+                    except (TypeError, ValueError):
+                        pass
+            if stop_loss_trigger_price is None and position.model_meta:
+                for k in ("stop_price", "stop_loss_price", "stop_trigger_price"):
+                    v = position.model_meta.get(k)
+                    if v is not None:
+                        try:
+                            stop_loss_trigger_price = float(v)
+                            break
+                        except (TypeError, ValueError):
+                            pass
 
             snap = TradeContextSnapshot(
                 trade_id=position.position_id,
@@ -1846,6 +1899,9 @@ class Supervisor:
                 breaker_context=br_ctx,
                 ticker_buffer=[],
                 notes=reason,
+                kill_switch_reason=kill_switch_reason,
+                stop_loss_trigger_price=stop_loss_trigger_price,
+                breaker_decision=breaker_decision,
             )
             self.trade_context_store.record_snapshot(snap)
         except Exception as exc:  # noqa: BLE001 - never crash the tick

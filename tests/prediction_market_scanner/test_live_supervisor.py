@@ -1492,6 +1492,24 @@ class TestTradeContextSnapshotCapture(unittest.TestCase):
         # The reason is propagated into the snapshot's notes/breaker_context.
         self.assertIsNotNone(breaker_snap.notes)
 
+    def test_breaker_snapshot_populates_canonical_kill_switch_fields(self) -> None:
+        """Phase-16: kill-switch trip writes the canonical fields A5 reads."""
+        existing_pos = _make_position(side="long", symbol="ETH/USDT")
+        ps = StubPositionStore(open_positions=[existing_pos])
+        breakers = StubCircuitBreakers(kill_switch=True)
+        sup, refs, store = self._build(
+            with_store=True, breakers=breakers, position_store=ps
+        )
+        sup.run_once()
+        snaps = store.get_snapshots(existing_pos.position_id)
+        breaker_snap = snaps.get("breaker")
+        assert breaker_snap is not None
+        # Kill-switch trip populated the canonical reason field. A5 will
+        # prefer this over scanning notes.
+        self.assertEqual(breaker_snap.kill_switch_reason, "kill_switch")
+        # Force-flat path always tags ``breaker_decision``.
+        self.assertEqual(breaker_snap.breaker_decision, "force_flat")
+
     def test_no_store_wired_skips_snapshot_capture(self) -> None:
         """Sanity: without a store, the supervisor must still tick cleanly
         and not raise from the snapshot helpers."""

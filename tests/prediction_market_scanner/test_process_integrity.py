@@ -323,6 +323,119 @@ class ProcessIntegrityAgentTests(unittest.TestCase):
             f"expected snapshot-gap evidence, got {finding.evidence!r}",
         )
 
+    # --------------------------------------------------------------- 7
+    # Phase-16: A5 prefers canonical TradeContextSnapshot fields over
+    # substring-matching breaker_context / notes.
+    def test_canonical_kill_switch_reason_satisfies_breaker_check(self) -> None:
+        """A breaker snapshot with ``kill_switch_reason`` set must satisfy the
+        kill-switch consistency check even without ``breaker_context.tripped``
+        carrying ``"kill_switch"``."""
+        store = _store()
+        store.record_snapshot(_signal_snap(notes="kill_switch_pending"))
+        store.record_snapshot(_fill_snap())
+        # No "kill_switch" in tripped, but the canonical field IS set —
+        # the legacy probe would flag this as primary, but with the
+        # canonical field, A5 must accept it.
+        breaker = _breaker_snap(
+            breaker_context={
+                "tripped": ["daily_loss"],
+                "reason": "daily_loss",
+                "recommended_action": "force_flat",
+                "details": {},
+            },
+            notes=None,
+        )
+        breaker.kill_switch_reason = "kill_switch"
+        store.record_snapshot(breaker)
+        agent = ProcessIntegrityAgent(context_store=store)
+        finding = agent.investigate("trade-1")
+        # No primary kill_switch flag because the canonical field
+        # confirms the trip even though the legacy substring isn't there.
+        # Could land as innocent or contributing depending on the
+        # other paths; the load-bearing assertion is that the
+        # "supposed to trip but didn't" primary flag is NOT raised.
+        self.assertNotEqual(finding.verdict, "primary_cause")
+        self.assertFalse(
+            any(
+                "kill_switch" in e and "supposed to trip" in e.lower()
+                for e in finding.evidence
+            ),
+            f"unexpected supposed-to-trip evidence: {finding.evidence!r}",
+        )
+
+    def test_canonical_stop_loss_trigger_price_used(self) -> None:
+        """A5 prefers the canonical ``stop_loss_trigger_price`` over the
+        legacy ``risk_metrics_input.stop_loss_trigger`` probe."""
+        store = _store()
+        store.record_snapshot(_signal_snap(notes=None))
+        store.record_snapshot(_fill_snap())
+        # No legacy keys at all — only the canonical field carries the
+        # trigger price. With exit at 95 vs trigger at 100 the drift is
+        # 5% which is well above the primary threshold.
+        breaker = _breaker_snap(
+            breaker_context={
+                "tripped": ["stop_loss"],
+                "reason": "stop_loss",
+                "recommended_action": "force_flat",
+                "details": {},
+            },
+            notes="stop_loss force_flat",
+        )
+        breaker.stop_loss_trigger_price = 100.0
+        store.record_snapshot(breaker)
+        position_store = _StubPositionStore(
+            _StubPosition(
+                position_id="trade-1",
+                exchange="coinbase-paper",
+                exit_price=95.0,
+                notes="paper-deferred-fill stop_loss force_flat",
+            )
+        )
+        agent = ProcessIntegrityAgent(
+            context_store=store, position_store=position_store
+        )
+        finding = agent.investigate("trade-1")
+        self.assertEqual(finding.verdict, "primary_cause")
+        self.assertTrue(
+            any("stop-loss" in e for e in finding.evidence),
+            f"expected stop-loss evidence, got {finding.evidence!r}",
+        )
+
+    def test_legacy_snapshot_without_canonical_fields_still_works(self) -> None:
+        """Backward-compat: A5 must keep working on snapshots captured before
+        Phase-16 (where ``stop_loss_trigger_price`` is None)."""
+        store = _store()
+        store.record_snapshot(_signal_snap(notes=None))
+        store.record_snapshot(_fill_snap())
+        breaker = _breaker_snap(
+            breaker_context={
+                "tripped": ["stop_loss"],
+                "reason": "stop_loss",
+                "recommended_action": "force_flat",
+                "details": {},
+                # Legacy place where the trigger price was stuffed.
+                "trigger_price": 100.0,
+            },
+            notes="stop_loss force_flat",
+        )
+        # Canonical fields stay None — the legacy fall-through must fire.
+        self.assertIsNone(breaker.stop_loss_trigger_price)
+        store.record_snapshot(breaker)
+        position_store = _StubPositionStore(
+            _StubPosition(
+                position_id="trade-1",
+                exchange="coinbase-paper",
+                exit_price=95.0,
+                notes="paper-deferred-fill stop_loss force_flat",
+            )
+        )
+        agent = ProcessIntegrityAgent(
+            context_store=store, position_store=position_store
+        )
+        finding = agent.investigate("trade-1")
+        # The legacy trigger_price probe still works — primary cause.
+        self.assertEqual(finding.verdict, "primary_cause")
+
     def test_safe_investigate_swallows_store_failure(self) -> None:
         class _ExplodingStore:
             namespace = "test"

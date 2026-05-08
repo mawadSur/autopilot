@@ -233,13 +233,23 @@ class ProcessIntegrityAgent(BaseForensicsAgent):
 
         If position notes claim a forced flat but ``breaker_context`` says
         ``recommended_action="allow"``, we have a lost-decision bug.
+
+        Phase-16: prefers ``snapshot.breaker_decision`` over scanning
+        ``breaker_context.recommended_action``. Falls back to the legacy
+        scan for snapshots captured before that field existed.
         """
         if breaker_snap is None:
             # No breaker snapshot doesn't itself indicate breaker
             # incoherence — only forced-flat closes produce one.
             return None, None
         br = breaker_snap.breaker_context or {}
-        action = str(br.get("recommended_action") or "").strip()
+        # Phase-16 canonical field takes precedence over the dict probe.
+        canonical_decision = getattr(breaker_snap, "breaker_decision", None)
+        action = str(
+            canonical_decision
+            if canonical_decision is not None
+            else (br.get("recommended_action") or "")
+        ).strip()
         reason = str(br.get("reason") or "").strip().lower()
         notes = ""
         if position is not None and getattr(position, "notes", None):
@@ -285,12 +295,18 @@ class ProcessIntegrityAgent(BaseForensicsAgent):
           omits ``"kill_switch"``) — primary bug, the breaker check
           missed a real condition.
         """
-        # Trip claimed by breaker_context.
+        # Trip claimed by canonical field OR by breaker_context.tripped.
+        # Phase-16: prefer the canonical ``kill_switch_reason`` field; fall
+        # back to scanning ``breaker_context.tripped`` for legacy snapshots.
         ks_in_breaker = False
         if breaker_snap is not None:
-            br = breaker_snap.breaker_context or {}
-            tripped = [str(t) for t in (br.get("tripped") or [])]
-            ks_in_breaker = "kill_switch" in tripped
+            canonical_ksr = getattr(breaker_snap, "kill_switch_reason", None)
+            if canonical_ksr:
+                ks_in_breaker = True
+            else:
+                br = breaker_snap.breaker_context or {}
+                tripped = [str(t) for t in (br.get("tripped") or [])]
+                ks_in_breaker = "kill_switch" in tripped
 
         notes_imply_ks = False
         for snap in (signal_snap, breaker_snap):
@@ -412,23 +428,39 @@ class ProcessIntegrityAgent(BaseForensicsAgent):
             return None, None
 
         # Try several conventions for surfacing the trigger price.
+        # Phase-16: the canonical ``stop_loss_trigger_price`` field takes
+        # precedence; fall back to scanning ``risk_metrics_input`` and
+        # ``breaker_context`` for legacy snapshots.
         candidates: List[float] = []
-        rmi = breaker_snap.risk_metrics_input or {}
-        for key in ("stop_loss_trigger", "stop_trigger_price", "stop_loss_price"):
-            v = rmi.get(key)
-            if v is not None:
-                try:
-                    candidates.append(float(v))
-                except (TypeError, ValueError):
-                    pass
-        br = breaker_snap.breaker_context or {}
-        for key in ("stop_loss_trigger", "trigger_price"):
-            v = br.get(key)
-            if v is not None:
-                try:
-                    candidates.append(float(v))
-                except (TypeError, ValueError):
-                    pass
+        canonical_trigger = getattr(
+            breaker_snap, "stop_loss_trigger_price", None
+        )
+        if canonical_trigger is not None:
+            try:
+                candidates.append(float(canonical_trigger))
+            except (TypeError, ValueError):
+                pass
+        if not candidates:
+            rmi = breaker_snap.risk_metrics_input or {}
+            for key in (
+                "stop_loss_trigger",
+                "stop_trigger_price",
+                "stop_loss_price",
+            ):
+                v = rmi.get(key)
+                if v is not None:
+                    try:
+                        candidates.append(float(v))
+                    except (TypeError, ValueError):
+                        pass
+            br = breaker_snap.breaker_context or {}
+            for key in ("stop_loss_trigger", "trigger_price"):
+                v = br.get(key)
+                if v is not None:
+                    try:
+                        candidates.append(float(v))
+                    except (TypeError, ValueError):
+                        pass
 
         if not candidates:
             return None, None

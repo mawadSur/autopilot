@@ -88,6 +88,18 @@ class TradeContextSnapshot:
     BEFORE order placement), ``fill`` (after the exchange confirms the fill),
     ``breaker`` (a circuit-breaker forced exit), and ``close`` (the final
     book-closing snapshot, optional — usually fill or breaker is enough).
+
+    Phase-16 canonical fields
+    -------------------------
+    The three optional ``kill_switch_reason``, ``stop_loss_trigger_price``,
+    and ``breaker_decision`` fields are the documented seam the Process-
+    Integrity (A5) and Execution-Forensics (A2) agents read instead of
+    substring-scanning ``breaker_context`` / ``notes``. Pre-Phase-16
+    snapshots stored without these fields deserialize cleanly because they
+    default to ``None`` (Pydantic's ``cls(**data)`` resolution).
+
+    Fill-side structured metadata (also Phase-16) lives on the position
+    record, not the snapshot — see ``state.position_store.Position``.
     """
 
     trade_id: str
@@ -103,6 +115,12 @@ class TradeContextSnapshot:
     breaker_context: Dict[str, Any] = field(default_factory=dict)
     ticker_buffer: List[Dict[str, float]] = field(default_factory=list)
     notes: Optional[str] = None
+    # Phase-16 canonical breaker fields. A5 ProcessIntegrityAgent prefers
+    # these over substring-matching ``breaker_context``/``notes``. Default
+    # to None so legacy snapshots round-trip unchanged.
+    kill_switch_reason: Optional[str] = None
+    stop_loss_trigger_price: Optional[float] = None
+    breaker_decision: Optional[str] = None
 
     # ------------------------------------------------------------------
     # serialization

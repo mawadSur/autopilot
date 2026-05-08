@@ -188,6 +188,81 @@ class TradeContextStoreTests(unittest.TestCase):
         self.assertEqual(keys[0], "test:trade_ctx:ns-check:signal")
 
 
+class CanonicalBreakerFieldsTests(unittest.TestCase):
+    """Phase-16 canonical fields on ``TradeContextSnapshot``.
+
+    A5 ProcessIntegrity prefers these typed fields over substring-matching
+    the ``breaker_context`` dict / ``notes`` string. Tests assert: round
+    trip works, legacy snapshots without the fields deserialize cleanly
+    (defaults to None), and the new fields survive Redis storage.
+    """
+
+    def setUp(self) -> None:
+        self.fake = fakeredis.FakeRedis(decode_responses=True)
+        self.store = TradeContextStore(
+            redis_client=self.fake, namespace="test-canonical"
+        )
+
+    def test_new_fields_round_trip_through_to_json_and_from_json(self) -> None:
+        snap = TradeContextSnapshot(
+            trade_id="trade-canon",
+            symbol="BTC/USD",
+            captured_at_utc="2026-05-08T12:00:00+00:00",
+            phase="breaker",
+            kill_switch_reason="daily_loss_limit",
+            stop_loss_trigger_price=98.5,
+            breaker_decision="force_flat",
+        )
+        blob = snap.to_json()
+        revived = TradeContextSnapshot.from_json(blob)
+        self.assertEqual(revived.kill_switch_reason, "daily_loss_limit")
+        self.assertAlmostEqual(revived.stop_loss_trigger_price, 98.5)
+        self.assertEqual(revived.breaker_decision, "force_flat")
+
+    def test_legacy_blob_without_new_fields_defaults_to_none(self) -> None:
+        """Snapshots stored before Phase-16 must round-trip without the new keys."""
+        import json as _json
+
+        legacy = _json.dumps(
+            {
+                "trade_id": "legacy",
+                "symbol": "BTC/USD",
+                "captured_at_utc": "2026-05-01T12:00:00+00:00",
+                "phase": "breaker",
+                "feature_buffer": {},
+                "feature_window": None,
+                "model_probs": {},
+                "model_confidence": 0.0,
+                "risk_metrics_input": {},
+                "risk_metrics_output": {},
+                "breaker_context": {"reason": "kill_switch_file_present"},
+                "ticker_buffer": [],
+                "notes": "kill_switch_file_present",
+            }
+        )
+        revived = TradeContextSnapshot.from_json(legacy)
+        self.assertIsNone(revived.kill_switch_reason)
+        self.assertIsNone(revived.stop_loss_trigger_price)
+        self.assertIsNone(revived.breaker_decision)
+
+    def test_new_fields_survive_round_trip_through_redis(self) -> None:
+        snap = TradeContextSnapshot(
+            trade_id="trade-redis-canon",
+            symbol="ETH/USD",
+            captured_at_utc="2026-05-08T12:00:00+00:00",
+            phase="breaker",
+            kill_switch_reason="manual",
+            stop_loss_trigger_price=2000.0,
+            breaker_decision="force_flat",
+        )
+        self.store.record_snapshot(snap)
+        revived = self.store.get_snapshot("trade-redis-canon", "breaker")
+        assert revived is not None
+        self.assertEqual(revived.kill_switch_reason, "manual")
+        self.assertAlmostEqual(revived.stop_loss_trigger_price, 2000.0)
+        self.assertEqual(revived.breaker_decision, "force_flat")
+
+
 class RedisPostmortemQueueTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fake = fakeredis.FakeRedis(decode_responses=True)
