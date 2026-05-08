@@ -118,6 +118,67 @@ def _time_based_split(
     return train, val, test
 
 
+def walk_forward_cv(
+    df: pd.DataFrame,
+    *,
+    window_size: int = 1000,
+    step_size: int = 200,
+) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
+    """Anchored rolling walk-forward folds.
+
+    Each fold's train slice is ``df[0:val_start]`` and val slice is
+    ``df[val_start:val_end]`` where ``val_start`` advances by
+    ``step_size`` between folds. ``window_size`` sets the minimum
+    training history before the first fold's val begins, and
+    ``step_size`` bounds the per-fold validation length.
+
+    **Invariants** (covered by tests):
+
+      * ``min(val.timestamp) > max(train.timestamp)`` for every fold
+        (no leakage; train ends strictly before val begins),
+      * val slices across folds don't overlap.
+
+    Returns ``[]`` if the dataset has fewer than ``window_size + 1``
+    rows -- caller should fall back to single-split ``train()``.
+    """
+    if window_size <= 0 or step_size <= 0:
+        raise ValueError(
+            f"walk_forward_cv: window_size and step_size must be positive "
+            f"(got window_size={window_size}, step_size={step_size})"
+        )
+    n = len(df)
+    if n < window_size + 1:
+        return []
+
+    folds: List[Tuple[pd.DataFrame, pd.DataFrame]] = []
+    val_start = window_size
+    while val_start < n:
+        val_end = min(val_start + step_size, n)
+        train_slice = df.iloc[:val_start].copy()
+        val_slice = df.iloc[val_start:val_end].copy()
+        if len(val_slice) == 0:
+            break
+        folds.append((train_slice, val_slice))
+        val_start += step_size
+    return folds
+
+
+@dataclass
+class WalkForwardSummary:
+    """Aggregated metrics across all walk-forward folds.
+
+    ``per_fold`` is the per-fold metrics dict (one entry per fold);
+    ``mean_metrics`` is a flat ``{metric_name: mean_value}`` dict over
+    folds.
+    """
+
+    n_folds: int
+    per_fold: List[Dict[str, Any]]
+    mean_metrics: Dict[str, float]
+    feature_count: int
+    rows_total: int
+
+
 def _reliability_slope(y_true: np.ndarray, y_prob: np.ndarray, *, bins: int = 10) -> float:
     """Slope of (mean_pred, observed_freq) regression. 1.0 = perfectly calibrated.
 
@@ -271,6 +332,116 @@ def train(
         metrics_test,
     )
     return summary
+
+
+def train_with_walk_forward_cv(
+    df: pd.DataFrame,
+    *,
+    window_size: int = 1000,
+    step_size: int = 200,
+    calibration_method: Literal["isotonic", "sigmoid"] = "isotonic",
+    xgb_kwargs: Optional[Dict[str, Any]] = None,
+) -> WalkForwardSummary:
+    """Walk-forward CV: fit + calibrate on each fold, aggregate metrics.
+
+    A single train/val/test split can hide regime-dependent overfitting
+    (model looks great on the val slice but only because val happens to
+    be a calm period). Walk-forward folds let the operator see metric
+    variance across rolling time slices.
+
+    If ``walk_forward_cv`` returns no folds (dataset too small), raises
+    so the caller knows to fall back to ``train()``.
+    """
+    if "timestamp" not in df.columns or "label" not in df.columns:
+        raise ValueError(
+            "walk-forward CV requires 'timestamp' and 'label' columns"
+        )
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    feature_cols = [c for c in df.columns if c not in ("timestamp", "label")]
+    label_classes = sorted({int(v) for v in df["label"].unique()})
+    if len(label_classes) < 2:
+        raise ValueError(
+            f"Walk-forward CV requires at least 2 label classes; got {label_classes}"
+        )
+
+    folds = walk_forward_cv(df, window_size=window_size, step_size=step_size)
+    if not folds:
+        raise ValueError(
+            f"walk_forward_cv produced no folds for n={len(df)} "
+            f"window_size={window_size}; fall back to single-split train()"
+        )
+
+    booster_kwargs = dict(DEFAULT_XGB_KWARGS)
+    if xgb_kwargs:
+        booster_kwargs.update(xgb_kwargs)
+
+    per_fold: List[Dict[str, Any]] = []
+    for i, (train_df, val_df) in enumerate(folds):
+        X_train = train_df[feature_cols].to_numpy(dtype=np.float32)
+        y_train = train_df["label"].astype(int).to_numpy()
+        X_val = val_df[feature_cols].to_numpy(dtype=np.float32)
+        y_val = val_df["label"].astype(int).to_numpy()
+        if len(np.unique(y_train)) < 2 or len(np.unique(y_val)) < 2:
+            # Degenerate fold (one class only). Skip rather than crash --
+            # the booster's predict_proba is meaningless there.
+            LOGGER.warning(
+                "walk-forward fold %d has single-class slice; skipping", i
+            )
+            continue
+        booster = xgb.XGBClassifier(**booster_kwargs)
+        booster.fit(X_train, y_train)
+        calibrated = CalibratedClassifierCV(
+            FrozenEstimator(booster), method=calibration_method
+        )
+        calibrated.fit(X_val, y_val)
+        if len(label_classes) == 2:
+            prob_val = calibrated.predict_proba(X_val)[:, 1]
+        else:
+            prob_val = calibrated.predict_proba(X_val)
+        metrics: Dict[str, Any] = _evaluate(
+            y_val, prob_val, label_classes=label_classes
+        )
+        metrics["fold_index"] = i
+        metrics["rows_train"] = int(len(train_df))
+        metrics["rows_val"] = int(len(val_df))
+        # Recorded as strings so they survive JSON round-trips.
+        metrics["train_first_ts"] = str(train_df["timestamp"].iloc[0])
+        metrics["train_last_ts"] = str(train_df["timestamp"].iloc[-1])
+        metrics["val_first_ts"] = str(val_df["timestamp"].iloc[0])
+        metrics["val_last_ts"] = str(val_df["timestamp"].iloc[-1])
+        per_fold.append(metrics)
+
+    if not per_fold:
+        raise ValueError(
+            "All walk-forward folds were single-class; cannot aggregate"
+        )
+
+    # Aggregate numeric metrics by mean across folds.
+    skip_for_mean = {"fold_index", "rows_train", "rows_val"}
+    numeric_keys: List[str] = []
+    for k, v in per_fold[0].items():
+        if (
+            isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and k not in skip_for_mean
+        ):
+            numeric_keys.append(k)
+    mean_metrics: Dict[str, float] = {}
+    for k in numeric_keys:
+        vals = [
+            float(fold[k])
+            for fold in per_fold
+            if k in fold and np.isfinite(fold[k])
+        ]
+        mean_metrics[k] = float(np.mean(vals)) if vals else float("nan")
+
+    return WalkForwardSummary(
+        n_folds=len(per_fold),
+        per_fold=per_fold,
+        mean_metrics=mean_metrics,
+        feature_count=len(feature_cols),
+        rows_total=len(df),
+    )
 
 
 # ---------------------------------------------------------------------------
