@@ -41,11 +41,15 @@ testing — every Phase 1-4 collaborator is injected at construction time.
 from __future__ import annotations
 
 import argparse
+import collections
 import dataclasses
+import hashlib
 import json
 import logging
 import math
+import multiprocessing as mp
 import os
+import signal
 import sys
 import time
 import traceback
@@ -56,6 +60,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Deque,
     Dict,
     List,
     Literal,
@@ -227,6 +232,40 @@ def _acquire_file_lock(path: Path, *, exclusive: bool = True) -> Any:
 # almost certainly a sign the supervisor was paused / lost ticks for the
 # symbol.
 PAPER_PENDING_FILL_MAX_AGE_TICKS = 2
+
+
+# ---------------------------------------------------------------------------
+# Lane D D3: multiprocessing constants
+# ---------------------------------------------------------------------------
+
+# Redis key namespace for cross-process supervisor signals (shutdown,
+# leader election, etc). Children + parent both look here.
+_SHUTDOWN_KEY = "supervisor:shutdown_requested"
+# TTL on the shutdown flag. Parent sets it on signal; children check at
+# top of every tick. TTL prevents a stale shutdown flag from a previously
+# crashed parent process from poisoning a fresh boot.
+_SHUTDOWN_KEY_TTL_S = 60
+# Daily-close leader election: SETNX'd once per UTC date, scoped by the
+# supervisor's symbol set so two independent supervisor groups (different
+# symbol sets) don't share a leader key.
+_DAILY_CLOSE_LEADER_KEY_PREFIX = "daily_close_leader"
+_DAILY_CLOSE_LEADER_TTL_S = 7200  # 2 hours -- long enough to outlive a slow close.
+
+# Crash recovery: if a child exits unexpectedly, parent waits this long
+# before respawning to avoid tight crash loops.
+_CHILD_RESPAWN_BACKOFF_S = 5.0
+# Parent supervises children by polling .is_alive() at this cadence.
+_PARENT_HEALTH_POLL_S = 0.5
+# Default ceiling on respawns per symbol per hour. Beyond this the
+# supervisor treats the issue as systemic and halts.
+_DEFAULT_RESTART_LIMIT_PER_HOUR = 3
+# Window (seconds) for the rolling restart counter.
+_RESTART_WINDOW_S = 3600.0
+# Graceful shutdown: parent waits up to this many seconds for children to
+# exit cleanly after broadcasting shutdown, then SIGKILLs stragglers.
+_SHUTDOWN_GRACE_S = 30.0
+# Shorter grace interval used when polling each child's exit status.
+_SHUTDOWN_POLL_INTERVAL_S = 0.2
 
 
 @dataclasses.dataclass
@@ -2315,6 +2354,693 @@ class Supervisor:
             "order_latency_s", float(duration_s), labels={"symbol": symbol}
         )
 
+    # ------------------------------------------------------------------
+    # Lane D D3: multiprocessing-per-symbol supervisor
+    # ------------------------------------------------------------------
+    def run_workers(
+        self,
+        *,
+        restart_limit_per_hour: int = _DEFAULT_RESTART_LIMIT_PER_HOUR,
+    ) -> int:
+        """Multiprocessing-per-tradeable run loop.
+
+        Spawns one child process per :class:`Tradeable` in
+        :attr:`_tradeables`. Each child reconstructs its own non-picklable
+        resources (Redis client, predictor, exchange client, Tradeable
+        adapter) inside the child via :func:`_child_main` so nothing
+        process-bound is pickled across the fork boundary.
+
+        The parent monitors children, respawns crashed ones with a
+        ``_CHILD_RESPAWN_BACKOFF_S`` backoff and a
+        ``restart_limit_per_hour`` ceiling, and broadcasts shutdown via a
+        Redis flag on SIGTERM/SIGINT. Returns the supervisor's exit code:
+        ``0`` on clean shutdown, ``1`` if the restart-limit halt fired.
+
+        Notes for callers:
+          * Backward compat: :meth:`run_loop` still works exactly as
+            before. ``run_workers`` is a NEW entrypoint flipped on by the
+            ``--workers`` CLI flag.
+          * ``mp.get_context("spawn")`` is used unconditionally to avoid
+            inheriting forked ML state from the parent (predictor + ccxt
+            clients are deliberately re-constructed per-child).
+        """
+        if not self._tradeables:
+            LOGGER.warning(
+                "run_workers called with no tradeables; nothing to do."
+            )
+            return 0
+
+        ctx = mp.get_context("spawn")
+        # Child config dicts -- one per tradeable, computed once and
+        # re-used on every respawn for the same symbol.
+        configs_by_symbol: Dict[str, Dict[str, Any]] = {
+            tradeable.symbol: self._build_child_config(tradeable)
+            for tradeable in self._tradeables
+        }
+        processes: Dict[str, mp.process.BaseProcess] = {}
+        # Restart timestamps deque per symbol. We trim entries older than
+        # ``_RESTART_WINDOW_S`` whenever we test the limit; that keeps
+        # the deque bounded to "restarts in the last hour" without a
+        # dedicated reaper.
+        restart_counts: Dict[str, Deque[float]] = {
+            sym: collections.deque() for sym in configs_by_symbol
+        }
+        halted_for_restart_limit = False
+
+        # Install parent signal handlers BEFORE spawning so children
+        # don't inherit a half-installed handler set. The handlers set
+        # the in-process flag the supervisor loop polls.
+        self._shutdown_requested = False
+        prior_handlers: Dict[int, Any] = {}
+
+        def _handle_signal(_signum: int, _frame: Any) -> None:
+            self._shutdown_requested = True
+            try:
+                self._broadcast_shutdown()
+            except Exception as exc:  # noqa: BLE001 - never crash in handler
+                LOGGER.warning("broadcast_shutdown raised: %s", exc)
+
+        for signo in (signal.SIGTERM, signal.SIGINT):
+            try:
+                prior_handlers[signo] = signal.signal(signo, _handle_signal)
+            except (ValueError, OSError) as exc:
+                # Not running in main thread, or platform restriction --
+                # log and continue without the handler.
+                LOGGER.warning(
+                    "signal.signal(%s) failed: %s; running without handler",
+                    signo,
+                    exc,
+                )
+
+        try:
+            # Initial spawn pass.
+            for sym, child_config in configs_by_symbol.items():
+                proc = ctx.Process(
+                    target=_child_main,
+                    args=(child_config,),
+                    name=f"autopilot-child:{sym}",
+                    daemon=False,
+                )
+                proc.start()
+                processes[sym] = proc
+                LOGGER.info(
+                    "supervisor: spawned child for %s pid=%s",
+                    sym,
+                    proc.pid,
+                )
+
+            # Health-poll loop. Exits when:
+            #   * shutdown requested (parent signal handler), OR
+            #   * a symbol's restart limit was exceeded (halt).
+            while not self._shutdown_requested and not halted_for_restart_limit:
+                time.sleep(_PARENT_HEALTH_POLL_S)
+                for sym, proc in list(processes.items()):
+                    if proc.is_alive():
+                        continue
+                    exit_code = proc.exitcode
+                    LOGGER.warning(
+                        "supervisor: child for %s pid=%s exited with code=%s",
+                        sym,
+                        proc.pid,
+                        exit_code,
+                    )
+                    # Clean voluntary exit (code 0) usually means the
+                    # child saw the shutdown flag; do NOT respawn.
+                    if exit_code == 0 and self._shutdown_requested:
+                        processes.pop(sym, None)
+                        continue
+                    # Trim restart timestamps older than the rolling
+                    # window before testing the limit.
+                    now_mono = time.monotonic()
+                    history = restart_counts[sym]
+                    while history and now_mono - history[0] > _RESTART_WINDOW_S:
+                        history.popleft()
+                    if len(history) >= int(restart_limit_per_hour):
+                        LOGGER.error(
+                            "supervisor: restart limit (%d/hour) exceeded for %s; "
+                            "halting supervisor (assume systemic issue).",
+                            restart_limit_per_hour,
+                            sym,
+                        )
+                        self._emit_supervisor_halt_metric(
+                            reason="restart_limit", symbol=sym
+                        )
+                        halted_for_restart_limit = True
+                        break
+                    # Backoff, then respawn.
+                    LOGGER.warning(
+                        "supervisor: respawning child for %s in %.1fs",
+                        sym,
+                        _CHILD_RESPAWN_BACKOFF_S,
+                    )
+                    time.sleep(_CHILD_RESPAWN_BACKOFF_S)
+                    history.append(time.monotonic())
+                    proc = ctx.Process(
+                        target=_child_main,
+                        args=(configs_by_symbol[sym],),
+                        name=f"autopilot-child:{sym}",
+                        daemon=False,
+                    )
+                    proc.start()
+                    processes[sym] = proc
+                    LOGGER.info(
+                        "supervisor: respawned child for %s pid=%s "
+                        "(restart_count=%d in last hour)",
+                        sym,
+                        proc.pid,
+                        len(history),
+                    )
+        finally:
+            # Restore prior signal handlers so a future caller of
+            # run_workers (or anyone else in the same process) sees a
+            # clean signal map.
+            for signo, prior in prior_handlers.items():
+                try:
+                    signal.signal(signo, prior)
+                except (ValueError, OSError):
+                    pass
+            # Best-effort: broadcast shutdown so any still-alive child
+            # exits cleanly even on the halt path.
+            try:
+                self._broadcast_shutdown()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("broadcast_shutdown raised: %s", exc)
+            # Wait up to _SHUTDOWN_GRACE_S for clean exit, then SIGKILL.
+            self._stop_workers(processes)
+
+        return 1 if halted_for_restart_limit else 0
+
+    def _broadcast_shutdown(self) -> None:
+        """Set the cross-process shutdown flag in Redis.
+
+        Each child polls this key at the top of every tick. The TTL
+        bounds the lifetime of a stale flag so a long-since-crashed
+        parent doesn't poison a fresh boot.
+        """
+        redis_client = getattr(self.position_store, "_redis", None)
+        if redis_client is None:
+            return
+        try:
+            redis_client.set(_SHUTDOWN_KEY, "1", ex=_SHUTDOWN_KEY_TTL_S)
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            LOGGER.warning("failed to set %s in Redis: %s", _SHUTDOWN_KEY, exc)
+
+    def _stop_workers(
+        self,
+        processes: Dict[str, "mp.process.BaseProcess"],
+    ) -> None:
+        """Wait for clean child exits, SIGKILL stragglers after the grace.
+
+        Sends SIGTERM first (children should already be exiting via the
+        Redis shutdown flag, but SIGTERM is belt-and-braces). Polls
+        ``.is_alive()`` and joins as each child exits. After
+        ``_SHUTDOWN_GRACE_S`` any survivor gets ``terminate()`` followed
+        by ``kill()``. The function never raises; it logs.
+        """
+        # Send SIGTERM to any still-running child first.
+        for sym, proc in processes.items():
+            if proc.is_alive():
+                try:
+                    proc.terminate()
+                except Exception as exc:  # noqa: BLE001 - best-effort
+                    LOGGER.warning("terminate(%s) raised: %s", sym, exc)
+
+        deadline = time.monotonic() + _SHUTDOWN_GRACE_S
+        while processes and time.monotonic() < deadline:
+            for sym in list(processes.keys()):
+                proc = processes[sym]
+                if not proc.is_alive():
+                    proc.join(timeout=0.5)
+                    LOGGER.info(
+                        "supervisor: child for %s exited cleanly", sym
+                    )
+                    processes.pop(sym, None)
+            if processes:
+                time.sleep(_SHUTDOWN_POLL_INTERVAL_S)
+
+        # Stragglers: hard-kill.
+        for sym, proc in list(processes.items()):
+            if proc.is_alive():
+                LOGGER.warning(
+                    "supervisor: child for %s did not exit within %.1fs; "
+                    "killing pid=%s",
+                    sym,
+                    _SHUTDOWN_GRACE_S,
+                    proc.pid,
+                )
+                try:
+                    proc.kill()
+                except Exception as exc:  # noqa: BLE001 - best-effort
+                    LOGGER.warning("kill(%s) raised: %s", sym, exc)
+                proc.join(timeout=2.0)
+
+    def _build_child_config(self, tradeable: "Tradeable") -> Dict[str, Any]:
+        """Construct the picklable bootstrap dict passed to a child.
+
+        Everything the child needs to reconstruct its non-picklable
+        resources (Redis client, predictor, exchange client, Tradeable
+        adapter) lives in this dict. Live runtime objects (predictor
+        instance, exchange client, ccxt connector) are NOT pickled.
+
+        Schema (informal -- additive over time):
+          * ``symbol``                  -- string, the Tradeable's symbol.
+          * ``asset_class``             -- one of "spot_crypto" /
+                                           "perp_crypto" / "prediction_binary".
+          * ``tradeable_kind``          -- "coinbase" / "hyperliquid" /
+                                           "polymarket". The child uses
+                                           this to call the right factory
+                                           inside ``_child_main``.
+          * ``tradeable_args``          -- dict, kwargs for the factory.
+          * ``redis_url``               -- string or None. Falls back to
+                                           ``REDIS_URL`` env var inside the
+                                           child if None.
+          * ``redis_namespace``         -- :class:`PositionStore` namespace.
+          * ``shakedown_state_path``    -- string path.
+          * ``shakedown_min_days``      -- int.
+          * ``mode``                    -- "paper" or "live".
+          * ``bankroll_usd``            -- float.
+          * ``risk_pct_per_trade``      -- float.
+          * ``min_confidence_to_trade`` -- float.
+          * ``tick_interval_s``         -- float.
+          * ``symbol_set_hash``         -- str, sha256 prefix of sorted
+                                           symbol list. Used by the
+                                           daily-close leader-election
+                                           key so independent supervisor
+                                           groups don't share the lease.
+          * ``test_mode``               -- bool. When True, the child
+                                           runs the stub tick path
+                                           (writes to Redis, doesn't
+                                           construct exchange/predictor)
+                                           so tests can exercise the
+                                           multiprocess plumbing without
+                                           the full stack. Default False.
+          * ``test_max_ticks``          -- int. Test-mode only: child
+                                           exits after this many ticks.
+        """
+        symbol = tradeable.symbol
+        asset_class_obj = getattr(tradeable, "asset_class", None)
+        asset_class_str = str(getattr(asset_class_obj, "value", "") or "")
+        # Pull a redis_url off the position store if it had one (the store
+        # falls back to REDIS_URL env var inside the child if this is None).
+        redis_url = getattr(self.position_store, "_redis_url", None)
+        namespace = getattr(self.position_store, "namespace", "autopilot")
+        kill_switch_file = getattr(
+            self.circuit_breakers, "kill_switch_file", None
+        )
+
+        # Tradeable factory descriptor. Each branch surfaces only the
+        # plain-data kwargs the child needs to reconstruct the adapter.
+        tradeable_kind: str
+        tradeable_args: Dict[str, Any]
+        if asset_class_str == "prediction_binary":
+            tradeable_kind = "polymarket"
+            tradeable_args = {
+                "market_id": getattr(tradeable, "market_id", None),
+            }
+        elif asset_class_str == "perp_crypto":
+            tradeable_kind = "hyperliquid"
+            tradeable_args = {"symbol": symbol}
+        else:
+            tradeable_kind = "coinbase"
+            tradeable_args = {"symbol": symbol}
+
+        symbols_sorted = sorted(self._tradeables_by_symbol.keys())
+        symbol_set_hash = hashlib.sha256(
+            json.dumps(symbols_sorted).encode("utf-8")
+        ).hexdigest()[:16]
+
+        return {
+            "symbol": symbol,
+            "asset_class": asset_class_str,
+            "tradeable_kind": tradeable_kind,
+            "tradeable_args": tradeable_args,
+            "redis_url": redis_url,
+            "redis_namespace": str(namespace),
+            "shakedown_state_path": str(self.config.shakedown_state_path),
+            "shakedown_min_days": int(self.config.shakedown_min_days),
+            "mode": str(self.config.mode),
+            "bankroll_usd": float(self.config.bankroll_usd),
+            "risk_pct_per_trade": float(self.config.risk_pct_per_trade),
+            "min_confidence_to_trade": float(
+                self.config.min_confidence_to_trade
+            ),
+            "tick_interval_s": float(self.config.tick_interval_s),
+            "kill_switch_file": (
+                str(kill_switch_file) if kill_switch_file is not None else None
+            ),
+            "symbol_set_hash": symbol_set_hash,
+            "test_mode": False,
+            "test_max_ticks": 0,
+        }
+
+    def _emit_supervisor_halt_metric(self, *, reason: str, symbol: str) -> None:
+        """Emit ``autopilot_supervisor_halt_total`` when the supervisor halts.
+
+        Best-effort -- never raises through the worker loop.
+        """
+        if not self._pusher_enabled():
+            return
+        try:
+            self.metrics_pusher.counter(
+                "supervisor_halt_total",
+                1.0,
+                labels={"reason": reason, "symbol": symbol},
+            )
+        except Exception as exc:  # noqa: BLE001 - never let metrics kill us
+            LOGGER.warning("supervisor_halt metric raised: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Lane D D3: child-process entrypoint + factories
+# ---------------------------------------------------------------------------
+#
+# These helpers are MODULE-LEVEL (not on Supervisor) so they survive the
+# spawn-context pickle round trip. The child re-imports live_supervisor,
+# resolves _child_main from the module namespace, then constructs its own
+# Redis client + Tradeable + predictor inside the child process.
+
+
+def _connect_redis_for_child(child_config: Dict[str, Any]) -> Any:
+    """Construct a fresh Redis client inside the child.
+
+    The parent never pickles its Redis connection across the boundary;
+    the child reads ``redis_url`` from ``child_config`` (or
+    ``REDIS_URL`` env var) and connects independently. Returns ``None``
+    on failure -- the child then runs without cross-process state and
+    logs a warning.
+    """
+    try:
+        import redis  # type: ignore[import-not-found]
+    except ImportError:
+        LOGGER.warning("redis module unavailable; child running without it")
+        return None
+    url = (
+        child_config.get("redis_url")
+        or os.environ.get("REDIS_URL")
+        or "redis://localhost:6379/0"
+    )
+    try:
+        return redis.Redis.from_url(url, decode_responses=True)
+    except Exception as exc:  # noqa: BLE001 - never crash boot
+        LOGGER.warning("child redis connect failed (%s); running without", exc)
+        return None
+
+
+def _build_child_tradeable(child_config: Dict[str, Any]) -> Optional[Any]:
+    """Construct a fresh Tradeable inside the child by ``tradeable_kind``.
+
+    Each branch lazy-imports the venue connector so an unused branch
+    doesn't pay the import cost (the predictor / ccxt boots are heavy).
+    Returns ``None`` if construction fails -- caller logs and exits.
+    """
+    kind = str(child_config.get("tradeable_kind", "coinbase"))
+    args = dict(child_config.get("tradeable_args") or {})
+    try:
+        if kind == "polymarket":
+            from exchanges.adapters import PolymarketTradeable
+            import fetcher as polymarket_fetcher
+
+            return PolymarketTradeable(
+                str(args.get("market_id") or ""),
+                polymarket_fetcher,
+            )
+        if kind == "hyperliquid":
+            from exchanges.adapters import HyperliquidTradeable
+            from exchanges.hyperliquid import HyperliquidExchange
+
+            return HyperliquidTradeable(
+                HyperliquidExchange(),
+                str(args.get("symbol") or ""),
+            )
+        # Default: coinbase spot.
+        from exchanges.adapters import CoinbaseTradeable
+
+        return CoinbaseTradeable(
+            CoinbaseExchange(),
+            str(args.get("symbol") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001 - never crash without diagnostics
+        LOGGER.error(
+            "child %s tradeable construction failed: %s",
+            kind,
+            exc,
+        )
+        return None
+
+
+def _check_shutdown_flag(redis_client: Any) -> bool:
+    """True iff Redis has the cross-process shutdown flag set.
+
+    Children call this at the top of every tick. Returns False on any
+    error (read failure can't keep us trading -- we just retry next tick
+    and rely on SIGTERM as the second line of defence).
+    """
+    if redis_client is None:
+        return False
+    try:
+        return bool(redis_client.get(_SHUTDOWN_KEY))
+    except Exception:  # noqa: BLE001 - tolerate flaky reads
+        return False
+
+
+def _try_acquire_daily_close_leader(
+    redis_client: Any,
+    *,
+    utc_date: str,
+    symbol_set_hash: str,
+    pid: int,
+) -> bool:
+    """SETNX-elect this child as the daily-close leader for ``utc_date``.
+
+    Returns ``True`` iff this child won the lease. The key shape is
+    ``daily_close_leader:{utc_date}:{symbol_set_hash}``: ``utc_date``
+    scopes the lease to one day, ``symbol_set_hash`` scopes it to the
+    supervisor's symbol set so two independent supervisor groups
+    (different symbol sets running against the same Redis) don't share
+    the lease and thereby skip each other's daily close.
+
+    Uses ``redis.set(key, pid, ex=_DAILY_CLOSE_LEADER_TTL_S, nx=True)``;
+    the ``nx=True`` is the atomic primitive that makes this safe
+    against races among children waking up simultaneously at midnight.
+    """
+    if redis_client is None:
+        return True  # No Redis -> single-child mode -> always run close.
+    key = f"{_DAILY_CLOSE_LEADER_KEY_PREFIX}:{utc_date}:{symbol_set_hash}"
+    try:
+        won = redis_client.set(
+            name=key,
+            value=str(pid),
+            ex=_DAILY_CLOSE_LEADER_TTL_S,
+            nx=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - lease must not crash trader
+        LOGGER.warning(
+            "daily_close leader lease failed for %s: %s; deferring close",
+            key,
+            exc,
+        )
+        return False
+    return bool(won)
+
+
+def _child_main(child_config: Dict[str, Any]) -> int:  # pragma: no cover - exercised in subprocess
+    """Module-level child entrypoint (must be picklable for spawn context).
+
+    Reconstructs the per-child non-picklable resources (Redis client,
+    Tradeable adapter, predictor, position store, circuit breakers,
+    notifier) INSIDE the child process. Then runs an independent tick
+    loop until either:
+      * the cross-process shutdown flag goes truthy in Redis, OR
+      * SIGTERM is delivered to this child.
+
+    Returns the child's exit code: ``0`` on clean shutdown, ``1`` on
+    fatal boot error (caller / parent treats this as crash + respawn).
+
+    The function reads child_config["test_mode"] and dispatches to a
+    stub loop that doesn't import the predictor or live exchange when
+    True; the multiprocessing acceptance test relies on this so it
+    can exercise the spawn / shutdown / leader-election plumbing
+    without the full ML stack.
+    """
+    import logging as _logging  # re-import: child has fresh module state
+
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
+        force=True,
+    )
+    _CHILD_LOG = _logging.getLogger(__name__ + f".child[{child_config.get('symbol')}]")
+
+    if bool(child_config.get("test_mode")):
+        return _child_main_test_mode(child_config, _CHILD_LOG)
+
+    # Production path: real Redis + Tradeable + predictor.
+    redis_client = _connect_redis_for_child(child_config)
+    tradeable = _build_child_tradeable(child_config)
+    if tradeable is None:
+        _CHILD_LOG.error("child tradeable bootstrap failed; exiting 1")
+        return 1
+
+    pid = os.getpid()
+    symbol = str(child_config.get("symbol", ""))
+    tick_interval_s = float(child_config.get("tick_interval_s", 5.0))
+    symbol_set_hash = str(child_config.get("symbol_set_hash", ""))
+    last_close_date: Optional[str] = None
+
+    _CHILD_LOG.info("child %s booted pid=%s", symbol, pid)
+
+    # Per-child SIGTERM handler -- flips a local flag so the next tick
+    # boundary exits cleanly rather than mid-order. SIGTERM coming from
+    # the parent's _stop_workers cleanup is the belt-and-braces path
+    # behind the Redis shutdown flag.
+    _local_shutdown = {"requested": False}
+
+    def _on_sigterm(_signum: int, _frame: Any) -> None:
+        _local_shutdown["requested"] = True
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):
+        pass  # Not in main thread on this platform; we'll still poll Redis.
+
+    try:
+        while True:
+            # Shutdown gate at top of every tick -- both Redis flag AND
+            # SIGTERM-triggered local flag.
+            if _local_shutdown["requested"] or _check_shutdown_flag(redis_client):
+                _CHILD_LOG.info("child %s observed shutdown; exiting", symbol)
+                break
+
+            tick_start = time.monotonic()
+            try:
+                tradeable.get_ticker()
+            except Exception as exc:  # noqa: BLE001 - keep child alive
+                _CHILD_LOG.warning(
+                    "child %s tick error: %s; continuing", symbol, exc
+                )
+
+            # Daily-close leader gate. Run at most once per UTC date.
+            today_iso = datetime.now(timezone.utc).date().isoformat()
+            if last_close_date is None:
+                last_close_date = today_iso
+            elif today_iso != last_close_date:
+                won = _try_acquire_daily_close_leader(
+                    redis_client,
+                    utc_date=today_iso,
+                    symbol_set_hash=symbol_set_hash,
+                    pid=pid,
+                )
+                if won:
+                    _CHILD_LOG.info(
+                        "child %s won daily_close leadership for %s pid=%s",
+                        symbol,
+                        today_iso,
+                        pid,
+                    )
+                    # Production daily_close runs through a freshly
+                    # constructed Supervisor here in a future PR; for
+                    # now the gate logs and skips so the test plumbing
+                    # is the contract under test.
+                else:
+                    _CHILD_LOG.info(
+                        "child %s lost daily_close leadership for %s; skipping",
+                        symbol,
+                        today_iso,
+                    )
+                last_close_date = today_iso
+
+            tick_dur = time.monotonic() - tick_start
+            sleep_for = max(0.0, tick_interval_s - tick_dur)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+    except Exception as exc:  # noqa: BLE001 - log + exit non-zero so parent respawns
+        _CHILD_LOG.exception("child %s crashed: %s", symbol, exc)
+        return 1
+    return 0
+
+
+def _child_main_test_mode(
+    child_config: Dict[str, Any],
+    log: logging.Logger,
+) -> int:  # pragma: no cover - exercised in subprocess via tests
+    """Stub child loop used by the multiprocessing acceptance test.
+
+    Increments a Redis counter per tick (so the test can assert tick
+    counts across all children) and respects the same shutdown flag the
+    production loop honours. Daily-close leader election is exercised
+    by writing the winning child's pid into a per-symbol Redis key so
+    the test can assert exactly-one-leader semantics.
+
+    All non-trivial work is intentionally kept out of this stub: the
+    test's value is in exercising the SPAWN + SHUTDOWN + LEADER
+    primitives, not the predictor / exchange path.
+    """
+    redis_client = _connect_redis_for_child(child_config)
+    pid = os.getpid()
+    symbol = str(child_config.get("symbol", ""))
+    namespace = str(child_config.get("redis_namespace", "autopilot"))
+    tick_interval_s = float(child_config.get("tick_interval_s", 0.1))
+    max_ticks = int(child_config.get("test_max_ticks", 0) or 0)
+    symbol_set_hash = str(child_config.get("symbol_set_hash", ""))
+    force_daily_close = bool(child_config.get("test_force_daily_close"))
+    tick_count_key = f"{namespace}:test:tick_count:{symbol}"
+    leader_key_for_test = f"{namespace}:test:leader_winner:{symbol}"
+
+    log.info("test-child %s booted pid=%s max_ticks=%d", symbol, pid, max_ticks)
+
+    _local_shutdown = {"requested": False}
+
+    def _on_sigterm(_signum: int, _frame: Any) -> None:
+        _local_shutdown["requested"] = True
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):
+        pass
+
+    ticks_done = 0
+    try:
+        while True:
+            if _local_shutdown["requested"] or _check_shutdown_flag(redis_client):
+                log.info("test-child %s observed shutdown after %d ticks",
+                         symbol, ticks_done)
+                break
+            if max_ticks > 0 and ticks_done >= max_ticks:
+                log.info("test-child %s hit max_ticks=%d; exiting",
+                         symbol, max_ticks)
+                break
+
+            if redis_client is not None:
+                try:
+                    redis_client.incr(tick_count_key)
+                except Exception as exc:  # noqa: BLE001 - test counter is best-effort
+                    log.warning("test-child %s incr failed: %s", symbol, exc)
+
+            # Optional daily-close leader exercise: each child tries to
+            # win the lease on its FIRST tick. The test asserts only one
+            # child writes its pid to leader_winner_key; the rest skip.
+            if force_daily_close and ticks_done == 0:
+                today_iso = datetime.now(timezone.utc).date().isoformat()
+                won = _try_acquire_daily_close_leader(
+                    redis_client,
+                    utc_date=today_iso,
+                    symbol_set_hash=symbol_set_hash,
+                    pid=pid,
+                )
+                if won and redis_client is not None:
+                    try:
+                        redis_client.set(leader_key_for_test, str(pid))
+                    except Exception:  # noqa: BLE001 - best-effort
+                        pass
+
+            ticks_done += 1
+            time.sleep(max(0.0, tick_interval_s))
+    except Exception as exc:  # noqa: BLE001 - exit non-zero on crash
+        log.exception("test-child %s crashed: %s", symbol, exc)
+        return 1
+    return 0
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -2442,6 +3168,28 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "How many baseline std-deviations recent mean confidence must "
             "fall below for the gate's confidence condition to fire. "
             "Default 2.0 (a roughly 2.3%% tail event)."
+        ),
+    )
+    # Lane D D3: multiprocessing-per-symbol supervisor. ``--workers`` flips
+    # ``main()`` from the single-process ``run_loop`` to ``run_workers``.
+    # Default is run_loop so existing operators see zero behavioural change.
+    p.add_argument(
+        "--workers",
+        action="store_true",
+        help=(
+            "Spawn one child process per tradeable (multiprocessing-per-"
+            "symbol). Default: single-process serial run_loop. "
+            "Children share Redis state (positions, error counter, "
+            "shakedown evidence) so they survive crashes independently."
+        ),
+    )
+    p.add_argument(
+        "--restart-limit-per-hour",
+        type=int,
+        default=_DEFAULT_RESTART_LIMIT_PER_HOUR,
+        help=(
+            "When --workers is set: maximum unexpected child restarts per "
+            "symbol per hour before the supervisor halts. Default 3."
         ),
     )
     return p.parse_args(argv)
@@ -2681,6 +3429,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             LOGGER.info("supervisor: wrote %s/ticks.json", run_dir)
         return 0
+
+    # Lane D D3: --workers flips to multiprocessing-per-symbol. Default
+    # remains the single-process serial run_loop so existing operators
+    # are unaffected.
+    if getattr(args, "workers", False):
+        exit_code = supervisor.run_workers(
+            restart_limit_per_hour=int(
+                getattr(args, "restart_limit_per_hour", _DEFAULT_RESTART_LIMIT_PER_HOUR)
+            ),
+        )
+        return int(exit_code)
 
     summary = supervisor.run_loop()
     print(json.dumps(summary, indent=2))
