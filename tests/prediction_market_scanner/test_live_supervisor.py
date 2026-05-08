@@ -133,6 +133,10 @@ class StubPositionStore:
         self._closed_today: List[Position] = list(closed_today or [])
         self.recorded_open: List[Position] = []
         self.recorded_pending: List[Position] = []
+        # Lane A P0 #3: error counter shim. The supervisor now calls
+        # store.increment_error / errors_today / reset_errors_for_day
+        # instead of mutating an in-memory dict on Supervisor itself.
+        self._errors_by_symbol: Dict[str, int] = {}
 
     # -- reads
     def list_open(self) -> List[Position]:
@@ -173,6 +177,27 @@ class StubPositionStore:
         self.recorded_pending.append(position)
         self._open.append(position)
         return position
+
+    # -- error counter shim (Lane A P0 #3)
+    def increment_error(
+        self, symbol: str, *, now_utc: Optional[datetime] = None
+    ) -> int:
+        self._errors_by_symbol[symbol] = (
+            self._errors_by_symbol.get(symbol, 0) + 1
+        )
+        return self._errors_by_symbol[symbol]
+
+    def errors_today(
+        self, symbol: str, *, now_utc: Optional[datetime] = None
+    ) -> int:
+        return int(self._errors_by_symbol.get(symbol, 0))
+
+    def reset_errors_for_day(
+        self, *, now_utc: Optional[datetime] = None
+    ) -> int:
+        had = bool(self._errors_by_symbol)
+        self._errors_by_symbol = {}
+        return 1 if had else 0
 
 
 class StubCircuitBreakers:
@@ -1092,6 +1117,100 @@ class TestPerSymbolEquityPeak(unittest.TestCase):
             sup.shakedown_state.per_symbol["ETH/USD"].equity_peak_usd,
             8_500.0,
             places=2,
+        )
+
+
+class TestRedisBackedErrorCounter(unittest.TestCase):
+    """P0 #3: error counter lives in Redis so the D1 multi-process
+    supervisor model preserves increments across processes + restarts.
+    """
+
+    def test_two_supervisors_sharing_store_increment_same_counter(self) -> None:
+        """Two Supervisor instances backed by ONE PositionStore (one
+        FakeRedis) increment the same counter without losing writes."""
+        import fakeredis
+        from state.position_store import PositionStore
+
+        fake = fakeredis.FakeRedis(decode_responses=True)
+        # Use distinct namespaces to prove the counter key still
+        # converges to one place when both processes share the same
+        # namespace. Namespace 'shared' here is used for both.
+        store_a = PositionStore(redis_client=fake, namespace="shared")
+        store_b = PositionStore(redis_client=fake, namespace="shared")
+
+        with tempfile.TemporaryDirectory() as td:
+            path_a = Path(td) / "shake-a.json"
+            path_b = Path(td) / "shake-b.json"
+            sup_a, refs_a = _build_supervisor(
+                shakedown_path=path_a,
+                position_store=store_a,
+                exchange=StubExchange(
+                    raise_on_ticker=ExchangeError("net glitch")
+                ),
+            )
+            sup_b, refs_b = _build_supervisor(
+                shakedown_path=path_b,
+                position_store=store_b,
+                exchange=StubExchange(
+                    raise_on_ticker=ExchangeError("net glitch")
+                ),
+            )
+            # Both supervisors are pinned to the SAME fake clock so they
+            # write to the same daily error key.
+            sup_a.run_once()
+            sup_a.run_once()
+            sup_b.run_once()
+            sup_b.run_once()
+            shared_now = refs_a["now"]
+        # Both processes contributed to the SAME shared counter (read
+        # against the supervisor's pinned ``now``, not real wallclock).
+        self.assertEqual(
+            store_a.errors_today("ETH/USDT", now_utc=shared_now), 4
+        )
+        self.assertEqual(
+            store_b.errors_today("ETH/USDT", now_utc=shared_now), 4
+        )
+
+    def test_reset_errors_for_day_clears_redis_hash(self) -> None:
+        import fakeredis
+        from state.position_store import PositionStore
+
+        fake = fakeredis.FakeRedis(decode_responses=True)
+        store = PositionStore(redis_client=fake, namespace="reset")
+        store.increment_error("ETH/USD")
+        store.increment_error("BTC/USD")
+        store.increment_error("BTC/USD")
+        self.assertEqual(store.errors_today("BTC/USD"), 2)
+        # Reset wipes both symbols.
+        store.reset_errors_for_day()
+        self.assertEqual(store.errors_today("ETH/USD"), 0)
+        self.assertEqual(store.errors_today("BTC/USD"), 0)
+
+    def test_supervisor_evaluate_shakedown_reads_redis_counter(self) -> None:
+        """End-to-end: supervisor's shakedown evaluation pulls per-symbol
+        error counts from the Redis-backed store."""
+        import fakeredis
+        from state.position_store import PositionStore
+
+        fake = fakeredis.FakeRedis(decode_responses=True)
+        store = PositionStore(redis_client=fake, namespace="ev")
+        sup, refs = _build_supervisor(
+            position_store=store,
+            paper_days_clean=10,
+        )
+        # Pre-load the counter against the SUPERVISOR's pinned ``now``
+        # so the per-day key matches what evaluate_shakedown queries.
+        pinned_now = refs["now"]
+        store.increment_error("ETH/USDT", now_utc=pinned_now)
+        store.increment_error("ETH/USDT", now_utc=pinned_now)
+        state = sup.evaluate_shakedown()
+        # ETH/USDT had 2 pre-existing errors -> NOT clean -> reset to 0.
+        self.assertEqual(
+            state.per_symbol["ETH/USDT"].paper_days_clean, 0
+        )
+        # The counter is now reset for the next day.
+        self.assertEqual(
+            store.errors_today("ETH/USDT", now_utc=pinned_now), 0
         )
 
 

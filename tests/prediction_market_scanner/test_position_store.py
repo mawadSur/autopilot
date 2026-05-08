@@ -319,6 +319,47 @@ class PositionStoreTests(unittest.TestCase):
         self.assertGreater(deleted, 0)
         self.assertEqual(list(self.fake.scan_iter(match="test:*")), [])
 
+    # --- error counter (Lane A P0 #3) --------------------------------
+    def test_increment_error_returns_running_count(self) -> None:
+        self.assertEqual(self.store.increment_error("ETH/USD"), 1)
+        self.assertEqual(self.store.increment_error("ETH/USD"), 2)
+        self.assertEqual(self.store.errors_today("ETH/USD"), 2)
+        # Different symbol increments independently.
+        self.assertEqual(self.store.increment_error("BTC/USD"), 1)
+        self.assertEqual(self.store.errors_today("BTC/USD"), 1)
+        self.assertEqual(self.store.errors_today("ETH/USD"), 2)
+
+    def test_errors_today_returns_zero_for_unset_symbol(self) -> None:
+        self.assertEqual(self.store.errors_today("UNKNOWN/USD"), 0)
+
+    def test_errors_today_all_returns_full_map(self) -> None:
+        self.store.increment_error("ETH/USD")
+        self.store.increment_error("ETH/USD")
+        self.store.increment_error("BTC/USD")
+        all_counts = self.store.errors_today_all()
+        self.assertEqual(all_counts, {"ETH/USD": 2, "BTC/USD": 1})
+
+    def test_reset_errors_for_day_clears_hash(self) -> None:
+        self.store.increment_error("ETH/USD")
+        self.store.increment_error("BTC/USD")
+        self.assertEqual(self.store.reset_errors_for_day(), 1)
+        self.assertEqual(self.store.errors_today("ETH/USD"), 0)
+        self.assertEqual(self.store.errors_today("BTC/USD"), 0)
+        # Calling again with no key returns 0 (idempotent).
+        self.assertEqual(self.store.reset_errors_for_day(), 0)
+
+    def test_concurrent_increments_via_two_stores_share_counter(self) -> None:
+        """Two PositionStore instances over one fakeredis converge on the
+        same per-symbol count — the contract that justifies moving the
+        counter out of process memory in the first place (P0 #3)."""
+        store_b = PositionStore(redis_client=self.fake, namespace="test")
+        for _ in range(5):
+            self.store.increment_error("ETH/USD")
+        for _ in range(3):
+            store_b.increment_error("ETH/USD")
+        self.assertEqual(self.store.errors_today("ETH/USD"), 8)
+        self.assertEqual(store_b.errors_today("ETH/USD"), 8)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

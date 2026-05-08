@@ -317,12 +317,11 @@ class Supervisor:
         self._now = now_fn
         self.metrics_pusher = metrics_pusher
 
-        # Per-iteration error tracking. Errors are per-symbol (each
-        # _tick_symbol failure resets only that symbol's clean streak), but
-        # kill-switch trips are account-level (every symbol resets).
-        self._errors_today_by_symbol: Dict[str, int] = {
-            sym: 0 for sym in config.symbols
-        }
+        # Kill-switch trips are account-level (every symbol resets) and
+        # remain in-process: the only writer is the supervisor itself,
+        # so cross-process visibility isn't needed. Per-symbol error
+        # counts now live in Redis (P0 #3) so multiple symbol-supervisor
+        # processes can share state under the D1 multiprocessing model.
         self._kill_switch_trips_today = 0
 
         # One-time warning latches, keyed by symbol so the live-locked
@@ -444,10 +443,46 @@ class Supervisor:
         return ShakedownState.model_validate(raw), was_migrated
 
     def _increment_symbol_errors(self, symbol: str) -> None:
-        """Bump the per-symbol error counter for today's shakedown evaluation."""
-        self._errors_today_by_symbol[symbol] = (
-            self._errors_today_by_symbol.get(symbol, 0) + 1
-        )
+        """Bump the per-symbol error counter for today's shakedown evaluation.
+
+        Backed by Redis (P0 #3) so that multiple symbol-supervisor
+        processes under the D1 multiprocessing model share a single
+        canonical counter and survive crashes. Falls back to a no-op
+        with a logged WARNING if the store is missing the method or
+        the call fails -- the supervisor must NEVER crash because the
+        counter is unreachable.
+        """
+        try:
+            self.position_store.increment_error(symbol, now_utc=self._now())
+        except AttributeError:
+            # Older / stub stores without the new method. Log once per
+            # process (the latch keeps the noise floor low).
+            if not getattr(self, "_warned_no_error_counter", False):
+                LOGGER.warning(
+                    "position_store has no increment_error; running without "
+                    "shared error counter (test stub or pre-Lane-A store?)"
+                )
+                self._warned_no_error_counter = True
+        except Exception as exc:  # noqa: BLE001 - never crash the trader
+            LOGGER.warning(
+                "increment_error failed for %s: %s; continuing", symbol, exc
+            )
+
+    def _errors_today_for_symbol(self, symbol: str) -> int:
+        """Read today's error count from the store. Returns 0 on any failure."""
+        try:
+            return int(
+                self.position_store.errors_today(symbol, now_utc=self._now())
+            )
+        except AttributeError:
+            return 0
+        except Exception as exc:  # noqa: BLE001 - reads must not crash
+            LOGGER.warning(
+                "errors_today read failed for %s: %s; treating as 0",
+                symbol,
+                exc,
+            )
+            return 0
 
     def _persist_shakedown(self, state: ShakedownState) -> None:
         path = self.config.shakedown_state_path
@@ -498,9 +533,7 @@ class Supervisor:
                 # Genuinely uncaught path -- tick_symbol should catch
                 # ExchangeError / generic exceptions itself, but if something
                 # leaks through (eg pydantic validation), don't kill the loop.
-                self._errors_today_by_symbol[symbol] = (
-                    self._errors_today_by_symbol.get(symbol, 0) + 1
-                )
+                self._increment_symbol_errors(symbol)
                 LOGGER.exception("Unhandled tick error on %s", symbol)
                 _capture_exception(exc)
                 self._safe_alert(
@@ -614,7 +647,7 @@ class Supervisor:
             self.shakedown_state.get_or_init(sym)
 
         for symbol, sym_state in self.shakedown_state.per_symbol.items():
-            errors_for_symbol = int(self._errors_today_by_symbol.get(symbol, 0))
+            errors_for_symbol = self._errors_today_for_symbol(symbol)
             try:
                 pnl_for_symbol = float(
                     self.position_store.daily_realized_pnl_usd_for_symbol(symbol)
@@ -664,7 +697,14 @@ class Supervisor:
         self._persist_shakedown(self.shakedown_state)
 
         # Reset per-day counters once they've been folded into evidence.
-        self._errors_today_by_symbol = {sym: 0 for sym in self.config.symbols}
+        # Redis-backed error counter is reset via store.reset_errors_for_day
+        # so other symbol-supervisor processes also see the wipe.
+        try:
+            self.position_store.reset_errors_for_day(now_utc=now)
+        except AttributeError:
+            pass  # stub stores without the method
+        except Exception as exc:  # noqa: BLE001 - reset is best-effort
+            LOGGER.warning("reset_errors_for_day failed: %s; continuing", exc)
         self._kill_switch_trips_today = 0
         return self.shakedown_state
 

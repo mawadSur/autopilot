@@ -462,6 +462,80 @@ class PositionStore:
         return {"reconciled": reconciled, "dropped": dropped, "warnings": warnings}
 
     # ------------------------------------------------------------------
+    # per-symbol error counter (Lane A P0 #3)
+    # ------------------------------------------------------------------
+    #
+    # Multiple symbol-supervisor processes (under the multiprocessing model
+    # in D1) need to increment a shared error counter -- the in-memory
+    # dict that lived on Supervisor was per-process and lost increments
+    # across restarts. Redis HASH ``errors:by_symbol:{date}`` solves both:
+    # cross-process visibility and crash-survivability. The TTL keeps the
+    # set bounded automatically.
+    _ERROR_COUNTER_TTL_SECONDS = 48 * 3600  # 48h, two daily-close windows.
+
+    def _errors_key(self, when: datetime) -> str:
+        date_part = when.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        return f"{self.namespace}:errors:by_symbol:{date_part}"
+
+    def increment_error(
+        self, symbol: str, *, now_utc: Optional[datetime] = None
+    ) -> int:
+        """Atomically bump today's error count for ``symbol``. Returns new count.
+
+        Uses Redis HINCRBY so two processes racing on the same symbol
+        don't lose increments. The first writer also sets a 48h expire on
+        the key so stale daily counters age out automatically.
+        """
+        when = now_utc or _utc_now()
+        key = self._errors_key(when)
+        with self._lock:
+            new_value = int(self._redis.hincrby(key, symbol, 1))
+            # Expire only needs to be set once but EXPIRE is idempotent
+            # and ~free; calling it on every increment keeps the logic
+            # trivially correct across crashes.
+            self._redis.expire(key, self._ERROR_COUNTER_TTL_SECONDS)
+        return new_value
+
+    def errors_today(
+        self, symbol: str, *, now_utc: Optional[datetime] = None
+    ) -> int:
+        """Read today's error count for ``symbol``. Returns 0 if unset."""
+        when = now_utc or _utc_now()
+        raw = self._redis.hget(self._errors_key(when), symbol)
+        if raw is None:
+            return 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    def errors_today_all(
+        self, *, now_utc: Optional[datetime] = None
+    ) -> Dict[str, int]:
+        """Snapshot today's full per-symbol error map. Empty dict if unset."""
+        when = now_utc or _utc_now()
+        raw = self._redis.hgetall(self._errors_key(when)) or {}
+        out: Dict[str, int] = {}
+        for sym, val in raw.items():
+            try:
+                out[str(sym)] = int(val)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def reset_errors_for_day(
+        self, *, now_utc: Optional[datetime] = None
+    ) -> int:
+        """Delete today's error counter HASH. Returns 1 if deleted, 0 otherwise.
+
+        Called by the supervisor at daily_close after evidence has been
+        rolled into the shakedown record, so the next day starts clean.
+        """
+        when = now_utc or _utc_now()
+        key = self._errors_key(when)
+        return int(self._redis.delete(key))
+
+    # ------------------------------------------------------------------
     # admin
     # ------------------------------------------------------------------
     def clear_namespace(self) -> int:
