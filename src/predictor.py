@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import threading
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -34,6 +35,48 @@ import numpy as np
 LOGGER = logging.getLogger(__name__)
 
 _NEUTRAL_RESULT: Tuple[Literal["buy", "sell"], float] = ("buy", 0.5)
+
+
+# ---------------------------------------------------------------------------
+# Rich predictor return type (Lane B / A1 SignalForensics gap closure).
+#
+# The supervisor's loop only needs ``(side, confidence)``, so ``__call__``
+# stays a 2-tuple — backward-compatible with every existing caller and the
+# 700+ tests that destructure ``side, conf = predictor(...)``. But A1's
+# Mahalanobis / per-bin reliability / feature-quality checks need the
+# *latest-bar features* and the *raw class probabilities* at signal time,
+# not just the chosen side.
+#
+# ``predict_full`` returns ``PredictorResult`` exposing both. The supervisor
+# can adopt it later (separate change); A1 / context-snapshot writers can
+# adopt it now.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PredictorResult:
+    """Rich predictor output for downstream forensics + snapshot capture.
+
+    ``side`` / ``confidence`` mirror the legacy 2-tuple. ``feature_buffer``
+    is the per-feature snapshot from the *latest* bar (used by A1's
+    Mahalanobis + NaN/inf checks). ``model_probs`` is the raw class-prob
+    dict (used by A1's reliability bin lookup).
+
+    Both rich fields are ``None`` for neutral / warmup / error returns, so
+    callers must handle ``None`` (A1 already does).
+    """
+
+    side: Literal["buy", "sell"]
+    confidence: float
+    feature_buffer: Optional[Dict[str, float]] = None
+    model_probs: Optional[Dict[str, float]] = None
+    # Free-form metadata for the future (e.g. raw logits, feature window).
+    # Keep it ``Mapping[str, Any]`` so callers can add fields without
+    # bumping the dataclass schema.
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+
+_NEUTRAL_RICH_RESULT = PredictorResult(side="buy", confidence=0.5)
 
 
 def _is_valid_confidence(conf: float) -> bool:
@@ -123,21 +166,74 @@ class LegacyTransformerPredictor:
     def __call__(
         self, symbol: str, ticker: Any
     ) -> Tuple[Literal["buy", "sell"], float]:
+        # Backward-compatible 2-tuple surface. ``predict_full`` does the real
+        # work and we project down to ``(side, confidence)`` so the
+        # supervisor + every existing destructure-style caller is unchanged.
+        result = self.predict_full(symbol, ticker)
+        return (result.side, result.confidence)
+
+    # ------------------------------------------------------------------
+    # Rich predictor surface (A1 forensics + future snapshot writers).
+    # ------------------------------------------------------------------
+    def predict_full(
+        self, symbol: str, ticker: Any
+    ) -> PredictorResult:
+        """Return the full ``(side, conf, feature_buffer, model_probs)``.
+
+        On any neutral / warmup / error path the rich fields are ``None``
+        (matches A1's tolerant ``signal.feature_buffer or {}`` handling).
+        """
         try:
             self._refresh_buffer(symbol)
         except Exception as exc:  # noqa: BLE001 -- never crash the loop on data issues
             LOGGER.warning("predictor: candles refresh failed for %s: %s", symbol, exc)
-            return _NEUTRAL_RESULT
+            return _NEUTRAL_RICH_RESULT
 
         try:
-            probs = self._predict(symbol)
+            probs, feature_buffer = self._predict_with_features(symbol)
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("predictor: inference failed for %s: %s", symbol, exc)
-            return _NEUTRAL_RESULT
+            return _NEUTRAL_RICH_RESULT
 
         if probs is None:
-            return _NEUTRAL_RESULT
-        return self._probs_to_decision(probs)
+            return _NEUTRAL_RICH_RESULT
+        side, conf = self._probs_to_decision(probs)
+        # Build the model_probs dict from the raw softmax. For 3-class
+        # ordering ``[short, hold, long]`` we expose all three keys; for
+        # 2-class binary heads we expose ``short`` + ``long``.
+        flat = np.asarray(probs).flatten()
+        model_probs: Dict[str, float] = {}
+        if flat.size >= 3:
+            model_probs = {
+                "short": float(flat[0]),
+                "hold": float(flat[1]),
+                "long": float(flat[2]),
+            }
+        elif flat.size == 2:
+            model_probs = {
+                "short": float(flat[0]),
+                "long": float(flat[1]),
+            }
+        elif flat.size == 1:
+            p_long = float(flat[0])
+            model_probs = {"long": p_long, "short": 1.0 - p_long}
+        return PredictorResult(
+            side=side,
+            confidence=conf,
+            feature_buffer=feature_buffer if feature_buffer else None,
+            model_probs=model_probs if model_probs else None,
+        )
+
+    @property
+    def model_meta(self) -> Dict[str, Any]:
+        """Return the loaded ``model_meta.json`` blob.
+
+        A1 reads ``feature_means``, ``feature_stds``, ``optimal_threshold``,
+        ``threshold_metrics`` etc. via this handle so the agent doesn't have
+        to re-parse the file (and so tests can stub a meta dict cleanly).
+        """
+        # ``self.meta`` is set in ``__init__`` from ``load_model_bundle``.
+        return dict(self.meta) if isinstance(self.meta, dict) else {}
 
     # ------------------------------------------------------------------
     # Buffer management
@@ -176,7 +272,24 @@ class LegacyTransformerPredictor:
             self._last_seeded_minute[symbol] = current_minute
 
     def _predict(self, symbol: str) -> Optional[np.ndarray]:
-        """Compute features, build a window, return softmax probs or ``None``."""
+        """Compute features, build a window, return softmax probs or ``None``.
+
+        Thin wrapper around ``_predict_with_features`` for back-compat;
+        any caller that wants the latest-bar feature snapshot too should
+        use ``_predict_with_features`` directly.
+        """
+        probs, _features = self._predict_with_features(symbol)
+        return probs
+
+    def _predict_with_features(
+        self, symbol: str
+    ) -> Tuple[Optional[np.ndarray], Optional[Dict[str, float]]]:
+        """Return ``(probs, feature_buffer)`` -- both ``None`` on warmup.
+
+        ``feature_buffer`` is the *latest* bar's per-feature dict (raw,
+        un-scaled, NaN-dropped) so A1's Mahalanobis check sees the same
+        feature values the trader saw at signal time.
+        """
         import pandas as pd
         import torch
         import torch.nn.functional as F
@@ -190,7 +303,7 @@ class LegacyTransformerPredictor:
                 0 if buf is None else len(buf),
                 max(self.window_size, 240),
             )
-            return None
+            return None, None
 
         feats = compute_features(buf.copy())
         missing = [c for c in self.feature_cols if c not in feats.columns]
@@ -200,11 +313,26 @@ class LegacyTransformerPredictor:
                 symbol,
                 missing[:5],
             )
-            return None
+            return None, None
 
         window_frame = feats[self.feature_cols].tail(self.window_size).astype(np.float32)
         if len(window_frame) < self.window_size:
-            return None
+            return None, None
+
+        # Snapshot the *latest* bar's raw feature values BEFORE scaling so
+        # A1 can reason about them in the same units they had on disk.
+        latest_row = window_frame.iloc[-1]
+        feature_buffer: Dict[str, float] = {}
+        for feat in self.feature_cols:
+            try:
+                v = float(latest_row[feat])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if not np.isfinite(v):
+                # Capture NaN/inf as ``None`` so A1's NaN/inf check fires.
+                feature_buffer[feat] = None  # type: ignore[assignment]
+            else:
+                feature_buffer[feat] = v
 
         arr = window_frame.to_numpy()
         if not np.all(np.isfinite(arr)):
@@ -246,7 +374,7 @@ class LegacyTransformerPredictor:
                 float(probs[0]),
                 float(probs[1]),
             )
-        return probs
+        return probs, feature_buffer
 
     # ------------------------------------------------------------------
     # Decision policy
@@ -397,21 +525,63 @@ class XGBoostPredictor:
     def __call__(
         self, symbol: str, ticker: Any
     ) -> Tuple[Literal["buy", "sell"], float]:
+        # Backward-compatible 2-tuple surface. ``predict_full`` does the
+        # real inference; we project down here so the supervisor + every
+        # destructure-style caller stays unchanged.
+        result = self.predict_full(symbol, ticker)
+        return (result.side, result.confidence)
+
+    def predict_full(
+        self, symbol: str, ticker: Any
+    ) -> PredictorResult:
+        """Return the full ``(side, conf, feature_buffer, model_probs)``.
+
+        ``feature_buffer`` is the latest-bar raw feature dict (per
+        ``self.feature_cols``); ``model_probs`` is the binary head's
+        ``{"long": p1, "short": p0}`` (since the booster is binary today).
+        """
         try:
             self._refresh_buffer(symbol)
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("xgb predictor: candles refresh failed for %s: %s", symbol, exc)
-            return _NEUTRAL_RESULT
+            return _NEUTRAL_RICH_RESULT
         try:
-            proba = self._predict(symbol)
+            proba, feature_buffer = self._predict_with_features(symbol)
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("xgb predictor: inference failed for %s: %s", symbol, exc)
-            return _NEUTRAL_RESULT
+            return _NEUTRAL_RICH_RESULT
         if proba is None:
-            return _NEUTRAL_RESULT
+            return _NEUTRAL_RICH_RESULT
+
+        # Binary booster: P(long-profitable) is class 1; P(flat/short) is
+        # the complement. ``label_classes`` could be [-1, 1] or [0, 1] —
+        # we expose it under ``short`` (the negative class) so A1 can pick
+        # max() and compare against threshold bins consistently.
+        model_probs: Dict[str, float] = {
+            "long": float(proba),
+            "short": float(1.0 - proba),
+        }
+
         if proba >= self.thr_long:
-            return _validated_decision("buy", float(proba))
-        return _NEUTRAL_RESULT
+            side, conf = _validated_decision("buy", float(proba))
+        else:
+            side, conf = _NEUTRAL_RESULT
+        return PredictorResult(
+            side=side,
+            confidence=conf,
+            feature_buffer=feature_buffer if feature_buffer else None,
+            model_probs=model_probs,
+        )
+
+    @property
+    def model_meta(self) -> Dict[str, Any]:
+        """Return the loaded ``meta.json`` blob.
+
+        A1 uses this to reach ``feature_means`` / ``feature_stds`` /
+        ``optimal_threshold`` / ``threshold_metrics`` without re-parsing
+        from disk.
+        """
+        return dict(self.meta) if isinstance(self.meta, dict) else {}
 
     def _refresh_buffer(self, symbol: str) -> None:
         """Same minute-boundary refresh pattern as the transformer predictor."""
@@ -439,7 +609,22 @@ class XGBoostPredictor:
             self._last_seeded_minute[symbol] = current_minute
 
     def _predict(self, symbol: str) -> Optional[float]:
-        """Compute features + return P(long-profitable) for the latest bar."""
+        """Compute features + return P(long-profitable) for the latest bar.
+
+        Thin wrapper around ``_predict_with_features`` for back-compat.
+        """
+        proba, _features = self._predict_with_features(symbol)
+        return proba
+
+    def _predict_with_features(
+        self, symbol: str
+    ) -> Tuple[Optional[float], Optional[Dict[str, float]]]:
+        """Return ``(proba, feature_buffer)`` -- both ``None`` on warmup.
+
+        ``feature_buffer`` is the latest-bar's raw feature dict (NaN
+        captured as ``None`` so A1's NaN/inf check fires), keyed on
+        ``self.feature_cols``.
+        """
         import numpy as np
         from utils import compute_features
 
@@ -450,7 +635,7 @@ class XGBoostPredictor:
                 symbol,
                 0 if buf is None else len(buf),
             )
-            return None
+            return None, None
         # compute_features drops the timestamp column; we only need the
         # final row's feature values for the XGBoost path.
         feats = compute_features(buf.copy())
@@ -461,8 +646,24 @@ class XGBoostPredictor:
                 symbol,
                 missing[:5],
             )
-            return None
+            return None, None
         latest = feats[self.feature_cols].iloc[-1:].astype("float32")
+
+        # Snapshot the latest-bar feature values BEFORE NaN-fill so A1's
+        # NaN/inf detector still sees them (we capture NaN/inf as ``None``
+        # in the buffer dict; it's the inference path that fills with 0).
+        feature_buffer: Dict[str, float] = {}
+        latest_row = latest.iloc[0]
+        for feat in self.feature_cols:
+            try:
+                v = float(latest_row[feat])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if not np.isfinite(v):
+                feature_buffer[feat] = None  # type: ignore[assignment]
+            else:
+                feature_buffer[feat] = v
+
         if latest.isna().any().any():
             latest = latest.fillna(0.0)
         proba = float(self.model.predict_proba(latest.to_numpy())[0, 1])
@@ -475,7 +676,7 @@ class XGBoostPredictor:
                 symbol,
                 proba,
             )
-            return None
+            return None, None
         # Operator-visible: surface the raw probability so threshold tuning
         # is data-driven, not guesswork. One line per minute (buffer only
         # refreshes on minute boundary).
@@ -487,7 +688,7 @@ class XGBoostPredictor:
             self.thr_long,
             verdict,
         )
-        return proba
+        return proba, feature_buffer
 
 
 class MultiSymbolXGBoostPredictor:
@@ -547,6 +748,54 @@ class MultiSymbolXGBoostPredictor:
             )
             return _NEUTRAL_RESULT
         return predictor(symbol, ticker)
+
+    def predict_full(
+        self, symbol: str, ticker: Any
+    ) -> PredictorResult:
+        """Route to the per-symbol predictor's ``predict_full`` if available.
+
+        Older / stub predictors that only implement ``__call__`` (the
+        2-tuple form) are handled by projecting their tuple back into a
+        ``PredictorResult`` with empty rich fields. That keeps existing
+        wiring + tests working while still letting A1 pull rich fields
+        from real ``XGBoostPredictor`` instances.
+        """
+        predictor = self.model_map.get(symbol)
+        if predictor is None:
+            LOGGER.warning(
+                "multi-symbol predictor: no model wired for %s; returning neutral",
+                symbol,
+            )
+            return _NEUTRAL_RICH_RESULT
+        # Real per-symbol predictors expose predict_full; stubs in tests
+        # may only expose __call__. Route accordingly.
+        rich = getattr(predictor, "predict_full", None)
+        if callable(rich):
+            return rich(symbol, ticker)
+        side, conf = predictor(symbol, ticker)
+        return PredictorResult(side=side, confidence=conf)
+
+    def model_meta_for(self, symbol: str) -> Dict[str, Any]:
+        """Return the per-symbol meta blob for the given symbol or ``{}``.
+
+        Useful for A1 in a multi-symbol setup: each symbol has its own
+        meta.json and A1 needs to load the *right* one for the trade
+        being investigated.
+        """
+        predictor = self.model_map.get(symbol)
+        if predictor is None:
+            return {}
+        meta = getattr(predictor, "model_meta", None)
+        if isinstance(meta, dict):
+            return dict(meta)
+        if callable(meta):  # property fall-through if attribute lookup quirks
+            try:
+                resolved = meta()
+                if isinstance(resolved, dict):
+                    return dict(resolved)
+            except Exception:  # noqa: BLE001
+                return {}
+        return {}
 
 
 def _parse_crypto_model_map(raw: str) -> Dict[str, Tuple[str, Optional[float]]]:

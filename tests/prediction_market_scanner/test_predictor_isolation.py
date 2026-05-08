@@ -280,5 +280,101 @@ class ThresholdPrecedenceTests(unittest.TestCase):
             self.assertEqual(p._thr_source, "explicit")
 
 
+class ModelMetaAccessorTests(unittest.TestCase):
+    """``XGBoostPredictor.model_meta`` exposes the meta.json dict for A1."""
+
+    def test_meta_accessor_returns_a_dict_copy(self) -> None:
+        from predictor import XGBoostPredictor
+
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td) / "bundle"
+            cols = _train_and_persist_tiny_bundle(model_dir)
+            p = XGBoostPredictor(
+                model_dir=str(model_dir), exchange=None, thr_long=0.5
+            )
+            meta = p.model_meta
+
+        self.assertIsInstance(meta, dict)
+        # Must include the keys A1 actually reads -- the consumer surface
+        # is not allowed to silently drop these.
+        self.assertEqual(meta["feature_cols"], cols)
+        self.assertIn("optimal_threshold", meta)
+        # The accessor returns a copy: mutating it does NOT corrupt the
+        # predictor's loaded meta.
+        meta["feature_cols"] = ["bogus"]
+        self.assertNotEqual(p.meta["feature_cols"], ["bogus"])
+
+
+class PredictFullBackwardCompatTests(unittest.TestCase):
+    """Top-level guarantee: ``__call__`` 2-tuple unchanged after Lane B extension.
+
+    A1 + future snapshot writers can adopt ``predict_full``; existing 2-tuple
+    callers must keep working. We assert this here by stubbing the model so
+    the test runs without the heavy training fixture cost.
+    """
+
+    def test_call_returns_two_tuple_for_xgb_predictor(self) -> None:
+        from predictor import XGBoostPredictor
+
+        # Stub a predictor with a fake model that always returns 0.7
+        # P(long) so __call__ should fire ("buy", 0.7) at thr=0.5.
+        p = XGBoostPredictor.__new__(XGBoostPredictor)
+        p.model_dir = "/tmp/stub_compat"
+        p.feature_cols = ["f1", "f2", "f3"]
+        p.thr_long = 0.5
+        p._buffers = {}
+        p._last_seeded_minute = {}
+        p._lock = __import__("threading").Lock()
+        p.scaler = None
+
+        class _StubModel:
+            def predict_proba(self, X):
+                return np.array([[0.3, 0.7]])
+
+        p.model = _StubModel()
+
+        # Pin buffer + minute so _refresh_buffer is a no-op without an
+        # exchange. Buffer must hold valid 1m OHLCV columns so
+        # compute_features doesn't crash; we use a synthetic random walk.
+        import pandas as pd
+
+        from datetime import datetime, timedelta, timezone as tz
+
+        rng = np.random.default_rng(0)
+        n = 260
+        rows: List[Any] = []
+        end = datetime.now(tz.utc).replace(second=0, microsecond=0)
+        price = 1000.0
+        for i in range(n):
+            ts = end - timedelta(minutes=(n - 1 - i))
+            ret = float(rng.normal(0, 0.0008))
+            new_price = price * (1.0 + ret)
+            rows.append(
+                {
+                    "timestamp": ts.isoformat(),
+                    "open": price,
+                    "high": max(price, new_price) * 1.0001,
+                    "low": min(price, new_price) * 0.9999,
+                    "close": new_price,
+                    "volume": 50.0,
+                }
+            )
+            price = new_price
+        p._buffers["ETH/USD"] = pd.DataFrame(rows)
+        p._last_seeded_minute["ETH/USD"] = int(
+            datetime.now(tz.utc).timestamp() // 60
+        )
+
+        # The compute_features path expects feature columns we don't have
+        # in our stub feature_cols list, so the predictor will skip with
+        # "missing feature cols" and route to neutral. Assert that path
+        # also returns a clean 2-tuple.
+        out = p("ETH/USD", None)
+        self.assertIsInstance(out, tuple)
+        self.assertEqual(len(out), 2)
+        side, conf = out
+        self.assertIn(side, ("buy", "sell"))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

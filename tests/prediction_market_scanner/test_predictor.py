@@ -431,5 +431,322 @@ class MultiSymbolPredictorRoutingTests(unittest.TestCase):
             MultiSymbolXGBoostPredictor(model_map={})
 
 
+class PredictorResultDataclassTests(unittest.TestCase):
+    """``PredictorResult`` shape + defaults (Lane B / A1 gap closure)."""
+
+    def test_defaults_have_no_rich_fields(self) -> None:
+        from predictor import PredictorResult
+
+        r = PredictorResult(side="buy", confidence=0.5)
+        self.assertEqual(r.side, "buy")
+        self.assertAlmostEqual(r.confidence, 0.5)
+        self.assertIsNone(r.feature_buffer)
+        self.assertIsNone(r.model_probs)
+        self.assertEqual(r.extras, {})
+
+    def test_can_be_constructed_with_rich_fields(self) -> None:
+        from predictor import PredictorResult
+
+        r = PredictorResult(
+            side="sell",
+            confidence=0.71,
+            feature_buffer={"return_5": 0.001, "rv_60": 0.002},
+            model_probs={"long": 0.29, "short": 0.71},
+        )
+        self.assertEqual(r.feature_buffer["return_5"], 0.001)
+        self.assertAlmostEqual(r.model_probs["short"], 0.71)
+
+
+class XGBoostPredictFullTests(unittest.TestCase):
+    """``XGBoostPredictor.predict_full`` returns the rich result shape."""
+
+    def _make_synth_dataset(self, n: int = 500) -> "pd.DataFrame":
+        import pandas as pd
+
+        rng = np.random.default_rng(seed=11)
+        f = {
+            "return_5": rng.normal(0, 0.001, size=n),
+            "rv_60": rng.uniform(0.0001, 0.005, size=n),
+            "tod_sin": rng.uniform(-1, 1, size=n),
+        }
+        score = (
+            0.6 * f["return_5"] / 0.001
+            + 0.3 * (f["rv_60"] - 0.0025) / 0.001
+            + 0.1 * f["tod_sin"]
+        )
+        labels = (score > np.median(score)).astype(int)
+        timestamps = pd.date_range("2026-01-01", periods=n, freq="1min").astype(str)
+        return pd.DataFrame({"timestamp": timestamps, **f, "label": labels})
+
+    def _train_tiny_model(self, out_dir: Path) -> None:
+        from crypto_training.train_xgboost import train
+
+        df = self._make_synth_dataset(n=500)
+        with tempfile.TemporaryDirectory() as td:
+            ds_path = Path(td) / "ds.csv"
+            df.to_csv(ds_path, index=False)
+            train(
+                dataset_path=ds_path,
+                output_dir=out_dir,
+                val_frac=0.2,
+                test_frac=0.2,
+                xgb_kwargs={"n_estimators": 20, "max_depth": 3},
+            )
+
+    def test_predict_full_returns_predictor_result_with_rich_fields(self) -> None:
+        from predictor import PredictorResult, XGBoostPredictor
+
+        candles = _synthetic_candles(n=400)
+        ex = _FakeExchange(candles)
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td) / "model_xgb"
+            self._train_tiny_model(model_dir)
+            predictor = XGBoostPredictor(
+                model_dir=str(model_dir),
+                exchange=ex,
+                thr_long=0.5,
+                warmup_bars=350,
+            )
+            fake_ticker = mock.MagicMock(symbol="ETH/USD")
+            result = predictor.predict_full("ETH/USD", fake_ticker)
+
+        self.assertIsInstance(result, PredictorResult)
+        self.assertIn(result.side, ("buy", "sell"))
+        self.assertGreaterEqual(result.confidence, 0.0)
+        self.assertLessEqual(result.confidence, 1.0)
+        # Rich fields populated for a real inference (not warmup).
+        self.assertIsNotNone(result.feature_buffer)
+        self.assertIsNotNone(result.model_probs)
+        # feature_buffer carries every meta.feature_cols entry.
+        for col in predictor.feature_cols:
+            self.assertIn(col, result.feature_buffer)
+        # model_probs has both long + short keys (binary head).
+        self.assertIn("long", result.model_probs)
+        self.assertIn("short", result.model_probs)
+        # Probs sum to ~1 (within float slop).
+        self.assertAlmostEqual(
+            result.model_probs["long"] + result.model_probs["short"],
+            1.0,
+            places=4,
+        )
+
+    def test_predict_full_warmup_returns_neutral_with_no_rich_fields(self) -> None:
+        from predictor import XGBoostPredictor
+
+        candles = _synthetic_candles(n=50)  # below 240-bar warmup
+        ex = _FakeExchange(candles)
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td) / "model_xgb"
+            self._train_tiny_model(model_dir)
+            predictor = XGBoostPredictor(
+                model_dir=str(model_dir), exchange=ex, thr_long=0.5
+            )
+            fake_ticker = mock.MagicMock(symbol="ETH/USD")
+            result = predictor.predict_full("ETH/USD", fake_ticker)
+
+        # Same neutral semantics as ``__call__``: ("buy", 0.5) with no rich
+        # data so A1's checks know to skip rather than analyse stale data.
+        self.assertEqual((result.side, result.confidence), ("buy", 0.5))
+        self.assertIsNone(result.feature_buffer)
+        self.assertIsNone(result.model_probs)
+
+    def test_call_still_returns_two_tuple_unchanged(self) -> None:
+        # Critical backward-compat assertion: ``__call__`` must keep the
+        # legacy 2-tuple return so the supervisor + 700+ tests that
+        # destructure ``side, conf = predictor(...)`` are unchanged by
+        # the predict_full extension.
+        from predictor import XGBoostPredictor
+
+        candles = _synthetic_candles(n=400)
+        ex = _FakeExchange(candles)
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td) / "model_xgb"
+            self._train_tiny_model(model_dir)
+            predictor = XGBoostPredictor(
+                model_dir=str(model_dir), exchange=ex, thr_long=0.5
+            )
+            fake_ticker = mock.MagicMock(symbol="ETH/USD")
+            out = predictor("ETH/USD", fake_ticker)
+
+        # Tuple length 2, not a PredictorResult.
+        self.assertIsInstance(out, tuple)
+        self.assertEqual(len(out), 2)
+        side, conf = out  # destructure works -- this is the contract
+        self.assertIn(side, ("buy", "sell"))
+        self.assertGreaterEqual(conf, 0.0)
+        self.assertLessEqual(conf, 1.0)
+
+    def test_model_meta_accessor_returns_loaded_meta(self) -> None:
+        from predictor import XGBoostPredictor
+
+        with tempfile.TemporaryDirectory() as td:
+            model_dir = Path(td) / "model_xgb"
+            self._train_tiny_model(model_dir)
+            predictor = XGBoostPredictor(
+                model_dir=str(model_dir), exchange=None, thr_long=0.5
+            )
+            meta = predictor.model_meta
+
+        self.assertIsInstance(meta, dict)
+        # Keys we actually persist today -- ensures A1 can read them.
+        self.assertIn("feature_cols", meta)
+        self.assertIn("optimal_threshold", meta)
+        # Mutating the returned dict must NOT mutate the predictor's
+        # internal meta (cheap defence against accidental shared state).
+        meta["feature_cols"] = ["bogus"]
+        self.assertNotEqual(predictor.meta["feature_cols"], ["bogus"])
+
+
+class MultiSymbolPredictFullTests(unittest.TestCase):
+    """Routing of ``predict_full`` + ``model_meta_for`` in the multi-symbol predictor."""
+
+    def test_routes_predict_full_to_per_symbol_predictor(self) -> None:
+        from predictor import MultiSymbolXGBoostPredictor, PredictorResult
+
+        class _RichStub:
+            def __init__(self, label: str) -> None:
+                self.label = label
+                self.full_calls: List[str] = []
+                self.feature_cols: List[str] = ["f1"]
+                self.model = object()
+                self.thr_long = 0.5
+
+            def __call__(self, symbol, ticker):
+                # 2-tuple legacy surface (unused in this test).
+                return ("buy", 0.5)
+
+            def predict_full(self, symbol, ticker):
+                self.full_calls.append(symbol)
+                return PredictorResult(
+                    side="buy",
+                    confidence=0.71 if self.label == "eth" else 0.33,
+                    feature_buffer={"f1": 1.0},
+                    model_probs={"long": 0.71, "short": 0.29},
+                )
+
+        eth = _RichStub("eth")
+        btc = _RichStub("btc")
+        multi = MultiSymbolXGBoostPredictor(
+            model_map={"ETH/USD": eth, "BTC/USD": btc}
+        )
+        result = multi.predict_full("ETH/USD", None)
+        self.assertIsInstance(result, PredictorResult)
+        self.assertAlmostEqual(result.confidence, 0.71)
+        self.assertEqual(result.feature_buffer, {"f1": 1.0})
+        self.assertEqual(eth.full_calls, ["ETH/USD"])
+        self.assertEqual(btc.full_calls, [])
+
+    def test_predict_full_falls_back_for_legacy_stub(self) -> None:
+        # An older stub that only implements ``__call__`` (no
+        # ``predict_full``) should still work through the multi-symbol
+        # routing -- we project the 2-tuple back to PredictorResult.
+        from predictor import MultiSymbolXGBoostPredictor, PredictorResult
+
+        class _LegacyStub:
+            def __init__(self) -> None:
+                self.feature_cols: List[str] = ["f1"]
+                self.model = object()
+                self.thr_long = 0.5
+
+            def __call__(self, symbol, ticker):
+                return ("sell", 0.62)
+
+        multi = MultiSymbolXGBoostPredictor(model_map={"ETH/USD": _LegacyStub()})
+        result = multi.predict_full("ETH/USD", None)
+        self.assertIsInstance(result, PredictorResult)
+        self.assertEqual(result.side, "sell")
+        self.assertAlmostEqual(result.confidence, 0.62)
+        self.assertIsNone(result.feature_buffer)
+        self.assertIsNone(result.model_probs)
+
+    def test_predict_full_unknown_symbol_returns_neutral_rich_result(self) -> None:
+        from predictor import MultiSymbolXGBoostPredictor, PredictorResult
+
+        class _Stub:
+            feature_cols = ["f1"]
+            model = object()
+            thr_long = 0.5
+
+            def __call__(self, symbol, ticker):
+                return ("buy", 0.5)
+
+        multi = MultiSymbolXGBoostPredictor(model_map={"ETH/USD": _Stub()})
+        result = multi.predict_full("DOGE/USD", None)
+        self.assertIsInstance(result, PredictorResult)
+        self.assertEqual((result.side, result.confidence), ("buy", 0.5))
+        self.assertIsNone(result.feature_buffer)
+        self.assertIsNone(result.model_probs)
+
+    def test_model_meta_for_returns_per_symbol_meta(self) -> None:
+        from predictor import MultiSymbolXGBoostPredictor
+
+        class _Stub:
+            feature_cols = ["f1"]
+            model = object()
+            thr_long = 0.5
+            model_meta = {"feature_cols": ["f1"], "optimal_threshold": 0.55}
+
+            def __call__(self, symbol, ticker):
+                return ("buy", 0.5)
+
+        multi = MultiSymbolXGBoostPredictor(model_map={"ETH/USD": _Stub()})
+        meta = multi.model_meta_for("ETH/USD")
+        self.assertEqual(meta["feature_cols"], ["f1"])
+        self.assertAlmostEqual(meta["optimal_threshold"], 0.55)
+        # Unknown symbol -> empty dict (not None) so callers can ``meta.get(...)``.
+        self.assertEqual(multi.model_meta_for("DOGE/USD"), {})
+
+
+class XGBoostBackwardCompatibilityTests(unittest.TestCase):
+    """Hard guarantees that the rich-result extension didn't regress legacy paths."""
+
+    def test_call_signature_is_two_tuple_with_invalid_proba(self) -> None:
+        # The NaN/inf guard inside ``_predict_with_features`` must still
+        # route to the neutral 2-tuple via ``__call__`` (existing test
+        # ``test_xgb_invalid_proba_routes_to_neutral`` covers __call__;
+        # add a parallel one for predict_full so the rich path matches).
+        from predictor import PredictorResult, XGBoostPredictor
+
+        # Synthesise a minimal predictor with a stubbed model that returns
+        # NaN proba so we exercise the guard without doing a full train.
+        p = XGBoostPredictor.__new__(XGBoostPredictor)
+        p.model_dir = "/tmp/stub"
+        p.feature_cols = ["return_5", "rv_60", "tod_sin"]
+        p.thr_long = 0.5
+        p._buffers = {}
+        p._last_seeded_minute = {}
+        p._lock = __import__("threading").Lock()
+
+        class _BadModel:
+            def predict_proba(self, X):
+                return np.array([[0.0, float("nan")]])
+
+        p.model = _BadModel()
+        p.scaler = None
+
+        # Seed a 300-bar buffer so the warmup gate passes. Also pin the
+        # last_seeded_minute so _refresh_buffer is a no-op (the stub
+        # predictor has no real exchange).
+        import pandas as pd
+
+        rows = _synthetic_candles(n=300)
+        p._buffers["ETH/USD"] = pd.DataFrame(rows)
+        p._last_seeded_minute["ETH/USD"] = int(
+            datetime.now(timezone.utc).timestamp() // 60
+        )
+
+        # __call__ must still return a 2-tuple equal to neutral.
+        side, conf = p("ETH/USD", mock.MagicMock())
+        self.assertEqual((side, conf), ("buy", 0.5))
+
+        # predict_full must still return a PredictorResult with the same
+        # neutral semantics + no rich fields (consistent with warmup).
+        result = p.predict_full("ETH/USD", mock.MagicMock())
+        self.assertIsInstance(result, PredictorResult)
+        self.assertEqual((result.side, result.confidence), ("buy", 0.5))
+        self.assertIsNone(result.feature_buffer)
+        self.assertIsNone(result.model_probs)
+
+
 if __name__ == "__main__":
     unittest.main()
