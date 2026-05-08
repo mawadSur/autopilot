@@ -511,6 +511,24 @@ class MultiSymbolXGBoostPredictor:
     def __init__(self, *, model_map: Dict[str, "XGBoostPredictor"]) -> None:
         if not model_map:
             raise ValueError("model_map cannot be empty")
+        # Validate every symbol's predictor at construction time -- a bad
+        # bundle should fail loudly here, not on first inference call.
+        for sym, predictor in model_map.items():
+            if predictor is None:
+                raise ValueError(
+                    f"MultiSymbolXGBoostPredictor: model for {sym!r} is None"
+                )
+            # XGBoostPredictor instances must already have their feature_cols
+            # + model attributes populated (set in __init__). This catches
+            # half-constructed stubs that would NPE later.
+            for attr in ("feature_cols", "model", "thr_long"):
+                if isinstance(predictor, XGBoostPredictor) and not hasattr(
+                    predictor, attr
+                ):
+                    raise ValueError(
+                        f"MultiSymbolXGBoostPredictor: predictor for {sym!r} "
+                        f"is missing required attribute {attr!r}"
+                    )
         self.model_map = model_map
         LOGGER.info(
             "MultiSymbolXGBoostPredictor ready for %d symbol(s): %s",
@@ -588,24 +606,16 @@ def build_default_predict_fn(exchange: Any) -> Optional[Any]:
         loaded: Dict[str, XGBoostPredictor] = {}
         for sym, (path, thr) in parsed.items():
             if not Path(path).expanduser().exists():
-                LOGGER.warning(
-                    "predictor: %s model dir %s missing; symbol will be neutral",
-                    sym,
-                    path,
+                # Configured-but-missing is a human error. Don't silently
+                # downgrade the symbol to neutral -- fail so the operator
+                # notices.
+                raise FileNotFoundError(
+                    f"CRYPTO_MODEL_MAP entry for {sym!r}: path {path!r} does "
+                    f"not exist on disk. Fix the path or remove the entry."
                 )
-                continue
-            try:
-                eff_thr = thr if thr is not None else 0.5
-                loaded[sym] = XGBoostPredictor(
-                    model_dir=path, exchange=exchange, thr_long=eff_thr
-                )
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning(
-                    "predictor: %s model load from %s failed (%s); skipping",
-                    sym,
-                    path,
-                    exc,
-                )
+            loaded[sym] = XGBoostPredictor(
+                model_dir=path, exchange=exchange, thr_long=thr
+            )
         if loaded:
             return MultiSymbolXGBoostPredictor(model_map=loaded)
         LOGGER.warning(
@@ -614,23 +624,26 @@ def build_default_predict_fn(exchange: Any) -> Optional[Any]:
 
     # 2. Single XGBoost (preferred when present -- USD-native model).
     crypto_dir = os.getenv("CRYPTO_MODEL_DIR", "").strip()
-    if crypto_dir and Path(crypto_dir).expanduser().exists():
-        try:
-            thr_env = os.getenv("CRYPTO_MODEL_THR_LONG", "").strip()
-            thr_long = float(thr_env) if thr_env else 0.65
-            LOGGER.info(
-                "predictor: trying XGBoost bundle at %s (thr_long=%.3f)",
-                crypto_dir,
-                thr_long,
+    if crypto_dir:
+        # Configured but missing on disk = operator error. Raise loudly
+        # rather than silently falling through to a legacy path the
+        # operator didn't intend to use.
+        if not Path(crypto_dir).expanduser().exists():
+            raise FileNotFoundError(
+                f"CRYPTO_MODEL_DIR is configured but does not exist on disk: "
+                f"{crypto_dir}. Refusing to silently fall back; either fix "
+                f"the path or unset the env var."
             )
-            return XGBoostPredictor(
-                model_dir=crypto_dir, exchange=exchange, thr_long=thr_long
-            )
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning(
-                "predictor: XGBoost bundle load failed (%s); falling back to legacy",
-                exc,
-            )
+        thr_env = os.getenv("CRYPTO_MODEL_THR_LONG", "").strip()
+        thr_long = float(thr_env) if thr_env else None
+        LOGGER.info(
+            "predictor: trying XGBoost bundle at %s (thr_long=%s)",
+            crypto_dir,
+            thr_long if thr_long is not None else "from-meta-or-default",
+        )
+        return XGBoostPredictor(
+            model_dir=crypto_dir, exchange=exchange, thr_long=thr_long
+        )
 
     # 2. Legacy transformer (model_sanity/) as fallback.
     legacy_dir = os.getenv("LEGACY_MODEL_DIR", "model_sanity").strip()

@@ -220,7 +220,10 @@ class XGBoostPredictorBuildFallbackTests(unittest.TestCase):
         ):
             self.assertIsNone(build_default_predict_fn(exchange=None))
 
-    def test_falls_back_to_legacy_when_crypto_dir_missing(self) -> None:
+    def test_raises_when_crypto_dir_missing(self) -> None:
+        # Per Lane B P0 #5: a configured-but-missing CRYPTO_MODEL_DIR is a
+        # human error (typo, leftover env var, dataset moved). Silently
+        # falling back hides the mistake; raise loudly instead.
         from predictor import build_default_predict_fn
 
         with mock.patch.dict(
@@ -231,7 +234,8 @@ class XGBoostPredictorBuildFallbackTests(unittest.TestCase):
             },
             clear=False,
         ):
-            self.assertIsNone(build_default_predict_fn(exchange=None))
+            with self.assertRaises(FileNotFoundError):
+                build_default_predict_fn(exchange=None)
 
 
 @unittest.skipUnless(
