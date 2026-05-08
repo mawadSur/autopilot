@@ -52,7 +52,16 @@ import traceback
 import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+)
 
 # Mirror the sys.path shim used by main.py / orchestrator.py /
 # calibration_agent/build_dataset.py so this CLI runs without the caller
@@ -61,7 +70,10 @@ _SRC_DIR = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+if TYPE_CHECKING:  # pragma: no cover - type hints only
+    from protocols import Tradeable
 
 from alerts.notifier import Notifier
 from exchanges.coinbase import CoinbaseExchange, ExchangeError, OrderResult, Ticker
@@ -256,11 +268,22 @@ _ActionTaken = Literal[
 
 
 class SupervisorConfig(BaseModel):
-    """Operator-supplied configuration for the supervisor."""
+    """Operator-supplied configuration for the supervisor.
 
-    model_config = ConfigDict(extra="forbid")
+    Lane D D2: ``tradeables`` lets the supervisor iterate heterogeneous
+    venues (Coinbase spot, Hyperliquid perps, Polymarket binary markets)
+    under a single tick loop. Legacy ``symbols`` is still honoured —
+    each symbol gets wrapped in a :class:`CoinbaseTradeable` at boot.
+    Precedence: ``tradeables`` > ``symbols``. At least one must be
+    non-empty.
+    """
 
-    symbols: List[str] = Field(..., min_length=1)
+    # arbitrary_types_allowed: Tradeable adapters are runtime objects,
+    # not pydantic models.
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    symbols: List[str] = Field(default_factory=list)
+    tradeables: List[Any] = Field(default_factory=list)
     tick_interval_s: float = 5.0
     bankroll_usd: float = 10_000.0
     mode: Literal["paper", "live"] = "paper"
@@ -268,6 +291,15 @@ class SupervisorConfig(BaseModel):
     shakedown_state_path: Path
     risk_pct_per_trade: float = 0.005
     min_confidence_to_trade: float = 0.6
+
+    @model_validator(mode="after")
+    def _require_at_least_one_source(self) -> "SupervisorConfig":
+        if not self.symbols and not self.tradeables:
+            raise ValueError(
+                "SupervisorConfig requires at least one of `symbols` or "
+                "`tradeables` to be non-empty"
+            )
+        return self
 
 
 class SymbolShakedownState(BaseModel):
@@ -479,10 +511,34 @@ class Supervisor:
         # the start of the next tick for that symbol against the live
         # ticker. See PendingPaperFill above for the rationale.
         self._pending_paper_fills: Dict[str, PendingPaperFill] = {}
+
+        # Lane D D2: explicit tradeables first, then legacy symbols
+        # wrapped in CoinbaseTradeable. Dedupe by symbol.
+        self._tradeables: List["Tradeable"] = []
+        self._tradeables_by_symbol: Dict[str, "Tradeable"] = {}
+        for tradeable in list(config.tradeables or []):
+            sym = str(getattr(tradeable, "symbol", ""))
+            if sym and sym not in self._tradeables_by_symbol:
+                self._tradeables.append(tradeable)
+                self._tradeables_by_symbol[sym] = tradeable
+        if config.symbols:
+            from exchanges.adapters import CoinbaseTradeable  # noqa: WPS433
+
+            for sym in config.symbols:
+                if sym not in self._tradeables_by_symbol:
+                    wrapped = CoinbaseTradeable(self.exchange, sym)
+                    self._tradeables.append(wrapped)
+                    self._tradeables_by_symbol[sym] = wrapped
+        # Backfill config.symbols so shakedown / run_once / daily_close
+        # see every tradeable's symbol (including "polymarket:<id>").
+        for sym in self._tradeables_by_symbol.keys():
+            if sym not in config.symbols:
+                config.symbols.append(sym)
+
         # Monotonic per-symbol tick counter, used to age out stale pending
         # fills (anything older than PAPER_PENDING_FILL_MAX_AGE_TICKS).
         self._symbol_tick_index: Dict[str, int] = {
-            sym: 0 for sym in config.symbols
+            sym: 0 for sym in self._tradeables_by_symbol.keys()
         }
 
         # Hydrate (or initialise) the shakedown evidence file.
@@ -793,13 +849,19 @@ class Supervisor:
         )
 
     def run_once(self) -> List[SupervisorTick]:
-        """Run a single iteration over all configured symbols."""
+        """Run a single iteration over all configured symbols.
+
+        Iterates ``config.symbols`` (which the supervisor backfills at
+        init with every tradeable's symbol). Binary tradeables route
+        through :meth:`_dispatch_tick` to a Polymarket-specific tick
+        path; crypto symbols stay on the legacy :meth:`_tick_symbol`.
+        """
         ticks: List[SupervisorTick] = []
         loop_start = time.monotonic()
         for symbol in self.config.symbols:
             tick_start = time.monotonic()
             try:
-                tick = self._tick_symbol(symbol)
+                tick = self._dispatch_tick(symbol)
             except Exception as exc:  # noqa: BLE001 - keep loop alive
                 # Genuinely uncaught path -- tick_symbol should catch
                 # ExchangeError / generic exceptions itself, but if something
@@ -1090,6 +1152,59 @@ class Supervisor:
     # ------------------------------------------------------------------
     # Per-symbol tick
     # ------------------------------------------------------------------
+    def _dispatch_tick(self, symbol: str) -> SupervisorTick:
+        """Route a tick to crypto or binary tick handler by asset_class."""
+        tradeable = self._tradeables_by_symbol.get(symbol)
+        if tradeable is not None:
+            asset_class = getattr(tradeable, "asset_class", None)
+            # String compare avoids importing AssetClass here.
+            if str(getattr(asset_class, "value", "")) == "prediction_binary":
+                return self._tick_prediction_binary(tradeable)
+        return self._tick_symbol(symbol)
+
+    def _tick_prediction_binary(self, tradeable: "Tradeable") -> SupervisorTick:
+        """Minimal tick for Polymarket markets — adapter-driven ticker
+        read, no exchange call. Order placement deferred to a follow-up.
+        """
+        symbol = tradeable.symbol
+        now = self._now()
+        if self.circuit_breakers.is_kill_switch_tripped():
+            self._kill_switch_trips_today += 1
+            return SupervisorTick(
+                tick_at_utc=now.isoformat(),
+                symbol=symbol,
+                verdict=CircuitBreakerVerdict(
+                    allow=False,
+                    tripped=["kill_switch"],
+                    reason="kill switch active",
+                    recommended_action="force_flat",
+                    details={},
+                ),
+                model_confidence=None,
+                action_taken="force_flatted",
+                notes="prediction_binary kill_switch",
+            )
+        try:
+            tradeable.get_ticker()
+        except Exception as exc:  # noqa: BLE001 - fetcher errors are non-fatal
+            self._handle_tick_error(symbol)
+            return SupervisorTick(
+                tick_at_utc=now.isoformat(),
+                symbol=symbol,
+                verdict=self._allow_verdict(),
+                model_confidence=None,
+                action_taken="errored",
+                notes=f"polymarket_ticker: {exc!r}",
+            )
+        return SupervisorTick(
+            tick_at_utc=now.isoformat(),
+            symbol=symbol,
+            verdict=self._allow_verdict(),
+            model_confidence=None,
+            action_taken="allowed",
+            notes="prediction_binary",
+        )
+
     def _tick_symbol(self, symbol: str) -> SupervisorTick:
         now = self._now()
         # 1. Kill switch first.
@@ -2213,8 +2328,20 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--symbols",
         type=str,
-        required=True,
+        required=False,
+        default="",
         help="Comma-separated symbols, e.g. 'ETH/USDT,BTC/USDT'.",
+    )
+    p.add_argument(
+        "--polymarket-markets",
+        type=str,
+        required=False,
+        default="",
+        help=(
+            "Comma-separated Polymarket Gamma market ids. Each id is "
+            "wrapped in a PolymarketTradeable and added to the tick "
+            "loop alongside any --symbols entries."
+        ),
     )
     p.add_argument(
         "--mode",
@@ -2382,7 +2509,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception:  # noqa: BLE001
         pass
     args = _parse_args(argv)
-    raw_symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    raw_symbols = [s.strip() for s in (args.symbols or "").split(",") if s.strip()]
+    raw_polymarket = [
+        s.strip() for s in (args.polymarket_markets or "").split(",") if s.strip()
+    ]
     # Dedupe preserving first-seen order. Duplicates are usually a config typo
     # (eg. ``--symbols ETH/USD,ETH/USD``) and would otherwise spawn two
     # supervisor entries fighting over the same Redis position keys + the
@@ -2399,12 +2529,43 @@ def main(argv: Optional[List[str]] = None) -> int:
             continue
         seen.add(sym)
         symbols.append(sym)
-    if not symbols:
-        print("error: --symbols must contain at least one entry", file=sys.stderr)
+    polymarket_market_ids: List[str] = []
+    seen_pm: set[str] = set()
+    for mid in raw_polymarket:
+        if mid in seen_pm:
+            LOGGER.warning(
+                "supervisor: dropping duplicate market id %r from --polymarket-markets",
+                mid,
+            )
+            continue
+        seen_pm.add(mid)
+        polymarket_market_ids.append(mid)
+    if not symbols and not polymarket_market_ids:
+        # Preserve the legacy error string so existing CLI consumers /
+        # tests that key off the substring "--symbols must contain at
+        # least one entry" continue to work. We additionally surface
+        # the polymarket option for operators who want the union.
+        print(
+            "error: --symbols must contain at least one entry "
+            "(or pass --polymarket-markets)",
+            file=sys.stderr,
+        )
         return 2
+
+    # Build PolymarketTradeable instances up-front so SupervisorConfig
+    # validation sees the union of (symbols, tradeables) and the
+    # supervisor's __init__ wires them into the iteration list.
+    tradeables: List[Any] = []
+    if polymarket_market_ids:
+        from exchanges.adapters import PolymarketTradeable
+        import fetcher as polymarket_fetcher
+
+        for mid in polymarket_market_ids:
+            tradeables.append(PolymarketTradeable(mid, polymarket_fetcher))
 
     config = SupervisorConfig(
         symbols=symbols,
+        tradeables=tradeables,
         tick_interval_s=args.interval,
         bankroll_usd=args.bankroll,
         mode=args.mode,
@@ -2503,7 +2664,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         confidence_history=confidence_history,
     )
 
-    run_dir = _setup_run_dir(args.log_dir, symbols=symbols)
+    # Include polymarket market ids in the run-dir name when set so the
+    # log path makes the heterogeneous tradeables list legible.
+    run_dir_label_symbols = list(symbols) + [
+        f"polymarket-{mid}" for mid in polymarket_market_ids
+    ]
+    run_dir = _setup_run_dir(args.log_dir, symbols=run_dir_label_symbols)
 
     if args.once:
         ticks = supervisor.run_once()

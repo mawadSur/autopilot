@@ -1748,5 +1748,236 @@ class TestAutoPauseWiring(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# Lane D D2: tradeables wiring
+# ---------------------------------------------------------------------------
+
+
+class _StubCryptoTradeable:
+    """Minimal Tradeable stub for SPOT_CRYPTO that delegates to the supervisor's
+    legacy ``self.exchange`` path via the ``symbol`` attribute.
+
+    Crypto tradeables don't actually drive their own ticker fetch in the
+    legacy tick path — _tick_symbol still calls ``self.exchange.get_ticker``.
+    The stub just needs to expose the right ``symbol`` and ``asset_class``
+    for dispatch routing.
+    """
+
+    def __init__(self, symbol: str = "ETH/USDT") -> None:
+        self.symbol = symbol
+
+        class _AC:
+            value = "spot_crypto"
+
+        self.asset_class = _AC()
+
+
+class _StubPolymarketTradeable:
+    """Minimal Tradeable stub for PREDICTION_BINARY.
+
+    Records ``get_ticker`` calls so tests can assert the binary-tick path
+    actually pulled a quote from the adapter (not from ``self.exchange``).
+    """
+
+    def __init__(self, market_id: str, *, raise_on_ticker: bool = False) -> None:
+        self._market_id = market_id
+        self.symbol = f"polymarket:{market_id}"
+
+        class _AC:
+            value = "prediction_binary"
+
+        self.asset_class = _AC()
+        self.ticker_calls: int = 0
+        self._raise = raise_on_ticker
+
+    def get_ticker(self) -> Any:
+        self.ticker_calls += 1
+        if self._raise:
+            raise RuntimeError("polymarket fetcher boom")
+        # The supervisor's binary-tick path doesn't introspect the ticker
+        # shape; returning a sentinel is enough.
+        return object()
+
+
+class TestTradeablesConfigValidation(unittest.TestCase):
+    def test_supervisor_config_accepts_tradeables_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = SupervisorConfig(
+                tradeables=[_StubPolymarketTradeable("mkt-1")],
+                shakedown_state_path=Path(td) / "sk.json",
+            )
+            self.assertEqual(cfg.symbols, [])
+            self.assertEqual(len(cfg.tradeables), 1)
+
+    def test_supervisor_config_accepts_symbols_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = SupervisorConfig(
+                symbols=["ETH/USDT"],
+                shakedown_state_path=Path(td) / "sk.json",
+            )
+            self.assertEqual(cfg.symbols, ["ETH/USDT"])
+            self.assertEqual(cfg.tradeables, [])
+
+    def test_supervisor_config_rejects_both_empty(self) -> None:
+        from pydantic import ValidationError
+
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(ValidationError):
+                SupervisorConfig(shakedown_state_path=Path(td) / "sk.json")
+
+
+class TestSupervisorWiresTradeables(unittest.TestCase):
+    def test_legacy_symbols_path_unchanged(self) -> None:
+        """Backward-compat: existing ``--symbols ETH/USD`` boot still works
+        and ticks the same number of times per pass.
+        """
+        sup, refs = _build_supervisor(symbols=["ETH/USDT"])
+        ticks = sup.run_once()
+        self.assertEqual(len(ticks), 1)
+        # The supervisor's tradeables list must include the wrapped
+        # CoinbaseTradeable for the legacy symbol.
+        self.assertEqual(len(sup._tradeables), 1)
+        self.assertEqual(sup._tradeables_by_symbol["ETH/USDT"].symbol, "ETH/USDT")
+
+    def test_tradeables_only_path_ticks_each_tradeable(self) -> None:
+        store = StubPositionStore()
+        pm = _StubPolymarketTradeable("mkt-1")
+        with tempfile.TemporaryDirectory() as td:
+            cfg = SupervisorConfig(
+                tradeables=[pm],
+                tick_interval_s=0.0,
+                bankroll_usd=10_000.0,
+                mode="paper",
+                shakedown_state_path=Path(td) / "sk.json",
+                shakedown_min_days=14,
+                risk_pct_per_trade=0.005,
+                min_confidence_to_trade=0.6,
+            )
+            sup = Supervisor(
+                config=cfg,
+                exchange=StubExchange(),
+                position_store=store,
+                circuit_breakers=StubCircuitBreakers(),
+                notifier=StubNotifier(),
+                model_predict_fn=lambda s, t: ("buy", 0.9),
+                sleep_fn=lambda s: None,
+            )
+            ticks = sup.run_once()
+            self.assertEqual(len(ticks), 1)
+            self.assertEqual(ticks[0].symbol, "polymarket:mkt-1")
+            self.assertEqual(ticks[0].action_taken, "allowed")
+            self.assertEqual(ticks[0].notes, "prediction_binary")
+            # The binary-tick path must call the adapter's get_ticker, NOT
+            # the supervisor's exchange (the StubExchange would crash on a
+            # ``polymarket:`` symbol if hit).
+            self.assertEqual(pm.ticker_calls, 1)
+
+    def test_mixed_symbols_and_polymarket_tradeables_tick_each_pass(self) -> None:
+        """Mixed config: --symbols BTC/USD --polymarket-markets m1,m2 ticks
+        all 3 tradeables per pass.
+
+        Tick iteration order is the union of legacy ``config.symbols`` (in
+        CLI declaration order) followed by any additional tradeable symbols
+        backfilled by the supervisor.
+        """
+        store = StubPositionStore()
+        pm1 = _StubPolymarketTradeable("m1")
+        pm2 = _StubPolymarketTradeable("m2")
+        with tempfile.TemporaryDirectory() as td:
+            cfg = SupervisorConfig(
+                symbols=["BTC/USD"],
+                tradeables=[pm1, pm2],
+                tick_interval_s=0.0,
+                bankroll_usd=10_000.0,
+                mode="paper",
+                shakedown_state_path=Path(td) / "sk.json",
+                shakedown_min_days=14,
+                risk_pct_per_trade=0.005,
+                min_confidence_to_trade=0.6,
+            )
+            sup = Supervisor(
+                config=cfg,
+                exchange=StubExchange(),
+                position_store=store,
+                circuit_breakers=StubCircuitBreakers(),
+                notifier=StubNotifier(),
+                model_predict_fn=lambda s, t: ("buy", 0.9),
+                sleep_fn=lambda s: None,
+            )
+            ticks = sup.run_once()
+            self.assertEqual(len(ticks), 3)
+            tick_symbols = [t.symbol for t in ticks]
+            # Each of the 3 tradeables ticks exactly once per pass.
+            self.assertEqual(
+                set(tick_symbols),
+                {"BTC/USD", "polymarket:m1", "polymarket:m2"},
+            )
+            # The binary tradeables drove their own ticker reads.
+            self.assertEqual(pm1.ticker_calls, 1)
+            self.assertEqual(pm2.ticker_calls, 1)
+
+    def test_polymarket_ticker_error_is_handled_gracefully(self) -> None:
+        """A failing fetcher must not crash the loop — the tick records
+        ``errored`` and the supervisor moves on."""
+        store = StubPositionStore()
+        pm = _StubPolymarketTradeable("mkt-1", raise_on_ticker=True)
+        with tempfile.TemporaryDirectory() as td:
+            cfg = SupervisorConfig(
+                tradeables=[pm],
+                tick_interval_s=0.0,
+                bankroll_usd=10_000.0,
+                mode="paper",
+                shakedown_state_path=Path(td) / "sk.json",
+                shakedown_min_days=14,
+                risk_pct_per_trade=0.005,
+                min_confidence_to_trade=0.6,
+            )
+            sup = Supervisor(
+                config=cfg,
+                exchange=StubExchange(),
+                position_store=store,
+                circuit_breakers=StubCircuitBreakers(),
+                notifier=StubNotifier(),
+                model_predict_fn=lambda s, t: ("buy", 0.9),
+                sleep_fn=lambda s: None,
+            )
+            ticks = sup.run_once()
+            self.assertEqual(len(ticks), 1)
+            self.assertEqual(ticks[0].action_taken, "errored")
+            self.assertIn("polymarket_ticker", ticks[0].notes or "")
+
+    def test_polymarket_kill_switch_force_flatted(self) -> None:
+        """When the kill switch is active, even binary tradeables must
+        record force_flatted (not allowed)."""
+        store = StubPositionStore()
+        pm = _StubPolymarketTradeable("mkt-1")
+        breakers = StubCircuitBreakers(kill_switch=True)
+        with tempfile.TemporaryDirectory() as td:
+            cfg = SupervisorConfig(
+                tradeables=[pm],
+                tick_interval_s=0.0,
+                bankroll_usd=10_000.0,
+                mode="paper",
+                shakedown_state_path=Path(td) / "sk.json",
+                shakedown_min_days=14,
+                risk_pct_per_trade=0.005,
+                min_confidence_to_trade=0.6,
+            )
+            sup = Supervisor(
+                config=cfg,
+                exchange=StubExchange(),
+                position_store=store,
+                circuit_breakers=breakers,
+                notifier=StubNotifier(),
+                model_predict_fn=lambda s, t: ("buy", 0.9),
+                sleep_fn=lambda s: None,
+            )
+            ticks = sup.run_once()
+            self.assertEqual(len(ticks), 1)
+            self.assertEqual(ticks[0].action_taken, "force_flatted")
+            # Binary path doesn't reach the adapter when kill switch is up.
+            self.assertEqual(pm.ticker_calls, 0)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
