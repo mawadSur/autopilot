@@ -13,11 +13,13 @@ Lane D Sub-agent D2 adds the prediction-market adapter
 
 from __future__ import annotations
 
+from .alpaca_tradeable import AlpacaTradeable
 from .coinbase_tradeable import CoinbaseTradeable
 from .hyperliquid_tradeable import HyperliquidTradeable
 from .polymarket_tradeable import PolymarketTradeable
 
 __all__ = [
+    "AlpacaTradeable",
     "CoinbaseTradeable",
     "HyperliquidTradeable",
     "PolymarketTradeable",

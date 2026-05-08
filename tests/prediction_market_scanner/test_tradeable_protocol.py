@@ -99,14 +99,18 @@ class _IncompleteTradeable:
 
 class TestAssetClassEnum(unittest.TestCase):
     def test_three_expected_values(self) -> None:
+        # D1's original three asset classes.
         self.assertEqual(AssetClass.SPOT_CRYPTO.value, "spot_crypto")
         self.assertEqual(AssetClass.PERP_CRYPTO.value, "perp_crypto")
         self.assertEqual(AssetClass.PREDICTION_BINARY.value, "prediction_binary")
-        self.assertEqual(len(list(AssetClass)), 3)
+        # Phase P3 added SPOT_EQUITY for the Alpaca stocks adapter.
+        self.assertEqual(AssetClass.SPOT_EQUITY.value, "spot_equity")
+        self.assertEqual(len(list(AssetClass)), 4)
 
     def test_distinct_members(self) -> None:
         self.assertNotEqual(AssetClass.SPOT_CRYPTO, AssetClass.PERP_CRYPTO)
         self.assertNotEqual(AssetClass.PERP_CRYPTO, AssetClass.PREDICTION_BINARY)
+        self.assertNotEqual(AssetClass.SPOT_EQUITY, AssetClass.SPOT_CRYPTO)
 
 
 class TestFeeModel(unittest.TestCase):

@@ -57,6 +57,7 @@ class AssetClass(Enum):
     SPOT_CRYPTO = "spot_crypto"
     PERP_CRYPTO = "perp_crypto"
     PREDICTION_BINARY = "prediction_binary"
+    SPOT_EQUITY = "spot_equity"
 
 
 @dataclass(frozen=True)
