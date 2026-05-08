@@ -2664,10 +2664,9 @@ class Supervisor:
             tradeable_kind = "coinbase"
             tradeable_args = {"symbol": symbol}
 
-        symbols_sorted = sorted(self._tradeables_by_symbol.keys())
-        symbol_set_hash = hashlib.sha256(
-            json.dumps(symbols_sorted).encode("utf-8")
-        ).hexdigest()[:16]
+        symbol_set_hash = _compute_symbol_set_hash(
+            list(self._tradeables_by_symbol.keys())
+        )
 
         return {
             "symbol": symbol,
@@ -2801,6 +2800,19 @@ def _check_shutdown_flag(redis_client: Any) -> bool:
         return bool(redis_client.get(_SHUTDOWN_KEY))
     except Exception:  # noqa: BLE001 - tolerate flaky reads
         return False
+
+
+def _compute_symbol_set_hash(symbols: List[str]) -> str:
+    """Stable 16-char sha256 prefix of the sorted symbol list.
+
+    The hash scopes the daily-close leader-election Redis key so two
+    independent supervisor groups (different symbol sets running
+    against the same Redis) don't share the lease and thereby skip
+    each other's daily close. Order-insensitive: ``["ETH/USD", "BTC/USD"]``
+    and ``["BTC/USD", "ETH/USD"]`` produce the same hash.
+    """
+    canonical = json.dumps(sorted(symbols)).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()[:16]
 
 
 def _try_acquire_daily_close_leader(

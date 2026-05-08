@@ -32,6 +32,7 @@ import live_supervisor
 from live_supervisor import (
     _CHILD_RESPAWN_BACKOFF_S,
     _DAILY_CLOSE_LEADER_KEY_PREFIX,
+    _DAILY_CLOSE_LEADER_TTL_S,
     _DEFAULT_RESTART_LIMIT_PER_HOUR,
     _SHUTDOWN_KEY,
     _SHUTDOWN_KEY_TTL_S,
@@ -39,6 +40,7 @@ from live_supervisor import (
     SupervisorConfig,
     _build_child_tradeable,
     _check_shutdown_flag,
+    _compute_symbol_set_hash,
     _try_acquire_daily_close_leader,
 )
 
@@ -286,6 +288,74 @@ class TestDailyCloseLeader(unittest.TestCase):
                 pid=1,
             )
         )
+
+    def test_redis_set_called_with_nx_and_ex_kwargs(self) -> None:
+        """The ``nx=True`` + ``ex=7200`` kwargs are the atomic primitive
+        that makes leader election safe -- assert them on the call shape.
+        """
+        client = MagicMock()
+        client.set.return_value = True
+        won = _try_acquire_daily_close_leader(
+            client,
+            utc_date="2026-05-08",
+            symbol_set_hash="abc",
+            pid=99,
+        )
+        self.assertTrue(won)
+        client.set.assert_called_once()
+        kwargs = client.set.call_args.kwargs
+        self.assertTrue(kwargs.get("nx"))
+        self.assertEqual(kwargs.get("ex"), _DAILY_CLOSE_LEADER_TTL_S)
+        self.assertEqual(kwargs.get("name"),
+                         f"{_DAILY_CLOSE_LEADER_KEY_PREFIX}:2026-05-08:abc")
+        self.assertEqual(kwargs.get("value"), "99")
+
+    def test_redis_failure_returns_false(self) -> None:
+        """If Redis raises mid-lease, defer the close (false) rather than
+        let the trader crash."""
+        client = MagicMock()
+        client.set.side_effect = RuntimeError("redis down")
+        won = _try_acquire_daily_close_leader(
+            client, utc_date="2026-05-08", symbol_set_hash="x", pid=1
+        )
+        self.assertFalse(won)
+
+    def test_three_children_simultaneous_race_one_winner(self) -> None:
+        """Simulates 3 children racing at UTC midnight. Exactly one wins.
+
+        This exercises the same fakeredis instance from three logical
+        callers in sequence -- the SETNX semantic guarantees only the
+        first one writes the key, modeling exactly the race that happens
+        when all three children wake up within the same second.
+        """
+        import fakeredis
+
+        client = fakeredis.FakeRedis(decode_responses=True)
+        # Same symbol_set_hash across all three -- they share a leader key.
+        results = [
+            _try_acquire_daily_close_leader(
+                client,
+                utc_date="2026-05-08",
+                symbol_set_hash="set_hash_1234567",
+                pid=pid,
+            )
+            for pid in (101, 102, 103)
+        ]
+        self.assertEqual(
+            sum(1 for r in results if r), 1,
+            "exactly ONE child must win the daily-close lease per UTC date",
+        )
+
+    def test_compute_symbol_set_hash_stable_and_order_insensitive(self) -> None:
+        """The symbol_set_hash helper itself: deterministic + order-insensitive."""
+        h1 = _compute_symbol_set_hash(["ETH/USD", "BTC/USD", "SOL/USD"])
+        h2 = _compute_symbol_set_hash(["SOL/USD", "BTC/USD", "ETH/USD"])
+        h3 = _compute_symbol_set_hash(["ETH/USD", "BTC/USD"])  # subset
+        self.assertEqual(h1, h2)
+        self.assertNotEqual(h1, h3)
+        self.assertEqual(len(h1), 16)
+        # Re-running yields the same value (no nondeterminism).
+        self.assertEqual(h1, _compute_symbol_set_hash(["ETH/USD", "BTC/USD", "SOL/USD"]))
 
 
 # ---------------------------------------------------------------------------
