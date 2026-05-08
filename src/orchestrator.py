@@ -9,7 +9,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -25,6 +25,7 @@ from calibration_agent.ml_service import (
     get_xgboost_probability,
 )
 from calibration_agent.models import CalibrationReport
+from calibration_agent.outcome_weight_adjuster import OutcomeWeightAdjuster
 from fetcher import DEFAULT_MIN_VOLUME_24H, DEFAULT_PAGE_SIZE, fetch_active_markets
 from main import build_scan_results
 from models import Market
@@ -758,6 +759,32 @@ def print_final_report(calibration: CalibrationReport) -> str:
     rendered = "\n".join(lines)
     print(rendered)
     return rendered
+
+
+_DEFAULT_OUTCOME_WEIGHT_FILE = REPO_ROOT / "state" / "outcome_llm_weight.json"
+_DEFAULT_OUTCOME_AUDIT_FILE = REPO_ROOT / "state" / "outcome_llm_weight_audit.jsonl"
+
+
+def apply_outcome_weight_update(
+    outcome_review: Mapping[str, Any] | Any,
+    *,
+    weight_file: Path | None = None,
+    audit_file: Path | None = None,
+    adjuster: OutcomeWeightAdjuster | None = None,
+) -> float:
+    """Per-trade synchronous weight update (D3, Lane C P1 #16).
+
+    Call this from the settled-trade path (today: ``PerformanceTracker``,
+    tomorrow: the loss-postmortem swarm) to apply the adjuster to a single
+    outcome-review payload. Returns the new weight; the caller can pass
+    that into ``calibrate(..., llm_weight=new_weight)`` on the next trade.
+    """
+    if adjuster is None:
+        adjuster = OutcomeWeightAdjuster(
+            weight_file=Path(weight_file or _DEFAULT_OUTCOME_WEIGHT_FILE),
+            audit_file=Path(audit_file or _DEFAULT_OUTCOME_AUDIT_FILE),
+        )
+    return adjuster.update_weight(outcome_review)
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:

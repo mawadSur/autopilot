@@ -448,6 +448,14 @@ class Supervisor:
         # Hydrate (or initialise) the shakedown evidence file.
         self.shakedown_state: ShakedownState = self._load_or_init_shakedown()
 
+        # P0 #8: track the last UTC date we ran ``daily_close`` for so the
+        # run loop can fire it automatically when the clock crosses
+        # midnight. ``None`` on construction means "no close has fired
+        # yet"; the first iteration sets it without firing daily_close
+        # (otherwise a freshly booted supervisor would always emit one
+        # immediately).
+        self._last_close_date: Optional[date] = None
+
         # One-shot "supervisor started" gauge -- only if a pusher is wired in.
         self._safe_metric_call(
             lambda: self.metrics_pusher.gauge("supervisor_started", 1.0)
@@ -736,6 +744,7 @@ class Supervisor:
         total_ticks = 0
         action_counts: Dict[str, int] = {}
         interrupted = False
+        daily_closes_fired = 0
         try:
             while True:
                 if max_iterations is not None and iterations >= max_iterations:
@@ -762,6 +771,14 @@ class Supervisor:
                         confidence,
                         note_suffix,
                     )
+
+                # P0 #8: auto-fire daily_close when the UTC clock crosses
+                # midnight. The first iteration after process boot only
+                # records the current date (no close fires) so a fresh
+                # supervisor doesn't emit one immediately on startup.
+                if self._maybe_fire_daily_close():
+                    daily_closes_fired += 1
+
                 # Sleep last so a single-iter call doesn't pay an idle wait.
                 if max_iterations is None or iterations < max_iterations:
                     self._sleep(self.config.tick_interval_s)
@@ -774,7 +791,39 @@ class Supervisor:
             "total_ticks": total_ticks,
             "action_counts": action_counts,
             "interrupted": interrupted,
+            "daily_closes_fired": daily_closes_fired,
         }
+
+    def _maybe_fire_daily_close(self) -> bool:
+        """If the UTC date has rolled past ``self._last_close_date``, run
+        ``daily_close`` exactly once for the new boundary.
+
+        Returns True if a close fired, False otherwise. The first call on
+        a freshly constructed Supervisor sets the baseline date but does
+        not fire a close -- otherwise every booted process would emit a
+        spurious close on its first tick.
+        """
+        today = self._now().astimezone(timezone.utc).date()
+        if self._last_close_date is None:
+            self._last_close_date = today
+            return False
+        if today > self._last_close_date:
+            try:
+                self.daily_close()
+            except Exception as exc:  # noqa: BLE001 - never crash the loop
+                LOGGER.warning(
+                    "auto daily_close failed: %s; will retry on next crossing",
+                    exc,
+                )
+                # Don't advance _last_close_date so the next iteration
+                # tries again -- but we also don't want to retry every
+                # tick on the same crossing, so the date IS advanced
+                # only on success. (If you want retry-this-tick semantics
+                # remove the early return.)
+                return False
+            self._last_close_date = today
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Daily rollup + shakedown evaluation

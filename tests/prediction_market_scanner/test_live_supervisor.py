@@ -1214,6 +1214,81 @@ class TestRedisBackedErrorCounter(unittest.TestCase):
         )
 
 
+class TestUtcMidnightAutoDailyClose(unittest.TestCase):
+    """P0 #8: ``run_loop`` automatically fires ``daily_close`` when the UTC
+    clock crosses midnight. Exactly once per crossing.
+    """
+
+    def _build_clock_supervisor(
+        self, current: List[datetime]
+    ) -> Supervisor:
+        """Construct a supervisor whose ``now_fn`` returns ``current[0]``
+        on every call. The test mutates ``current[0]`` to advance time."""
+
+        def fake_now() -> datetime:
+            return current[0]
+
+        td = tempfile.TemporaryDirectory()
+        _TMPDIRS.append(td)
+        path = Path(td.name) / "midnight.json"
+        store = StubPositionStore(daily_pnl=10.0)
+        breakers = StubCircuitBreakers(daily_loss_limit_usd=1000.0)
+        notifier = StubNotifier()
+        config = SupervisorConfig(
+            symbols=["ETH/USDT"],
+            tick_interval_s=0.0,
+            bankroll_usd=10_000.0,
+            mode="paper",
+            shakedown_min_days=14,
+            shakedown_state_path=path,
+            risk_pct_per_trade=0.005,
+            min_confidence_to_trade=0.6,
+        )
+        sup = Supervisor(
+            config=config,
+            exchange=StubExchange(),
+            position_store=store,
+            circuit_breakers=breakers,
+            notifier=notifier,
+            model_predict_fn=lambda s, t: ("buy", 0.1),
+            sleep_fn=lambda s: None,
+            now_fn=fake_now,
+        )
+        return sup
+
+    def test_auto_close_fires_once_per_midnight_crossing(self) -> None:
+        """Two iterations on Day-1, two on Day-2 -> exactly one close."""
+        day_1 = datetime(2026, 4, 26, 23, 50, tzinfo=timezone.utc)
+        day_2 = datetime(2026, 4, 27, 0, 5, tzinfo=timezone.utc)
+        clock = [day_1]
+        sup = self._build_clock_supervisor(clock)
+        # Run two iterations on Day-1 (no close should fire; baseline gets set).
+        sup.run_loop(max_iterations=2)
+        self.assertEqual(sup._last_close_date, day_1.date())
+        # Now cross midnight.
+        clock[0] = day_2
+        summary = sup.run_loop(max_iterations=2)
+        self.assertEqual(summary["daily_closes_fired"], 1)
+        self.assertEqual(sup._last_close_date, day_2.date())
+
+    def test_no_close_fires_when_clock_does_not_cross_midnight(self) -> None:
+        within_day = datetime(2026, 4, 26, 12, 0, tzinfo=timezone.utc)
+        sup = self._build_clock_supervisor([within_day])
+        summary = sup.run_loop(max_iterations=5)
+        self.assertEqual(summary["daily_closes_fired"], 0)
+
+    def test_close_fires_only_once_per_crossing(self) -> None:
+        """Crossing midnight then doing many iterations same day = 1 close."""
+        day_1 = datetime(2026, 4, 26, 23, 59, tzinfo=timezone.utc)
+        day_2 = datetime(2026, 4, 27, 0, 1, tzinfo=timezone.utc)
+        clock = [day_1]
+        sup = self._build_clock_supervisor(clock)
+        sup.run_loop(max_iterations=1)  # baseline = day_1
+        clock[0] = day_2
+        summary = sup.run_loop(max_iterations=10)  # fires once on first iter
+        self.assertEqual(summary["daily_closes_fired"], 1)
+
+
 class TestShakedownFileLock(unittest.TestCase):
     """P0 #2: persisted shakedown state is flock-guarded + atomic-renamed.
 
