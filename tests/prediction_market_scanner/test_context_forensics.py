@@ -26,7 +26,7 @@ import os
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 from unittest.mock import patch
 
 import fakeredis
@@ -37,6 +37,9 @@ from loss_postmortem.context_forensics import (
     BTC_DOMINANCE_PREV_KEY,
     HEADLINE_DENSITY_RED_FLAG,
     ContextForensicsAgent,
+    X_SENTIMENT_CACHE_KEY_PREFIX,
+    X_SENTIMENT_CACHE_TTL_S,
+    X_SENTIMENT_RED_FLAG_ABS,
     _VERY_HIGH_NEWS_CLUSTER,
     _fetch_btc_dominance_cached,
     _fetch_x_sentiment,
@@ -824,7 +827,7 @@ class BtcDominanceAgentIntegrationTests(unittest.TestCase):
 
 
 class XSentimentScaffoldTests(unittest.TestCase):
-    """The X/Twitter sentiment helper is a stub until API access is wired."""
+    """The X/Twitter sentiment helper short-circuits when no API key is set."""
 
     def test_returns_none_when_env_var_unset(self) -> None:
         """No X_API_KEY → silent None, no NotImplementedError."""
@@ -832,6 +835,209 @@ class XSentimentScaffoldTests(unittest.TestCase):
             os.environ.pop("X_API_KEY", None)
             value = _fetch_x_sentiment("BTC/USD")
         self.assertIsNone(value)
+
+
+# ---------------------------------------------------------------------------
+# X sentiment — bearer auth + cache + sentiment scoring
+# ---------------------------------------------------------------------------
+
+
+def _x_response(tweets: List[Dict[str, Any]], *, status_code: int = 200) -> _StubResponse:
+    """Build a minimal X v2 recent-search response wrapping ``tweets``."""
+
+    return _StubResponse(
+        json_data={"data": tweets, "meta": {"result_count": len(tweets)}},
+        status_code=status_code,
+    )
+
+
+class XSentimentLiveFetchTests(unittest.TestCase):
+    """End-to-end: bearer auth → tweet score → score in [-1, 1] → cache."""
+
+    def test_bullish_tweets_yield_positive_score(self) -> None:
+        """5 mixed tweets weighted bullish → positive score."""
+        tweets = [
+            {"text": "BTC bullish breakout, going to moon!"},
+            {"text": "buying the dip, strong support"},
+            {"text": "rally is on, ATH soon"},
+            {"text": "weak action though, maybe down a bit"},
+            {"text": "bull market momentum"},
+        ]
+        with patch.dict(os.environ, {"X_API_KEY": "test-key"}, clear=False):
+            with patch("requests.get", return_value=_x_response(tweets)):
+                value = _fetch_x_sentiment("BTC/USD", redis_client=None)
+        self.assertIsNotNone(value)
+        self.assertGreater(value, 0.0)
+        self.assertLessEqual(value, 1.0)
+
+    def test_bearish_tweets_yield_negative_score(self) -> None:
+        """5 mixed tweets weighted bearish → negative score."""
+        tweets = [
+            {"text": "BTC crash incoming, bearish"},
+            {"text": "huge dump, sell now"},
+            {"text": "panic in the market, fear high"},
+            {"text": "minor strength, might recover"},
+            {"text": "rekt, total loss"},
+        ]
+        with patch.dict(os.environ, {"X_API_KEY": "test-key"}, clear=False):
+            with patch("requests.get", return_value=_x_response(tweets)):
+                value = _fetch_x_sentiment("BTC/USD", redis_client=None)
+        self.assertIsNotNone(value)
+        self.assertLess(value, 0.0)
+        self.assertGreaterEqual(value, -1.0)
+
+    def test_empty_tweet_list_returns_zero(self) -> None:
+        """No tweets in response → neutral 0.0 (not None)."""
+        with patch.dict(os.environ, {"X_API_KEY": "test-key"}, clear=False):
+            with patch("requests.get", return_value=_x_response([])):
+                value = _fetch_x_sentiment("BTC/USD", redis_client=None)
+        self.assertIsNotNone(value)
+        self.assertAlmostEqual(value, 0.0)
+
+    def test_http_timeout_returns_none(self) -> None:
+        """requests.get raising → None, no exception propagation."""
+
+        class _SimulatedTimeout(Exception):
+            pass
+
+        with patch.dict(os.environ, {"X_API_KEY": "test-key"}, clear=False):
+            with patch("requests.get", side_effect=_SimulatedTimeout("timed out")):
+                value = _fetch_x_sentiment("BTC/USD", redis_client=None)
+        self.assertIsNone(value)
+
+    def test_4xx_response_returns_none(self) -> None:
+        """Unauthorised / quota / server errors → None silently."""
+        with patch.dict(os.environ, {"X_API_KEY": "bad-key"}, clear=False):
+            with patch(
+                "requests.get",
+                return_value=_x_response([], status_code=429),
+            ):
+                value = _fetch_x_sentiment("BTC/USD", redis_client=None)
+        self.assertIsNone(value)
+
+    def test_cache_hit_skips_http_call(self) -> None:
+        """A cached score short-circuits; requests.get is never invoked."""
+        client = fakeredis.FakeRedis(decode_responses=True)
+        # Pre-seed the cache with the exact key the helper builds.
+        cache_key = (
+            f"{X_SENTIMENT_CACHE_KEY_PREFIX}:BTC/USD:"
+            f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H')}"
+        )
+        client.set(cache_key, "0.42", ex=X_SENTIMENT_CACHE_TTL_S)
+        with patch.dict(os.environ, {"X_API_KEY": "test-key"}, clear=False):
+            with patch("requests.get") as spy:
+                value = _fetch_x_sentiment("BTC/USD", redis_client=client)
+        self.assertAlmostEqual(value, 0.42, places=5)
+        # Cache hit = zero HTTP calls.
+        self.assertEqual(spy.call_count, 0)
+
+    def test_live_fetch_repopulates_cache(self) -> None:
+        """Cache miss → live fetch → cache now holds the new score."""
+        client = fakeredis.FakeRedis(decode_responses=True)
+        tweets = [{"text": "buy the dip, bullish"}]
+        with patch.dict(os.environ, {"X_API_KEY": "test-key"}, clear=False):
+            with patch("requests.get", return_value=_x_response(tweets)):
+                value = _fetch_x_sentiment("BTC/USD", redis_client=client)
+        self.assertIsNotNone(value)
+        self.assertGreater(value, 0.0)
+        cache_key = (
+            f"{X_SENTIMENT_CACHE_KEY_PREFIX}:BTC/USD:"
+            f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H')}"
+        )
+        cached = client.get(cache_key)
+        self.assertIsNotNone(cached)
+        self.assertAlmostEqual(float(cached), value, places=5)
+
+    def test_bearer_token_is_sent_in_authorization_header(self) -> None:
+        """X_API_KEY is forwarded as ``Authorization: Bearer <key>``."""
+        with patch.dict(os.environ, {"X_API_KEY": "abc-123"}, clear=False):
+            with patch(
+                "requests.get",
+                return_value=_x_response([]),
+            ) as spy:
+                _fetch_x_sentiment("BTC/USD", redis_client=None)
+        self.assertEqual(spy.call_count, 1)
+        kwargs = spy.call_args.kwargs
+        self.assertEqual(
+            kwargs["headers"]["Authorization"], "Bearer abc-123"
+        )
+
+
+class XSentimentAgentIntegrationTests(unittest.TestCase):
+    """A4 must consume the X sentiment fetcher without ever crashing."""
+
+    def test_unset_env_var_emits_unavailable_bullet(self) -> None:
+        """Sentiment helper returns None → existing 'unavailable' bullet."""
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini(),
+            x_sentiment_fetcher=lambda _sym: None,
+        )
+        finding = agent.investigate("trade-A4")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("sentiment check unavailable", joined)
+        # Should not promote to contributing on this signal alone.
+        self.assertEqual(finding.verdict, "innocent")
+
+    def test_strong_x_sentiment_triggers_red_flag(self) -> None:
+        """``|score| > 0.3`` → red flag bullet + contributing tier."""
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini(),
+            x_sentiment_fetcher=lambda _sym: -0.6,
+        )
+        finding = agent.investigate("trade-A4")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("x_sentiment_shift", joined)
+        self.assertIn("bearish", joined)
+        # 1 red flag → contributing
+        self.assertEqual(finding.verdict, "contributing")
+
+    def test_weak_x_sentiment_does_not_trigger_red_flag(self) -> None:
+        """``|score| <= 0.3`` → informational only, no escalation."""
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini(),
+            x_sentiment_fetcher=lambda _sym: 0.15,
+        )
+        finding = agent.investigate("trade-A4")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("X sentiment", joined)
+        self.assertNotIn("x_sentiment_shift", joined)
+        self.assertEqual(finding.verdict, "innocent")
+
+    def test_x_sentiment_fetcher_raise_does_not_crash_agent(self) -> None:
+        """A raising fetcher must not break A4 — sentiment is decoration."""
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+
+        def _exploding(_sym: str) -> Optional[float]:
+            raise RuntimeError("simulated X API outage")
+
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini(),
+            x_sentiment_fetcher=_exploding,
+        )
+        finding = agent.investigate("trade-A4")
+        # Despite the raising fetcher, the agent emits a finding cleanly.
+        self.assertEqual(finding.verdict, "innocent")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("sentiment check unavailable", joined)
 
 
 # ---------------------------------------------------------------------------

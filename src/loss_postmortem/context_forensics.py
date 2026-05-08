@@ -398,35 +398,112 @@ def _fetch_btc_dominance_prev(redis_client: Optional[Any]) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
-# X / Twitter sentiment — scaffold (no real integration without API keys)
+# X / Twitter sentiment — bearer-auth fetch + word-count sentiment + 1h cache
 # ---------------------------------------------------------------------------
 
+# X API endpoint + auth + bounds. Endpoint is the v2 recent-search surface;
+# 50 results is a comfortable default — enough signal to average over without
+# burning API quota. 4s HTTP timeout matches the BTC dominance fetcher
+# discipline upstream.
+X_API_RECENT_SEARCH_URL = "https://api.twitter.com/2/tweets/search/recent"
+X_API_HTTP_TIMEOUT_S = 4.0
+X_API_MAX_RESULTS = 50
 
-def _fetch_x_sentiment(symbol: str) -> Optional[float]:  # pragma: no cover
-    """Stub for X (Twitter) sentiment — returns ``None`` until wired.
+# Cache key prefix + TTL. Keyed by (symbol, ISO date_hour) so the result
+# rolls over hourly without explicit invalidation.
+X_SENTIMENT_CACHE_KEY_PREFIX = "x_sentiment"
+X_SENTIMENT_CACHE_TTL_S = 3600  # 1 hour
 
-    When the ``X_API_KEY`` environment variable is set we'll wire a real
-    call to the X API v2 ``tweets/search/recent`` endpoint, score the
-    pulled tweets via a small sentiment model (e.g. cardiffnlp/twitter-
-    roberta-base-sentiment), and return a [-1, 1] score. Until the API
-    key exists we return ``None`` silently — A4 must continue without it.
+# Sentiment evidence trigger threshold. ``|score| > 0.3`` flips the bullet
+# in :meth:`ContextForensicsAgent.investigate` to a contributing red flag.
+X_SENTIMENT_RED_FLAG_ABS = 0.3
 
-    Future wiring contract:
-    * Bearer auth via ``Authorization: Bearer <X_API_KEY>``.
-    * Search params: ``query=$symbol -is:retweet lang:en``,
-      ``max_results=100``, ``start_time=now-1h``.
-    * Aggregation: mean compound score across the returned tweets.
-    * Caching: stash the result under
-      ``x_sentiment:{symbol}:{date_hour}`` with TTL=1h to bound cost.
+# Skeleton word lists. Production should swap to a real sentiment model
+# (e.g. cardiffnlp/twitter-roberta-base-sentiment) and proper tokenization
+# — these tiny lists exist purely so this PR can ship a runnable end-to-end
+# integration without dragging in a heavyweight dependency. See the
+# docstring for the upgrade path.
+_X_POSITIVE_WORDS: frozenset[str] = frozenset(
+    [
+        "bull", "bullish", "rally", "surge", "moon", "pump", "buy",
+        "long", "breakout", "winning", "win", "gain", "gains", "rich",
+        "strong", "strength", "rocket", "up", "uptrend", "ath", "good",
+        "great", "love", "best",
+    ]
+)
+
+_X_NEGATIVE_WORDS: frozenset[str] = frozenset(
+    [
+        "bear", "bearish", "crash", "dump", "sell", "short", "tank",
+        "loss", "losses", "down", "downtrend", "weak", "weakness",
+        "rekt", "rug", "scam", "fud", "panic", "fear", "drop", "dump",
+        "bad", "hate", "worst", "bleeding",
+    ]
+)
+
+
+def _x_score_text(text: str) -> int:
+    """Return a simple +1/-1/0 score for a single tweet's text.
+
+    Word-count heuristic: positive_count - negative_count, sign-clipped to
+    {-1, 0, 1} so ties or quiet text don't dominate the aggregate. Splits
+    on whitespace and lowercases — no proper tokenizer here. Documented as
+    a temporary skeleton (see module-level note).
+    """
+
+    if not text or not isinstance(text, str):
+        return 0
+    pos = 0
+    neg = 0
+    for token in text.lower().split():
+        # Strip very common punctuation cling-ons; cheap pre-filter.
+        token = token.strip(".,!?;:'\"()[]{}#@-")
+        if not token:
+            continue
+        if token in _X_POSITIVE_WORDS:
+            pos += 1
+        elif token in _X_NEGATIVE_WORDS:
+            neg += 1
+    if pos == neg:
+        return 0
+    return 1 if pos > neg else -1
+
+
+def _fetch_x_sentiment(
+    symbol: str,
+    *,
+    redis_client: Optional[Any] = None,
+) -> Optional[float]:
+    """Pull recent X (Twitter) chatter for ``symbol`` + return a compound score.
+
+    Wiring contract:
+
+    * Auth: ``Authorization: Bearer <X_API_KEY>`` from env.
+    * Endpoint: GET ``https://api.twitter.com/2/tweets/search/recent``
+      with ``query=$symbol``, ``max_results=50``,
+      ``tweet.fields=public_metrics``.
+    * 4s HTTP timeout. On timeout / 4xx-5xx / non-JSON, return ``None``
+      silently — never raise out of A4 (matches the rest of the agent's
+      ``_safe_run`` discipline).
+    * Cache: Redis key ``x_sentiment:{symbol}:{YYYY-MM-DDTHH}`` with TTL=1h
+      so we don't burn API quota on every investigate() call inside the
+      same hour.
+    * Sentiment scoring: simple positive/negative word-count heuristic
+      averaged across returned tweets, clipped to ``[-1, 1]``. This is a
+      skeleton — production should swap to a real sentiment model
+      (cardiffnlp/twitter-roberta-base-sentiment is the cheap reference)
+      with proper tokenization. The signature stays the same.
 
     Args:
         symbol: trading symbol the sentiment was requested for (e.g.
-            ``"BTC/USD"``). Currently unused — present for forward
-            compat with the eventual real implementation.
+            ``"BTC/USD"``). Used both as the search query and as the
+            cache key component.
+        redis_client: optional Redis-like client (``get`` / ``set(ex=)``).
+            When ``None``, the cache is skipped (live fetch every call).
 
     Returns:
-        Float compound sentiment in [-1.0, 1.0] when the integration is
-        wired and a result is available, ``None`` otherwise.
+        Float sentiment in ``[-1.0, 1.0]`` on success; ``None`` when
+        ``X_API_KEY`` is unset or any failure path fires.
     """
 
     api_key = os.getenv("X_API_KEY")
@@ -434,12 +511,85 @@ def _fetch_x_sentiment(symbol: str) -> Optional[float]:  # pragma: no cover
         # No key configured — degrade silently. A4's sentiment evidence
         # bullet already records the gap.
         return None
-    # TODO: wire X API integration. The plumbing is intentionally stubbed
-    # so callers don't accidentally rely on real network access in CI.
-    raise NotImplementedError(
-        "Wire X API integration: bearer auth + tweets/search/recent + "
-        "sentiment scoring + 1h TTL cache by symbol."
+
+    # ---- 1) cache hit? ---------------------------------------------
+    cache_key = (
+        f"{X_SENTIMENT_CACHE_KEY_PREFIX}:{symbol}:"
+        f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H')}"
     )
+    if redis_client is not None:
+        try:
+            raw = redis_client.get(cache_key)
+        except Exception:  # noqa: BLE001 - degrade gracefully
+            raw = None
+        if raw is not None:
+            try:
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                value = float(raw)
+                if -1.0 <= value <= 1.0:
+                    return value
+            except (TypeError, ValueError):
+                # Bad cache entry; fall through to the live fetch.
+                pass
+
+    # ---- 2) live fetch (best-effort, never raises out) -------------
+    try:
+        import requests  # local import keeps cold path cheap
+    except Exception:  # noqa: BLE001
+        return None
+
+    try:
+        response = requests.get(
+            X_API_RECENT_SEARCH_URL,
+            params={
+                "query": symbol,
+                "max_results": X_API_MAX_RESULTS,
+                "tweet.fields": "public_metrics",
+            },
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=X_API_HTTP_TIMEOUT_S,
+        )
+    except Exception as exc:  # noqa: BLE001 - includes Timeout, ConnectionError
+        LOGGER.warning("context: X sentiment fetch failed: %r", exc)
+        return None
+
+    try:
+        if getattr(response, "status_code", 200) >= 400:
+            return None
+        payload = response.json()
+    except Exception as exc:  # noqa: BLE001 - malformed JSON
+        LOGGER.warning("context: X sentiment response not JSON: %r", exc)
+        return None
+
+    tweets = []
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            tweets = data
+    if not tweets:
+        # Empty response → neutral sentiment (0.0). Distinct from "API
+        # failed" (None) so the caller can tell them apart.
+        score = 0.0
+    else:
+        scores = [_x_score_text(str(t.get("text", "") or "")) for t in tweets]
+        # Mean of per-tweet scores in {-1, 0, 1} → already in [-1, 1].
+        score = sum(scores) / max(1, len(scores))
+        # Defensive clip for safety.
+        score = max(-1.0, min(1.0, score))
+
+    # ---- 3) cache (best-effort) ------------------------------------
+    if redis_client is not None:
+        try:
+            redis_client.set(
+                cache_key,
+                f"{score:.6f}",
+                ex=X_SENTIMENT_CACHE_TTL_S,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -479,18 +629,23 @@ class ContextForensicsAgent(BaseForensicsAgent):
         gemini_timeout_s: float = GEMINI_CALL_TIMEOUT_S,
         redis_client: Optional[Any] = None,
         btc_dominance_fetcher: Optional[Callable[[Optional[Any]], Optional[float]]] = None,
+        x_sentiment_fetcher: Optional[Callable[[str], Optional[float]]] = None,
     ) -> None:
         super().__init__(context_store=context_store, timeout_s=timeout_s)
         self._news_fetcher_factory = news_fetcher_factory
         self._markets_fetcher = markets_fetcher
         self._gemini_caller = gemini_caller
         self._gemini_timeout_s = float(gemini_timeout_s)
-        # Optional Redis client used for the BTC-dominance cache. When
-        # absent we still try to fetch live but skip caching.
+        # Optional Redis client used for the BTC-dominance + X-sentiment
+        # caches. When absent we still try to fetch live but skip caching.
         self._redis_client = redis_client
         # Tests can inject a fake fetcher to avoid hitting CoinGecko.
         # Default delegates to ``_fetch_btc_dominance_cached``.
         self._btc_dominance_fetcher = btc_dominance_fetcher
+        # Tests can inject a fake X sentiment fetcher to avoid hitting the
+        # X API. Default delegates to ``_fetch_x_sentiment`` (module-level)
+        # with the agent's Redis client for caching.
+        self._x_sentiment_fetcher = x_sentiment_fetcher
 
     # ------------------------------------------------------------------
     # contract
@@ -638,12 +793,33 @@ class ContextForensicsAgent(BaseForensicsAgent):
                     "(no prior cached sample for 1h delta)"
                 )
 
-        # ---- 4) Sentiment (optional) ---------------------------------
-        # We don't run X/Twitter sentiment here. Surface the gap so the
-        # synthesizer / digest can flag it as a known unknown.
-        evidence.append(
-            "sentiment check unavailable — would require X/Twitter integration"
-        )
+        # ---- 4) Sentiment (X / Twitter) -------------------------------
+        # Best-effort. Returns None when X_API_KEY is unset (no key, no
+        # noise) and surfaces a contributing red flag when ``|score|``
+        # exceeds the documented threshold. Wrap in try/except so the
+        # check NEVER propagates upward — sentiment is decoration, not
+        # the swarm's source of truth.
+        try:
+            x_score = self._fetch_x_sentiment(symbol)
+        except Exception as exc:  # noqa: BLE001 - paranoid belt + braces
+            LOGGER.warning("context: X sentiment helper raised: %r", exc)
+            x_score = None
+        if x_score is None:
+            evidence.append(
+                "sentiment check unavailable — X_API_KEY unset or fetch failed"
+            )
+        else:
+            evidence.append(f"X sentiment: {x_score:+.2f} (over recent 50 tweets)")
+            if abs(x_score) > X_SENTIMENT_RED_FLAG_ABS:
+                red_flags += 1
+                direction = "bullish" if x_score > 0 else "bearish"
+                evidence.append(
+                    f"red flag: x_sentiment_shift — {direction} "
+                    f"({x_score:+.2f}, > {X_SENTIMENT_RED_FLAG_ABS:.2f})"
+                )
+                suggested_actions.append(
+                    {"type": "add_x_sentiment_feature", "source": "x_recent_search"}
+                )
 
         # ---- 5) Optional LLM summarization ---------------------------
         # ONE bounded call. Failure => still emit deterministic findings.
@@ -705,6 +881,20 @@ class ContextForensicsAgent(BaseForensicsAgent):
         if fetcher is None:
             return _fetch_btc_dominance_cached(self._redis_client)
         return fetcher(self._redis_client)
+
+    def _fetch_x_sentiment(self, symbol: str) -> Optional[float]:
+        """Return the cached/live X sentiment score in [-1, 1] or ``None``.
+
+        Delegates to the constructor-injected fetcher when supplied;
+        otherwise calls :func:`_fetch_x_sentiment` (module-level) with this
+        agent's redis client for caching. Returns ``None`` on any failure
+        OR when X_API_KEY is unset.
+        """
+
+        fetcher = self._x_sentiment_fetcher
+        if fetcher is not None:
+            return fetcher(symbol)
+        return _fetch_x_sentiment(symbol, redis_client=self._redis_client)
 
     def _fetch_macro_shifts(self) -> List[Dict[str, Any]]:
         """Return macro markets that moved > 5pp in the 1h window, sorted desc."""
@@ -924,6 +1114,12 @@ __all__ = [
     "HEADLINE_DENSITY_RED_FLAG",
     "MACRO_CATEGORIES",
     "MACRO_SHIFT_RED_FLAG_PP",
+    "X_API_HTTP_TIMEOUT_S",
+    "X_API_MAX_RESULTS",
+    "X_API_RECENT_SEARCH_URL",
+    "X_SENTIMENT_CACHE_KEY_PREFIX",
+    "X_SENTIMENT_CACHE_TTL_S",
+    "X_SENTIMENT_RED_FLAG_ABS",
     "_VERY_HIGH_NEWS_CLUSTER",
     "_fetch_btc_dominance_cached",
     "_fetch_btc_dominance_prev",
