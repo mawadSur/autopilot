@@ -36,6 +36,34 @@ LOGGER = logging.getLogger(__name__)
 _NEUTRAL_RESULT: Tuple[Literal["buy", "sell"], float] = ("buy", 0.5)
 
 
+def _is_valid_confidence(conf: float) -> bool:
+    """Confidence must be a finite float in ``[0.0, 1.0]``.
+
+    NaN, +/-inf, negative, or >1 values fail. Used by both predictor
+    families as a last-line defence before returning to the supervisor —
+    the supervisor's confidence floor would skip NaN anyway via < check
+    semantics, but we prefer not to pass garbage downstream.
+    """
+    try:
+        c = float(conf)
+    except (TypeError, ValueError):
+        return False
+    return bool(np.isfinite(c)) and 0.0 <= c <= 1.0
+
+
+def _validated_decision(
+    side: Literal["buy", "sell"], conf: float
+) -> Tuple[Literal["buy", "sell"], float]:
+    """Return ``(side, conf)`` if ``conf`` is finite + in [0, 1] else neutral."""
+    if not _is_valid_confidence(conf):
+        LOGGER.warning(
+            "predictor: rejecting invalid confidence %r; returning neutral",
+            conf,
+        )
+        return _NEUTRAL_RESULT
+    return (side, float(conf))
+
+
 class LegacyTransformerPredictor:
     """Wraps ``model_sanity/`` artifacts as a supervisor-shaped callable."""
 
@@ -235,6 +263,11 @@ class LegacyTransformerPredictor:
 
         Confidence is the chosen side's probability so the supervisor's
         ``min_confidence_to_trade`` gate is meaningful.
+
+        Defensive: any non-finite or out-of-range confidence (NaN, +/-inf,
+        negative, > 1.0) routes to ``_NEUTRAL_RESULT``. The supervisor's
+        confidence floor would already skip such values, but we'd rather
+        not pass garbage downstream.
         """
         flat = np.asarray(probs).flatten()
         if flat.size >= 3:
@@ -250,9 +283,9 @@ class LegacyTransformerPredictor:
 
         # Apply thresholds + dominance check.
         if p_long >= p_short and p_long >= self.thr_long:
-            return ("buy", p_long)
+            return _validated_decision("buy", p_long)
         if p_short > p_long and p_short >= self.thr_short:
-            return ("sell", p_short)
+            return _validated_decision("sell", p_short)
         return _NEUTRAL_RESULT
 
 
@@ -281,7 +314,7 @@ class XGBoostPredictor:
         *,
         model_dir: str,
         exchange: Any,
-        thr_long: float = 0.65,
+        thr_long: Optional[float] = None,
         warmup_bars: int = 350,
         max_buffer_bars: int = 5000,
     ) -> None:
@@ -289,10 +322,13 @@ class XGBoostPredictor:
         import joblib
 
         self.model_dir = str(Path(model_dir).expanduser().resolve())
+        if not Path(self.model_dir).exists():
+            raise FileNotFoundError(
+                f"XGBoost model_dir does not exist: {self.model_dir}"
+            )
         self.exchange = exchange
         self.warmup_bars = int(warmup_bars)
         self.max_buffer_bars = int(max_buffer_bars)
-        self.thr_long = float(thr_long)
 
         meta_path = Path(self.model_dir) / "meta.json"
         model_path = Path(self.model_dir) / "model.joblib"
@@ -309,15 +345,53 @@ class XGBoostPredictor:
         self.feature_cols: List[str] = list(feature_cols_raw)
         self.model = joblib.load(model_path)
 
+        # Threshold precedence: explicit kwarg > meta.json optimal_threshold
+        # > 0.5 default. Document so operators know what overrides what.
+        meta_optimal = self.meta.get("optimal_threshold")
+        if thr_long is not None:
+            self.thr_long = float(thr_long)
+            self._thr_source = "explicit"
+        elif meta_optimal is not None:
+            self.thr_long = float(meta_optimal)
+            self._thr_source = "meta.optimal_threshold"
+        else:
+            self.thr_long = 0.5
+            self._thr_source = "default"
+
+        # Optional StandardScaler bundle. If present, its column order MUST
+        # match meta.feature_cols exactly; silently scaling features in the
+        # wrong order is the kind of footgun that produces seemingly-fine
+        # probabilities that are wrong by every measure.
+        scaler_path = Path(self.model_dir) / "scaler.joblib"
+        self.scaler: Optional[Any] = None
+        if scaler_path.exists():
+            self.scaler = joblib.load(scaler_path)
+        if self.scaler is not None:
+            if not hasattr(self.scaler, "feature_names_in_"):
+                raise ValueError(
+                    f"XGBoost bundle at {self.model_dir}: scaler is missing "
+                    f"feature_names_in_ attribute; cannot verify feature "
+                    f"column order. Refusing to load."
+                )
+            scaler_cols = list(self.scaler.feature_names_in_)
+            if scaler_cols != self.feature_cols:
+                raise ValueError(
+                    f"XGBoost bundle at {self.model_dir}: scaler column "
+                    f"order does not match meta.feature_cols. "
+                    f"scaler_first5={scaler_cols[:5]} "
+                    f"meta_first5={self.feature_cols[:5]}"
+                )
+
         self._buffers: Dict[str, Any] = {}
         self._last_seeded_minute: Dict[str, int] = {}
         self._lock = threading.Lock()
 
         LOGGER.info(
-            "XGBoostPredictor ready: dir=%s features=%d thr_long=%.3f",
+            "XGBoostPredictor ready: dir=%s features=%d thr_long=%.3f (src=%s)",
             self.model_dir,
             len(self.feature_cols),
             self.thr_long,
+            self._thr_source,
         )
 
     def __call__(
@@ -336,7 +410,7 @@ class XGBoostPredictor:
         if proba is None:
             return _NEUTRAL_RESULT
         if proba >= self.thr_long:
-            return ("buy", float(proba))
+            return _validated_decision("buy", float(proba))
         return _NEUTRAL_RESULT
 
     def _refresh_buffer(self, symbol: str) -> None:
@@ -392,6 +466,16 @@ class XGBoostPredictor:
         if latest.isna().any().any():
             latest = latest.fillna(0.0)
         proba = float(self.model.predict_proba(latest.to_numpy())[0, 1])
+        # Defensive: a corrupted booster or numerically unstable feature row
+        # could yield NaN / inf. Returning ``None`` makes ``__call__`` map
+        # back to ``_NEUTRAL_RESULT`` rather than passing junk downstream.
+        if not _is_valid_confidence(proba):
+            LOGGER.warning(
+                "xgb predictor: %s produced invalid proba %r; returning neutral",
+                symbol,
+                proba,
+            )
+            return None
         # Operator-visible: surface the raw probability so threshold tuning
         # is data-driven, not guesswork. One line per minute (buffer only
         # refreshes on minute boundary).
