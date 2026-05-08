@@ -2,19 +2,23 @@
 
 A losing trade where high-impact news broke in the 1h window before the
 trade timestamp. The model fired without that context — A4
-ContextForensicsAgent should detect elevated headline density (> 5
-headlines in 1h) and emit a news evidence bullet, classifying as at
-least ``contributing`` (and ``primary_cause`` when combined with a
-macro shift).
+ContextForensicsAgent should detect an extreme headline cluster (>= 10
+headlines in the 1h window) and promote the verdict directly to
+``primary_cause`` so the swarm root_cause label resolves to "Context".
+
+W1A's verdict-ladder tightening introduced ``_VERY_HIGH_NEWS_CLUSTER =
+10`` — at or above that count A4 promotes regardless of other red
+flags. This fixture seeds 11 headlines by default so the canonical
+integration scenario exercises the new tier.
 
 To keep the fixture deterministic and self-contained, ``build_fixture``
 returns the trade_id PLUS a callable factory that the test wires into
 the ContextForensicsAgent constructor:
 
 - ``news_fetcher_factory(query) -> object with .fetch_news()``
-  returning a list of 7 canned headlines, all timestamped within the 1h
-  window before ``captured_at``. That alone (> 5 headlines) trips the
-  HEADLINE_DENSITY_RED_FLAG threshold.
+  returning a list of 11 canned headlines, all timestamped within the 1h
+  window before ``captured_at``. Crossing the ``_VERY_HIGH_NEWS_CLUSTER``
+  threshold (10) promotes A4 to ``primary_cause`` directly.
 - ``markets_fetcher() -> []`` — no Polymarket macro shifts (so the
   verdict is at-least-contributing, not necessarily primary).
 - ``gemini_caller(prompt) -> str`` — returns a fixed one-line summary
@@ -186,9 +190,11 @@ def build_fixture(
             trade_id, exit_price=29_700.0, exit_quote_usd=29_700.0 * 0.003
         )
 
-    # ----- canned headlines: 7 entries, all in the 1h pre-trade window -----
-    # Spread across the 60 min before captured_at so they fall inside
-    # ``(captured_at - 1h, captured_at]``.
+    # ----- canned headlines: 11 entries, all in the 1h pre-trade window -----
+    # Spread across the 55 min before captured_at so they fall inside
+    # ``(captured_at - 1h, captured_at]``. 11 entries crosses the
+    # ``_VERY_HIGH_NEWS_CLUSTER`` threshold (10) so A4 promotes directly
+    # to primary_cause.
     headline_titles = [
         "Federal Reserve signals emergency rate decision overnight",
         "BTC plunges 8% on macro shock; analysts warn of cascade",
@@ -197,12 +203,19 @@ def build_fixture(
         "Hedge fund liquidation rumours hit crypto markets",
         "Stablecoin issuer reveals reserve audit discrepancy",
         "Inflation print exceeds consensus; risk-off across the board",
+        "ECB hints at coordinated central bank intervention",
+        "Crypto whale wallet drains $200M to exchange in last hour",
+        "Geopolitical risk premium surges as Mideast tensions flare",
+        "On-chain analytics flag rapid leverage unwind in perp markets",
     ]
     headlines: List[Dict[str, Any]] = []
+    n_headlines = len(headline_titles)
     for i, title in enumerate(headline_titles):
-        # Place the i-th headline (60 - 5*i) minutes before captured_at,
-        # so all 7 land in the (captured_at - 60min, captured_at] window.
-        published = captured_at - timedelta(minutes=55 - 5 * i)
+        # Place the i-th headline at staggered offsets across the
+        # window so all entries land in (captured_at - 60min, captured_at].
+        # Offsets evenly spaced from ~58 min ago down to ~2 min ago.
+        offset_min = 58 - int(56 * i / max(1, n_headlines - 1))
+        published = captured_at - timedelta(minutes=offset_min)
         headlines.append(
             {
                 "title": title,

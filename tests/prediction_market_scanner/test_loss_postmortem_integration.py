@@ -361,13 +361,25 @@ class LossPostmortemIntegrationTests(unittest.TestCase):
         findings = _findings_by_agent(report)
         ctx_finding = findings.get("context")
         self.assertIsNotNone(ctx_finding, "context finding missing")
-        # Verdict must reflect that the news density red flag fired.
-        self.assertIn(
+        # With the W1A verdict-ladder tightening (>= 10 headlines promotes
+        # to primary_cause) the canonical fixture seeds 11 headlines so
+        # A4 returns primary_cause and root_cause includes "Context".
+        self.assertEqual(
             ctx_finding.verdict,
-            {"contributing", "primary_cause"},
+            "primary_cause",
             msg=(
-                f"context expected contributing/primary_cause; got "
-                f"{ctx_finding.verdict!r}. Evidence: {ctx_finding.evidence}"
+                f"context expected primary_cause from extreme news "
+                f"cluster; got {ctx_finding.verdict!r}. Evidence: "
+                f"{ctx_finding.evidence}"
+            ),
+        )
+        self.assertIn(
+            "Context",
+            report.root_cause,
+            msg=(
+                f"news_event_miss expected Context in root_cause; "
+                f"got {report.root_cause!r}. Findings: "
+                f"{[(f.agent, f.verdict) for f in report.findings]}"
             ),
         )
         # At least one evidence bullet must mention news / headline.

@@ -34,6 +34,7 @@ import fakeredis
 from loss_postmortem.context_forensics import (
     HEADLINE_DENSITY_RED_FLAG,
     ContextForensicsAgent,
+    _VERY_HIGH_NEWS_CLUSTER,
 )
 from state.trade_context_store import TradeContextSnapshot, TradeContextStore
 
@@ -448,6 +449,87 @@ class ContextForensicsRedFlagAggregationTests(unittest.TestCase):
         self.assertIn(f"> {HEADLINE_DENSITY_RED_FLAG}", joined)
         self.assertIn("inflation", joined)
         self.assertIn("baseline abs-delta", joined)
+
+
+# ---------------------------------------------------------------------------
+# News-cluster verdict ladder (W1A tightening)
+# ---------------------------------------------------------------------------
+
+
+class ContextForensicsNewsClusterLadderTests(unittest.TestCase):
+    """Verify the >= 10 headline tier promotes A4 directly to primary_cause."""
+
+    def _run_with_n_headlines(self, n: int):
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+        # Place N headlines packed inside the 1h pre-trade window. Even
+        # for n=50 every entry must land in (TRADE_TIME-60min, TRADE_TIME].
+        # Use seconds spacing so we can fit a large cluster in the window.
+        headlines = []
+        if n > 0:
+            # Spread evenly between 1s and 59min before trade time. Even
+            # at n=50 the spacing is ~71s — comfortably inside the window.
+            window_seconds = 59 * 60  # 59 min, leave 1 min buffer at edge
+            for i in range(n):
+                offset_s = 1 + int((window_seconds - 1) * i / max(1, n - 1))
+                published = TRADE_TIME - timedelta(seconds=offset_s)
+                headlines.append(
+                    _headline(
+                        title=f"Cluster headline {i}",
+                        published_at=published,
+                    )
+                )
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory(headlines),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini("Cluster summary."),
+        )
+        return agent.investigate("trade-A4")
+
+    def test_one_headline_stays_innocent(self) -> None:
+        """0 headlines -> innocent. With n=1 the > 5 threshold is not hit."""
+        # n=0 case: explicit check the no-headlines path is innocent
+        # (preserved behaviour).
+        finding = self._run_with_n_headlines(0)
+        self.assertEqual(finding.verdict, "innocent")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("no headlines", joined)
+        self.assertNotIn("extreme news cluster", joined)
+
+    def test_one_headline_below_density_threshold(self) -> None:
+        """1 headline -> innocent (under HEADLINE_DENSITY_RED_FLAG=5)."""
+        finding = self._run_with_n_headlines(1)
+        # Single headline is below the > 5 density threshold AND below
+        # the >= 10 very-high cluster threshold — innocent.
+        self.assertEqual(finding.verdict, "innocent")
+        joined = " | ".join(finding.evidence)
+        self.assertNotIn("extreme news cluster", joined)
+
+    def test_seven_headlines_yields_contributing(self) -> None:
+        """7 headlines -> contributing (existing tier preserved)."""
+        finding = self._run_with_n_headlines(7)
+        self.assertEqual(finding.verdict, "contributing")
+        joined = " | ".join(finding.evidence)
+        # Density red flag fires but the very-high tier does not.
+        self.assertIn(f"> {HEADLINE_DENSITY_RED_FLAG}", joined)
+        self.assertNotIn("extreme news cluster", joined)
+
+    def test_ten_headlines_promotes_to_primary(self) -> None:
+        """n=10 (== _VERY_HIGH_NEWS_CLUSTER) -> primary_cause with extreme bullet."""
+        finding = self._run_with_n_headlines(_VERY_HIGH_NEWS_CLUSTER)
+        self.assertEqual(finding.verdict, "primary_cause")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("extreme news cluster", joined)
+        self.assertIn(f"{_VERY_HIGH_NEWS_CLUSTER} headlines in 1h window", joined)
+
+    def test_fifty_headlines_still_primary(self) -> None:
+        """n=50 -> primary_cause (no upper bound issue)."""
+        finding = self._run_with_n_headlines(50)
+        self.assertEqual(finding.verdict, "primary_cause")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("extreme news cluster", joined)
+        self.assertIn("50 headlines in 1h window", joined)
 
 
 # ---------------------------------------------------------------------------

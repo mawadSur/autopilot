@@ -89,6 +89,13 @@ HEADLINE_DENSITY_RED_FLAG = 5  # > 5 headlines in window => red flag
 MACRO_SHIFT_RED_FLAG_PP = 0.05  # > 5pp move on any macro market => red flag
 VOL_SPIKE_MULTIPLIER = 2.0  # > 2x baseline median abs delta => red flag
 
+# Very-high news cluster tier. W1A's integration test agent flagged that
+# A4 capped at "contributing" even when 7 in-window headlines fired —
+# at this level the news cluster is the headline finding. ``>=`` tier:
+# at or above 10 headlines in the 1h window we promote A4 directly to
+# ``primary_cause`` regardless of how many other red flags fired.
+_VERY_HIGH_NEWS_CLUSTER = 10
+
 # Verdict thresholds (number of red flags).
 PRIMARY_CAUSE_RED_FLAGS = 3
 CONTRIBUTING_RED_FLAGS = 1
@@ -288,6 +295,7 @@ class ContextForensicsAgent(BaseForensicsAgent):
         evidence: List[str] = []
         red_flags = 0
         suggested_actions: List[Dict[str, Any]] = []
+        extreme_news_cluster = False
 
         snap = self.context_store.get_signal_snapshot(trade_id)
         if snap is None:
@@ -333,6 +341,13 @@ class ContextForensicsAgent(BaseForensicsAgent):
                 )
                 suggested_actions.append(
                     {"type": "add_news_feature", "source": "google_news_rss"}
+                )
+            if n >= _VERY_HIGH_NEWS_CLUSTER:
+                # Extreme cluster — A4 promotes directly to primary_cause.
+                extreme_news_cluster = True
+                evidence.append(
+                    f"extreme news cluster ({n} headlines in 1h window) — "
+                    f">= {_VERY_HIGH_NEWS_CLUSTER}; primary contextual driver"
                 )
         else:
             evidence.append("news: no headlines in 1h window before trade")
@@ -401,7 +416,9 @@ class ContextForensicsAgent(BaseForensicsAgent):
             # the return contract below — so nothing more to do here.
 
         # ---- Verdict -------------------------------------------------
-        verdict, confidence, severity = self._classify(red_flags)
+        verdict, confidence, severity = self._classify(
+            red_flags, extreme_news_cluster=extreme_news_cluster
+        )
 
         return ForensicsFinding(
             agent="context",
@@ -620,10 +637,18 @@ class ContextForensicsAgent(BaseForensicsAgent):
         return "\n".join(lines)
 
     @staticmethod
-    def _classify(red_flags: int) -> tuple[str, float, int]:
-        """Map red-flag count to (verdict, confidence, severity)."""
+    def _classify(
+        red_flags: int, *, extreme_news_cluster: bool = False
+    ) -> tuple[str, float, int]:
+        """Map red-flag count + tier flags to (verdict, confidence, severity).
 
-        if red_flags >= PRIMARY_CAUSE_RED_FLAGS:
+        ``extreme_news_cluster`` is a hard promotion: a >= 10 headline 1h
+        cluster jumps directly to primary_cause regardless of how many
+        other red flags fired (W1A tightening — the cluster IS the
+        story).
+        """
+
+        if extreme_news_cluster or red_flags >= PRIMARY_CAUSE_RED_FLAGS:
             return ("primary_cause", 0.75, 4)
         if red_flags >= CONTRIBUTING_RED_FLAGS:
             return ("contributing", 0.5, 2)
@@ -636,4 +661,5 @@ __all__ = [
     "HEADLINE_DENSITY_RED_FLAG",
     "MACRO_CATEGORIES",
     "MACRO_SHIFT_RED_FLAG_PP",
+    "_VERY_HIGH_NEWS_CLUSTER",
 ]
