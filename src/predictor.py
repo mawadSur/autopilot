@@ -514,13 +514,74 @@ class XGBoostPredictor:
         self._last_seeded_minute: Dict[str, int] = {}
         self._lock = threading.Lock()
 
+        # Optional regime-memory lookup. ``REGIME_STORE_PATH`` points at an
+        # .npz produced by ``regime_memory.backfill``. When set + valid, we
+        # construct a RegimeLookup and consult it per-predict; on resolve
+        # confidence >= 0.5 we override ``thr_long`` for that prediction
+        # only (and cache the resolved kelly fraction on
+        # ``self._last_resolved_kelly_pct`` for the risk engine). When
+        # unset (or load fails) the static threshold path runs unchanged —
+        # the documented backward-compat contract in
+        # ``src/regime_memory/INTEGRATION.md``.
+        self.regime_lookup: Optional[Any] = None
+        self._last_resolved_kelly_pct: Optional[float] = None
+        self._maybe_init_regime_lookup()
+
         LOGGER.info(
-            "XGBoostPredictor ready: dir=%s features=%d thr_long=%.3f (src=%s)",
+            "XGBoostPredictor ready: dir=%s features=%d thr_long=%.3f (src=%s) "
+            "regime_lookup=%s",
             self.model_dir,
             len(self.feature_cols),
             self.thr_long,
             self._thr_source,
+            "on" if self.regime_lookup is not None else "off",
         )
+
+    def _maybe_init_regime_lookup(self) -> None:
+        """Best-effort load of a RegimeLookup from ``REGIME_STORE_PATH``.
+
+        Sets ``self.regime_lookup`` to a constructed
+        :class:`regime_memory.lookup.RegimeLookup` on success; leaves it as
+        ``None`` and logs a warning on any failure. Never raises out — a
+        broken regime store must not stop a predictor from constructing.
+        """
+
+        store_path = os.getenv("REGIME_STORE_PATH", "").strip()
+        if not store_path:
+            return
+        path_obj = Path(store_path).expanduser()
+        if not path_obj.exists():
+            LOGGER.warning(
+                "REGIME_STORE_PATH=%s does not exist; regime lookup disabled",
+                store_path,
+            )
+            return
+        try:
+            from regime_memory.encoder import RegimeEncoder
+            from regime_memory.lookup import RegimeLookup
+            from regime_memory.store import NaiveRegimeStore
+
+            store = NaiveRegimeStore.load(path_obj)
+            encoder = RegimeEncoder(feature_cols=self.feature_cols)
+            defaults = {
+                "optimal_threshold": float(self.thr_long),
+                "kelly_size_pct": 0.0,
+            }
+            self.regime_lookup = RegimeLookup(
+                store=store, encoder=encoder, defaults=defaults
+            )
+            LOGGER.info(
+                "regime_lookup initialised from %s (size=%d)",
+                store_path,
+                len(store),
+            )
+        except Exception as exc:  # noqa: BLE001 - never crash on regime store issues
+            LOGGER.warning(
+                "regime_lookup load failed from %s: %r; falling back to static",
+                store_path,
+                exc,
+            )
+            self.regime_lookup = None
 
     def __call__(
         self, symbol: str, ticker: Any
@@ -546,7 +607,7 @@ class XGBoostPredictor:
             LOGGER.warning("xgb predictor: candles refresh failed for %s: %s", symbol, exc)
             return _NEUTRAL_RICH_RESULT
         try:
-            proba, feature_buffer = self._predict_with_features(symbol)
+            proba, feature_buffer, feature_window = self._predict_with_features(symbol)
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("xgb predictor: inference failed for %s: %s", symbol, exc)
             return _NEUTRAL_RICH_RESULT
@@ -562,7 +623,11 @@ class XGBoostPredictor:
             "short": float(1.0 - proba),
         }
 
-        if proba >= self.thr_long:
+        # Resolve threshold via regime lookup if available — falls back to
+        # static ``self.thr_long`` when lookup is None, returns low
+        # confidence, or raises mid-prediction.
+        effective_thr_long = self._resolve_threshold(feature_window)
+        if proba >= effective_thr_long:
             side, conf = _validated_decision("buy", float(proba))
         else:
             side, conf = _NEUTRAL_RESULT
@@ -572,6 +637,68 @@ class XGBoostPredictor:
             feature_buffer=feature_buffer if feature_buffer else None,
             model_probs=model_probs,
         )
+
+    def _resolve_threshold(self, feature_window: Any) -> float:
+        """Return the threshold to use for *this* prediction.
+
+        Consults :attr:`regime_lookup` when set. On
+        ``_regime_confidence >= 0.5`` we use the resolved
+        ``optimal_threshold`` and cache the resolved ``kelly_size_pct``
+        on ``self._last_resolved_kelly_pct`` for the risk engine to read.
+        On low confidence, lookup failure, or no lookup configured, the
+        static ``self.thr_long`` is returned and the cached kelly is
+        cleared (so a stale value can't leak into the next tick).
+
+        ``feature_window`` should be a pandas DataFrame of trailing
+        feature rows (whatever the predictor used for inference). Passing
+        ``None`` or any non-DataFrame falls back to static.
+        """
+
+        lookup = self.regime_lookup
+        if lookup is None or feature_window is None:
+            self._last_resolved_kelly_pct = None
+            return self.thr_long
+        try:
+            resolved = lookup.resolve_params(feature_window, k=10)
+        except Exception as exc:  # noqa: BLE001 - graceful degradation
+            LOGGER.warning(
+                "xgb predictor: regime_lookup raised mid-predict: %r; "
+                "falling back to static threshold",
+                exc,
+            )
+            self._last_resolved_kelly_pct = None
+            return self.thr_long
+        try:
+            confidence = float(resolved.get("_regime_confidence", 0.0))
+        except (TypeError, ValueError):
+            self._last_resolved_kelly_pct = None
+            return self.thr_long
+        if confidence < 0.5:
+            # Low-match → soft prior at most. Static path stays in charge.
+            self._last_resolved_kelly_pct = None
+            return self.thr_long
+        try:
+            new_thr = float(resolved.get("optimal_threshold", self.thr_long))
+        except (TypeError, ValueError):
+            new_thr = self.thr_long
+        # Cache the resolved kelly fraction so the risk engine can pull it
+        # without re-running the lookup. None when the lookup didn't
+        # surface one (defensive).
+        try:
+            self._last_resolved_kelly_pct = float(
+                resolved.get("kelly_size_pct", 0.0)
+            )
+        except (TypeError, ValueError):
+            self._last_resolved_kelly_pct = None
+        LOGGER.info(
+            "regime_lookup: confidence=%.3f -> thr=%.4f kelly=%s",
+            confidence,
+            new_thr,
+            f"{self._last_resolved_kelly_pct:.4f}"
+            if self._last_resolved_kelly_pct is not None
+            else "n/a",
+        )
+        return new_thr
 
     @property
     def model_meta(self) -> Dict[str, Any]:
@@ -613,17 +740,22 @@ class XGBoostPredictor:
 
         Thin wrapper around ``_predict_with_features`` for back-compat.
         """
-        proba, _features = self._predict_with_features(symbol)
+        proba, _features, _window = self._predict_with_features(symbol)
         return proba
 
     def _predict_with_features(
         self, symbol: str
-    ) -> Tuple[Optional[float], Optional[Dict[str, float]]]:
-        """Return ``(proba, feature_buffer)`` -- both ``None`` on warmup.
+    ) -> Tuple[Optional[float], Optional[Dict[str, float]], Optional[Any]]:
+        """Return ``(proba, feature_buffer, feature_window)`` -- all ``None`` on warmup.
 
         ``feature_buffer`` is the latest-bar's raw feature dict (NaN
         captured as ``None`` so A1's NaN/inf check fires), keyed on
         ``self.feature_cols``.
+
+        ``feature_window`` is the trailing 60-bar DataFrame of feature
+        values (post-fill, ready for the regime encoder). Returned
+        alongside ``feature_buffer`` so ``predict_full`` can pass it to
+        the optional :class:`RegimeLookup` without recomputing features.
         """
         import numpy as np
         from utils import compute_features
@@ -635,7 +767,7 @@ class XGBoostPredictor:
                 symbol,
                 0 if buf is None else len(buf),
             )
-            return None, None
+            return None, None, None
         # compute_features drops the timestamp column; we only need the
         # final row's feature values for the XGBoost path.
         feats = compute_features(buf.copy())
@@ -646,8 +778,13 @@ class XGBoostPredictor:
                 symbol,
                 missing[:5],
             )
-            return None, None
+            return None, None, None
         latest = feats[self.feature_cols].iloc[-1:].astype("float32")
+
+        # Trailing 60-bar window for the regime encoder. We keep this
+        # separate from ``latest`` because the encoder operates on a
+        # window of features, not just the most recent row.
+        feature_window = feats[self.feature_cols].tail(60)
 
         # Snapshot the latest-bar feature values BEFORE NaN-fill so A1's
         # NaN/inf detector still sees them (we capture NaN/inf as ``None``
@@ -676,7 +813,7 @@ class XGBoostPredictor:
                 symbol,
                 proba,
             )
-            return None, None
+            return None, None, None
         # Operator-visible: surface the raw probability so threshold tuning
         # is data-driven, not guesswork. One line per minute (buffer only
         # refreshes on minute boundary).
@@ -688,7 +825,7 @@ class XGBoostPredictor:
             self.thr_long,
             verdict,
         )
-        return proba, feature_buffer
+        return proba, feature_buffer, feature_window
 
 
 class MultiSymbolXGBoostPredictor:
@@ -731,11 +868,57 @@ class MultiSymbolXGBoostPredictor:
                         f"is missing required attribute {attr!r}"
                     )
         self.model_map = model_map
+        # Optional per-symbol regime-store override. The global
+        # ``REGIME_STORE_PATH`` was applied during each per-symbol predictor's
+        # __init__; here we honour the per-symbol form
+        # ``REGIME_STORE_PATH_<SAFE_SYMBOL>=...`` (e.g. for ``ETH/USD`` →
+        # ``REGIME_STORE_PATH_ETH_USD``) so a multi-symbol bot can wire one
+        # store per symbol cleanly. When the per-symbol var is set we
+        # re-run regime-init on that predictor; when unset we leave its
+        # regime_lookup as set by the global env var (or None).
+        self._maybe_apply_per_symbol_regime_paths()
         LOGGER.info(
             "MultiSymbolXGBoostPredictor ready for %d symbol(s): %s",
             len(model_map),
             ", ".join(sorted(model_map.keys())),
         )
+
+    @staticmethod
+    def _symbol_env_token(symbol: str) -> str:
+        """Map ``"ETH/USD"`` → ``"ETH_USD"`` for env-var key construction."""
+
+        out = []
+        for ch in symbol:
+            if ch.isalnum():
+                out.append(ch.upper())
+            else:
+                out.append("_")
+        return "".join(out)
+
+    def _maybe_apply_per_symbol_regime_paths(self) -> None:
+        """Honour ``REGIME_STORE_PATH_<SAFE_SYMBOL>`` overrides per predictor."""
+
+        for symbol, predictor in self.model_map.items():
+            if not isinstance(predictor, XGBoostPredictor):
+                continue
+            token = self._symbol_env_token(symbol)
+            per_sym_var = f"REGIME_STORE_PATH_{token}"
+            override = os.getenv(per_sym_var, "").strip()
+            if not override:
+                continue
+            # Temporarily flip the env var so the predictor's helper picks
+            # it up, then restore. We avoid duplicating the load logic so
+            # the failure paths stay identical between the global and
+            # per-symbol forms.
+            saved = os.environ.get("REGIME_STORE_PATH")
+            os.environ["REGIME_STORE_PATH"] = override
+            try:
+                predictor._maybe_init_regime_lookup()
+            finally:
+                if saved is None:
+                    os.environ.pop("REGIME_STORE_PATH", None)
+                else:
+                    os.environ["REGIME_STORE_PATH"] = saved
 
     def __call__(
         self, symbol: str, ticker: Any

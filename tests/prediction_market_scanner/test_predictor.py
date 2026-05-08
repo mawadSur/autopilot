@@ -716,6 +716,10 @@ class XGBoostBackwardCompatibilityTests(unittest.TestCase):
         p._buffers = {}
         p._last_seeded_minute = {}
         p._lock = __import__("threading").Lock()
+        # __init__ skipped via __new__; explicitly null the regime fields so
+        # _resolve_threshold's `lookup is None` short-circuit is exercised.
+        p.regime_lookup = None
+        p._last_resolved_kelly_pct = None
 
         class _BadModel:
             def predict_proba(self, X):
@@ -746,6 +750,234 @@ class XGBoostBackwardCompatibilityTests(unittest.TestCase):
         self.assertEqual((result.side, result.confidence), ("buy", 0.5))
         self.assertIsNone(result.feature_buffer)
         self.assertIsNone(result.model_probs)
+
+
+class _StubRegimeLookup:
+    """Minimal stub matching :class:`regime_memory.lookup.RegimeLookup`.
+
+    Tests inject this in place of the real RegimeLookup so we never have
+    to encode features or load a FAISS store. ``resolved_payload`` is the
+    dict returned verbatim from :meth:`resolve_params`; ``raise_on_resolve``
+    raises a synthetic exception to exercise the graceful-degradation
+    branch in :meth:`XGBoostPredictor._resolve_threshold`.
+    """
+
+    def __init__(
+        self,
+        *,
+        resolved_payload: Dict[str, float] | None = None,
+        raise_on_resolve: bool = False,
+    ) -> None:
+        self.resolved_payload = resolved_payload or {}
+        self.raise_on_resolve = raise_on_resolve
+        self.calls: List[Dict[str, Any]] = []
+
+    def resolve_params(
+        self, features: Any, *, k: int = 10, window_size: int = 60
+    ) -> Dict[str, float]:
+        self.calls.append({"k": k, "window_size": window_size})
+        if self.raise_on_resolve:
+            raise RuntimeError("simulated regime store failure")
+        return dict(self.resolved_payload)
+
+
+class XGBoostRegimeLookupResolveTests(unittest.TestCase):
+    """``XGBoostPredictor._resolve_threshold`` integration with RegimeLookup.
+
+    These tests bypass __init__ via __new__ so we don't have to load a
+    real model bundle. ``regime_lookup`` is injected directly so we can
+    verify the confidence gate (>= 0.5), the static fallback, and the
+    graceful-degradation branch in isolation.
+    """
+
+    def _bare_predictor(
+        self,
+        *,
+        thr_long: float = 0.55,
+        regime_lookup: Any = None,
+    ):
+        from predictor import XGBoostPredictor
+
+        p = XGBoostPredictor.__new__(XGBoostPredictor)
+        p.thr_long = thr_long
+        p.regime_lookup = regime_lookup
+        p._last_resolved_kelly_pct = None
+        return p
+
+    def test_no_lookup_returns_static_threshold(self) -> None:
+        """Lookup is None → static thr_long is used (regression baseline)."""
+        p = self._bare_predictor(thr_long=0.55, regime_lookup=None)
+        thr = p._resolve_threshold(feature_window=object())
+        self.assertAlmostEqual(thr, 0.55)
+        self.assertIsNone(p._last_resolved_kelly_pct)
+
+    def test_high_confidence_overrides_threshold(self) -> None:
+        """confidence=0.7 → resolved optimal_threshold replaces thr_long."""
+        lookup = _StubRegimeLookup(
+            resolved_payload={
+                "_regime_confidence": 0.7,
+                "optimal_threshold": 0.62,
+                "kelly_size_pct": 0.18,
+            }
+        )
+        p = self._bare_predictor(thr_long=0.55, regime_lookup=lookup)
+        thr = p._resolve_threshold(feature_window=object())
+        self.assertAlmostEqual(thr, 0.62)
+        self.assertAlmostEqual(p._last_resolved_kelly_pct, 0.18)
+        # Lookup was consulted exactly once with the documented k.
+        self.assertEqual(len(lookup.calls), 1)
+        self.assertEqual(lookup.calls[0]["k"], 10)
+
+    def test_low_confidence_falls_back_to_static(self) -> None:
+        """confidence=0.3 → static thr_long; cached kelly is cleared."""
+        lookup = _StubRegimeLookup(
+            resolved_payload={
+                "_regime_confidence": 0.3,
+                "optimal_threshold": 0.62,
+                "kelly_size_pct": 0.18,
+            }
+        )
+        p = self._bare_predictor(thr_long=0.55, regime_lookup=lookup)
+        # Pre-seed a stale kelly to verify we clear it when confidence
+        # falls below the gate.
+        p._last_resolved_kelly_pct = 0.99
+        thr = p._resolve_threshold(feature_window=object())
+        self.assertAlmostEqual(thr, 0.55)
+        self.assertIsNone(p._last_resolved_kelly_pct)
+
+    def test_lookup_raise_falls_back_to_static(self) -> None:
+        """Mid-prediction RegimeLookup exception → static threshold used."""
+        lookup = _StubRegimeLookup(raise_on_resolve=True)
+        p = self._bare_predictor(thr_long=0.55, regime_lookup=lookup)
+        thr = p._resolve_threshold(feature_window=object())
+        self.assertAlmostEqual(thr, 0.55)
+        self.assertIsNone(p._last_resolved_kelly_pct)
+
+    def test_confidence_exactly_at_threshold_uses_resolved(self) -> None:
+        """confidence=0.5 (boundary) → still uses resolved threshold."""
+        lookup = _StubRegimeLookup(
+            resolved_payload={
+                "_regime_confidence": 0.5,
+                "optimal_threshold": 0.61,
+                "kelly_size_pct": 0.05,
+            }
+        )
+        p = self._bare_predictor(thr_long=0.55, regime_lookup=lookup)
+        thr = p._resolve_threshold(feature_window=object())
+        self.assertAlmostEqual(thr, 0.61)
+
+
+class XGBoostRegimeLookupInitTests(unittest.TestCase):
+    """``_maybe_init_regime_lookup`` env-var gating + load-failure tolerance."""
+
+    def test_unset_env_var_leaves_lookup_none(self) -> None:
+        """REGIME_STORE_PATH unset → no lookup is constructed."""
+        from predictor import XGBoostPredictor
+
+        p = XGBoostPredictor.__new__(XGBoostPredictor)
+        p.feature_cols = ["return_5", "rv_60"]
+        p.thr_long = 0.55
+        p.regime_lookup = None
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("REGIME_STORE_PATH", None)
+            p._maybe_init_regime_lookup()
+        self.assertIsNone(p.regime_lookup)
+
+    def test_missing_path_logs_and_skips(self) -> None:
+        """Env points at a non-existent file → lookup stays None, no crash."""
+        from predictor import XGBoostPredictor
+
+        p = XGBoostPredictor.__new__(XGBoostPredictor)
+        p.feature_cols = ["return_5", "rv_60"]
+        p.thr_long = 0.55
+        p.regime_lookup = None
+        with mock.patch.dict(
+            os.environ,
+            {"REGIME_STORE_PATH": "/nonexistent/path/to/store.npz"},
+        ):
+            p._maybe_init_regime_lookup()
+        self.assertIsNone(p.regime_lookup)
+
+    def test_load_failure_falls_back_to_none(self) -> None:
+        """An import or load exception is swallowed; lookup stays None."""
+        from predictor import XGBoostPredictor
+
+        p = XGBoostPredictor.__new__(XGBoostPredictor)
+        p.feature_cols = ["return_5", "rv_60"]
+        p.thr_long = 0.55
+        p.regime_lookup = None
+        # Create a path-exists-but-malformed file so the loader raises.
+        with tempfile.TemporaryDirectory() as td:
+            stub = Path(td) / "broken.npz"
+            stub.write_bytes(b"not a real npz")
+            with mock.patch.dict(
+                os.environ,
+                {"REGIME_STORE_PATH": str(stub)},
+            ):
+                p._maybe_init_regime_lookup()
+        self.assertIsNone(p.regime_lookup)
+
+
+class MultiSymbolPerSymbolRegimePathTests(unittest.TestCase):
+    """``MultiSymbolXGBoostPredictor`` honours per-symbol REGIME_STORE_PATH_*."""
+
+    def test_per_symbol_env_var_triggers_lookup_init(self) -> None:
+        """REGIME_STORE_PATH_ETH_USD set → matching predictor's helper runs."""
+        from predictor import MultiSymbolXGBoostPredictor, XGBoostPredictor
+
+        # Build two bare predictors so we can verify the helper is called
+        # only on the symbol that has a per-symbol env var.
+        eth = XGBoostPredictor.__new__(XGBoostPredictor)
+        eth.feature_cols = ["f1"]
+        eth.thr_long = 0.5
+        eth.model = object()
+        eth.regime_lookup = None
+        eth._init_calls = 0  # type: ignore[attr-defined]
+
+        def _eth_helper() -> None:
+            eth._init_calls += 1  # type: ignore[attr-defined]
+
+        eth._maybe_init_regime_lookup = _eth_helper  # type: ignore[method-assign]
+
+        btc = XGBoostPredictor.__new__(XGBoostPredictor)
+        btc.feature_cols = ["f1"]
+        btc.thr_long = 0.5
+        btc.model = object()
+        btc.regime_lookup = None
+        btc._init_calls = 0  # type: ignore[attr-defined]
+
+        def _btc_helper() -> None:
+            btc._init_calls += 1  # type: ignore[attr-defined]
+
+        btc._maybe_init_regime_lookup = _btc_helper  # type: ignore[method-assign]
+
+        with mock.patch.dict(
+            os.environ,
+            {"REGIME_STORE_PATH_ETH_USD": "/tmp/eth.npz"},
+            clear=False,
+        ):
+            os.environ.pop("REGIME_STORE_PATH_BTC_USD", None)
+            MultiSymbolXGBoostPredictor(
+                model_map={"ETH/USD": eth, "BTC/USD": btc}
+            )
+        # ETH had a per-symbol var → helper was re-invoked. BTC had none →
+        # helper was NOT invoked again (its global-init from __init__ stays).
+        self.assertEqual(eth._init_calls, 1)
+        self.assertEqual(btc._init_calls, 0)
+
+    def test_symbol_env_token_normalises_separators(self) -> None:
+        """``ETH/USD`` and ``ETH-USD`` normalise to ``ETH_USD`` consistently."""
+        from predictor import MultiSymbolXGBoostPredictor
+
+        self.assertEqual(
+            MultiSymbolXGBoostPredictor._symbol_env_token("ETH/USD"), "ETH_USD"
+        )
+        self.assertEqual(
+            MultiSymbolXGBoostPredictor._symbol_env_token("eth-usd"), "ETH_USD"
+        )
+        self.assertEqual(
+            MultiSymbolXGBoostPredictor._symbol_env_token("BTC.USDT"), "BTC_USDT"
+        )
 
 
 if __name__ == "__main__":
