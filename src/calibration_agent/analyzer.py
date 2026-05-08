@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Tuple
 
 from google import genai
 from google.genai import types
@@ -12,6 +14,8 @@ from config import cfg
 from models import Market
 from news_research_agent.models import NewsResearchReport
 from utils import extract_json_object
+
+LOGGER = logging.getLogger(__name__)
 
 
 DEFAULT_MODEL_NAME = "gemini-2.5-pro"
@@ -30,6 +34,98 @@ SYSTEM_PROMPT = (
     '- If the evidence quality is weak, keep the final probability close to the model baseline (llm_adjustment = 0).\n'
     '- Never confuse narrative intensity with informational value. Be a cold, analytical skeptic.'
 )
+
+
+# Cap on the effective sample size we'll claim from confidence. Without this,
+# a confidence value of 1.0 yields posterior_var ~ 0 and the adjuster's signal
+# saturates immediately. 50 keeps the math well-behaved while still letting a
+# unanimous, high-confidence pair drive posterior_confidence > 0.95.
+_MAX_PSEUDO_OBSERVATIONS: float = 50.0
+
+
+def _clamp_unit(value: float, *, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, float(value)))
+
+
+def _coerce_confidence_pseudo_count(confidence: float, weight: float = 1.0) -> float:
+    """Map a [0, 1] confidence into a pseudo-observation count for Beta math.
+
+    confidence=0 -> 0 pseudo-observations (the prior wins).
+    confidence=1 -> ``_MAX_PSEUDO_OBSERVATIONS`` pseudo-observations (very tight).
+    Optional ``weight`` scales the contribution -- used by the outcome-weight
+    adjuster to dial down the LLM's influence after a string of bad reviews.
+    """
+    c = _clamp_unit(confidence)
+    w = max(0.0, float(weight))
+    return c * w * _MAX_PSEUDO_OBSERVATIONS
+
+
+def bayesian_fusion(
+    xgb_prob: float,
+    xgb_confidence: float,
+    llm_prob: float,
+    llm_confidence: float,
+    *,
+    llm_weight: float = 1.0,
+) -> Tuple[float, float]:
+    """Fuse XGBoost and LLM probability estimates via a Beta-posterior.
+
+    Treats each estimator as if it observed ``confidence * MAX`` pseudo-trials
+    that landed YES at rate ``prob``. The posterior is the conjugate
+    combination of the two Beta likelihoods (with the implicit Beta(1,1)
+    prior absorbed into the +1 terms).
+
+    Args:
+        xgb_prob: XGBoost's probability estimate, in [0, 1].
+        xgb_confidence: XGBoost confidence proxy in [0, 1] (see notes below).
+        llm_prob: LLM's probability estimate, in [0, 1].
+        llm_confidence: LLM confidence in [0, 1] (rescale [0, 100] -> [0, 1]
+            at the call site).
+        llm_weight: Optional [0, +inf) multiplier on the LLM pseudo-count.
+            The OutcomeWeightAdjuster uses this to dial back LLM influence
+            after Dumb Luck or Poetic Justice classifications.
+
+    Returns:
+        ``(posterior_prob, posterior_confidence)`` where ``posterior_prob``
+        is the fused probability and ``posterior_confidence`` is in [0, 1]
+        (1 = posterior is very tight, 0 = nearly uniform).
+
+    Notes on c_xgb (proxy choice):
+        The XGBoost predictor doesn't expose a per-bar entropy directly.
+        We use a coarse proxy: shrink raw confidence by half the distance to
+        0.5 (so a 50/50 prediction = 0 confidence, a 99/1 prediction = ~1).
+        Callers that have a better calibration-slope-based confidence can
+        pass it directly in ``xgb_confidence``.
+    """
+    p_xgb = _clamp_unit(xgb_prob)
+    p_llm = _clamp_unit(llm_prob)
+    # Clamp slightly inside (0, 1) to avoid degenerate alphas/betas at the
+    # endpoints. Anything closer than 1e-6 rounds to the bounds anyway.
+    p_xgb = _clamp_unit(p_xgb, lo=1e-9, hi=1.0 - 1e-9)
+    p_llm = _clamp_unit(p_llm, lo=1e-9, hi=1.0 - 1e-9)
+
+    c_xgb = _coerce_confidence_pseudo_count(xgb_confidence)
+    c_llm = _coerce_confidence_pseudo_count(llm_confidence, weight=llm_weight)
+
+    alpha_xgb = c_xgb * p_xgb + 1.0
+    beta_xgb = c_xgb * (1.0 - p_xgb) + 1.0
+    alpha_llm = c_llm * p_llm + 1.0
+    beta_llm = c_llm * (1.0 - p_llm) + 1.0
+
+    alpha = alpha_xgb + alpha_llm - 1.0
+    beta = beta_xgb + beta_llm - 1.0
+
+    if alpha + beta <= 0.0:
+        # Both estimators degenerate; fall back to the midpoint of priors.
+        return 0.5, 0.0
+
+    posterior_prob = alpha / (alpha + beta)
+    denom_var = (alpha + beta) ** 2 * (alpha + beta + 1.0)
+    posterior_var = (alpha * beta) / denom_var if denom_var > 0.0 else 0.0
+    if math.isnan(posterior_prob) or math.isnan(posterior_var):
+        return 0.5, 0.0
+    posterior_confidence = 1.0 / (1.0 + posterior_var)
+    return _clamp_unit(posterior_prob), _clamp_unit(posterior_confidence)
 
 
 def _resolve_api_key(explicit_api_key: Optional[str]) -> Optional[str]:
@@ -242,6 +338,9 @@ class CalibrationAgent:
         xgboost_prob: float,
         *,
         reddit_report: Any | None = None,
+        xgboost_confidence: float | None = None,
+        use_bayesian_fusion: bool = False,
+        llm_weight: float = 1.0,
     ) -> CalibrationReport:
         if not isinstance(market, Market):
             raise TypeError("market must be a Market instance")
@@ -249,7 +348,83 @@ class CalibrationAgent:
         baseline_probability = _coerce_probability(xgboost_prob, field_name="xgboost_prob")
         normalized_news_report = _coerce_news_report(news_report, market)
         prompt = _build_calibrate_prompt(market, normalized_news_report, baseline_probability, reddit_report=reddit_report)
-        return self._generate(prompt)
+        report = self._generate(prompt)
+
+        if use_bayesian_fusion:
+            report = self._apply_bayesian_fusion(
+                report,
+                xgboost_prob=baseline_probability,
+                xgboost_confidence=xgboost_confidence,
+                market_implied_prob=float(market.implied_prob),
+                llm_weight=llm_weight,
+            )
+        return report
+
+    def _apply_bayesian_fusion(
+        self,
+        report: CalibrationReport,
+        *,
+        xgboost_prob: float,
+        xgboost_confidence: float | None,
+        market_implied_prob: float,
+        llm_weight: float = 1.0,
+    ) -> CalibrationReport:
+        """Replace the additive shift the LLM emitted with Bayesian fusion.
+
+        The LLM's emitted ``calibrated_true_prob`` is treated as the LLM's
+        own probability estimate; its ``confidence_score`` (0-100) is
+        rescaled to [0, 1] and used as the LLM pseudo-count. We then fuse
+        with the XGBoost baseline using ``bayesian_fusion`` and rebuild
+        the report.
+        """
+        # Default XGB confidence proxy: shrink raw distance from 0.5.
+        # An 80/20 prediction -> 0.6 confidence; a 99/1 prediction -> ~1.
+        if xgboost_confidence is None:
+            xgboost_confidence = min(1.0, 2.0 * abs(float(xgboost_prob) - 0.5))
+        llm_confidence_unit = _clamp_unit(float(report.confidence_score) / 100.0)
+
+        posterior_prob, posterior_confidence = bayesian_fusion(
+            xgboost_prob,
+            xgboost_confidence,
+            float(report.calibrated_true_prob),
+            llm_confidence_unit,
+            llm_weight=llm_weight,
+        )
+
+        adjustment_pct_points = (posterior_prob - xgboost_prob) * 100.0
+        new_confidence_score = int(round(_clamp_unit(posterior_confidence) * 100.0))
+        edge_vs_market = posterior_prob - market_implied_prob
+
+        # Audit log: keep a structured trail of the inputs and the output so
+        # downstream debugging and the OutcomeWeightAdjuster can replay
+        # decisions later.
+        LOGGER.info(
+            "bayesian_fusion: xgb=(%.4f, c=%.3f) llm=(%.4f, c=%.3f) llm_weight=%.3f -> "
+            "posterior=(%.4f, c=%.3f)",
+            xgboost_prob,
+            xgboost_confidence,
+            float(report.calibrated_true_prob),
+            llm_confidence_unit,
+            llm_weight,
+            posterior_prob,
+            posterior_confidence,
+        )
+
+        fused = CalibrationReport(
+            xgboost_prob=xgboost_prob,
+            llm_adjustment_pct_points=adjustment_pct_points,
+            calibrated_true_prob=posterior_prob,
+            confidence_score=new_confidence_score,
+            key_drivers=list(report.key_drivers),
+            key_uncertainties=list(report.key_uncertainties),
+            edge_vs_market=_clamp_unit(edge_vs_market, lo=-1.0, hi=1.0),
+            action=report.action,
+            reasoning=(
+                f"{report.reasoning} [bayesian_fusion: posterior={posterior_prob:.4f}, "
+                f"posterior_confidence={posterior_confidence:.3f}, llm_weight={llm_weight:.2f}]"
+            ),
+        )
+        return fused
 
     def calibrate_probability(
         self,
