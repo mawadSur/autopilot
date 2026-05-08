@@ -269,10 +269,17 @@ def _build_risk_assessment(
     *,
     risk_metrics: RiskMetrics,
     calibration: CalibrationReport,
+    risk_calculator: RiskCalculator | None = None,
 ) -> RiskAssessment:
+    # Extreme-price gating now lives in ``RiskCalculator.passes_market_filters``
+    # (P1 #10) using the tighter [0.02, 0.98] band. We still raise the kill
+    # switch flag here so downstream consumers and the existing
+    # ``risk_logic_summary`` keep working, but the band itself is owned by
+    # the risk engine — not duplicated in two places.
+    filter_check = risk_calculator if risk_calculator is not None else RiskCalculator()
+    extreme_price = not filter_check.passes_market_filters(risk_metrics.market_price)
     kill_switch_triggered = (
-        risk_metrics.market_price <= 0.01
-        or risk_metrics.market_price >= 0.99
+        extreme_price
         or (risk_metrics.adjusted_position_size_pct <= 0.0 and risk_metrics.expected_value_estimate <= 0.0)
     )
 
@@ -329,9 +336,14 @@ def _run_risk_management_agent(
     market: Market,
     calibration: CalibrationReport,
     risk_metrics: RiskMetrics,
+    risk_calculator: RiskCalculator | None = None,
 ) -> RiskAssessment:
     if risk_management_agent is None:
-        return _build_risk_assessment(risk_metrics=risk_metrics, calibration=calibration)
+        return _build_risk_assessment(
+            risk_metrics=risk_metrics,
+            calibration=calibration,
+            risk_calculator=risk_calculator,
+        )
     method = _resolve_method(risk_management_agent, ("assess", "evaluate", "analyze_risk"))
     return _call_with_supported_kwargs(
         method,
@@ -407,6 +419,7 @@ def run_final_risk_gate(
         market=market,
         calibration=calibration,
         risk_metrics=risk_metrics,
+        risk_calculator=risk_calculator,
     )
 
     # Always-long-YES convention: pay the ask if scanner_row exposes one,

@@ -1,17 +1,16 @@
 """Characterization tests for the orchestrator kill-switch boundaries.
 
-The orchestrator hard-codes a kill switch in ``_build_risk_assessment``
-(see ``src/orchestrator.py`` lines 269-271):
+The kill-switch band was tightened from ``[0.01, 0.99]`` to ``[0.02, 0.98]``
+in P1 #10. The actual band check now lives in
+``RiskCalculator.passes_market_filters`` and the orchestrator delegates to
+it. The boundary endpoints we lock in here are:
 
-    kill_switch_triggered = (
-        risk_metrics.market_price <= 0.01
-        or risk_metrics.market_price >= 0.99
-        or ...
-    )
+    p <= 0.02 -> kill switch (rejects 0.01 and 0.005)
+    p >= 0.98 -> kill switch (rejects 0.99 and 0.995)
 
-Both inequalities are inclusive. We exercise the four boundary points
-0.005, 0.01, 0.99, 0.995 to lock in the *current* behaviour. None of
-these tests fix bugs; they document what the production code does today.
+(0.02 and 0.98 themselves PASS the filter — the band is inclusive on the
+*safe* side.) See P1 #10: Kelly explodes at p > 0.95, so the safety
+margin needed to be wider.
 
 Note on RiskMetrics.market_price field bounds: pydantic enforces
 ``gt=0.0, lt=1.0``. 0.005 and 0.995 are both valid (strictly between
