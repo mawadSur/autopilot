@@ -29,15 +29,20 @@ The repo is currently being extended for **automated crypto trading on Coinbase 
 | 4 | Alerts pipeline (`src/alerts/notifier.py`) | ✅ done | Discord (info/fills/daily summary) + Telegram (alert/critical with MarkdownV2 escape). Best-effort — never raises to caller. 14 tests. |
 | 5 | Live supervisor + 14-day shakedown gate (`src/live_supervisor.py`) | ✅ done | Tick loop wires Phase 1-4. Shakedown resets on uncaught error / kill-switch trip / daily-loss breaker trip. Paper mode synthesizes fills at mid ± 5 bps slippage. 16 tests. |
 | 6 | Hyperliquid perps adapter (`src/exchanges/hyperliquid.py`) | ✅ done | Read-only V1 (info / clearinghouseState / userFills). Write methods raise `NotImplementedError` — EIP-712 signing via `eth-account` is intentionally deferred (avoids heavy crypto deps). 14 tests. |
-| 7 | Monitoring (Sentry + Prometheus) | 🟡 mostly done | `src/observability/monitoring.py` + supervisor hooks landed (gauges, counters, histogram, sentry capture). Standalone `test_observability.py` is missing (agent timed out); supervisor tests still cover the integration path. Follow-up: add the dedicated unit tests + Grafana dashboard JSON. |
+| 7 | Monitoring (Sentry + Prometheus) | ✅ done | `src/observability/monitoring.py` + supervisor hooks landed (gauges, counters, histograms, Sentry capture + breadcrumbs). Phase-16 ops work added: tick duration, model confidence, order latency, daily PnL by symbol, shakedown clean-days, kill-switch state, reconciliation orphans/ghosts/drift, auto-pause/auto-trip counters. 10 dedicated tests in `test_observability_metrics.py`. Follow-up: Grafana dashboard JSON. |
 | 8 | Real model wired into supervisor (`src/predictor.py`) | ✅ done | `LegacyTransformerPredictor` loads `model_sanity/`, fetches Coinbase 1m candles via REST, computes 36 features, runs the transformer, returns `(side, confidence)`. Env-controlled by `LEGACY_MODEL_DIR`. Falls back to neutral placeholder on any load failure so the supervisor never crashes on model issues. 11 tests including end-to-end against the real bundle. |
 | 9 | Operator tools — paper-session monitor (`src/paper_session_monitor.py`) | ✅ done | Read-only CLI that parses supervisor tick log lines and prints rolling per-symbol stats (action distribution, confidence percentiles, time-since-last-signal). Run alongside a paper session: `tee paper.log` then `paper_session_monitor.py paper.log --follow`. 16 tests. |
 | 10 | Multi-symbol orchestration — per-symbol shakedown | ✅ done | `ShakedownState` now carries a `per_symbol: Dict[str, SymbolShakedownState]` map. Each symbol has its own `paper_days_clean` counter and `live_unlocked_at_utc`. Per-symbol errors only reset that symbol's streak; account-level events (kill switch trip, daily-loss breaker trip) reset every symbol. `is_live_unlocked(symbol)` for per-symbol gating; `is_live_unlocked()` (no args) returns the most-restrictive aggregate. Legacy single-counter shakedown JSON files migrate to per-symbol on load and are rewritten to disk in the new layout. 8 new tests; 24 supervisor tests total. |
 | 11 | Crypto training pipeline (`src/crypto_training/`) | ✅ done | USD-native model training stack. `backfill_ohlcv.py` paginates Coinbase `/products/{id}/candles` (350-bar/req limit) into one CSV per UTC day, idempotent + resumable. `build_dataset.py` loads + concats day CSVs, computes 36 features via `utils.compute_features`, applies forward-return labels (binary above/below threshold OR three-class). `train_xgboost.py` does time-based train/val/test split, fits XGBClassifier, isotonic-calibrates with `FrozenEstimator + CalibratedClassifierCV`, persists `model.joblib + meta.json`. 31 new tests (13 backfill + 9 dataset + 9 trainer). |
 | 11.4 | XGBoost predictor adapter (`src/predictor.py`) | ✅ done | `XGBoostPredictor` loads `model_crypto/<v>/{model.joblib,meta.json}`, maintains per-symbol Coinbase 1m candle buffer, computes features via `utils.compute_features`, runs `predict_proba`, returns `("buy", proba)` when `proba >= thr_long` else neutral. Tunable `thr_long` (high values = high precision, fewer trades). 6 new tests including end-to-end with a tiny trained model. |
 | 11.5 | Multi-symbol predictor + raw-proba logging | ✅ done | `MultiSymbolXGBoostPredictor` maps each symbol to its own model + threshold, since per-symbol prob distributions differ wildly (live probe: ETH peaks at 0.67, BTC at 0.34, SOL at 0.28 even on the same minute — one global threshold is useless). Configured via `CRYPTO_MODEL_MAP="ETH/USD=path:0.50,BTC/USD=path:0.30,..."`. Supervisor's `--log-dir DIR` auto-saves each run to `<DIR>/<UTC-ts>_<symbols>/{supervisor.log,ticks.json,summary.json}`. Both predictors now log raw class probabilities at INFO level so threshold tuning is data-driven. 7 new tests (model-map parser + multi-symbol routing + dir saving). |
+| 12 | Phase 0 safety hardening | ✅ done | Eight items shipped after a CEO + eng review pass. Per-symbol equity peak in `ShakedownState` (one symbol's drawdown no longer halts siblings). `fcntl.flock` + atomic temp+rename on `.shakedown.json` writes AND boot reads. Per-symbol error counter moved to Redis (HASH `errors:by_symbol:{date}`, 48h TTL — process-safe under multiprocessing). Defer-to-next-tick paper-fill state machine (paper Sharpe is no longer fictitious). NaN/inf guard on model confidence (predictor + supervisor). `--symbols` deduping with exit 2 on empty. UTC midnight auto-trigger for `daily_close` in `run_loop`. Per-symbol model isolation + `scaler.feature_names_in_` order assertion at boot. ~38 new tests. |
+| 13 | Phase 1 profitability + math | ✅ done | Polymarket fee deduction in Kelly (`POLYMARKET_FEE_BPS=200` in `config.py` — stops systematic 2-3% over-sizing). Extreme-price filter `[0.02, 0.98]` in `passes_market_filters()` (Kelly explosion at p≥0.98 prevented pre-emptively). Walk-forward CV (anchored rolling windows replace single 70/15/15 split). Sharpe-weighted threshold sweep on validation set, persisted as `optimal_threshold` in `meta.json`. Backtest PnL in trainer (reuses `profitability.py`, returns Sharpe + max-DD + win_rate alongside AUC/Brier). Bayesian fusion (Beta-posterior) replacing additive XGB+LLM blend. `scale_pos_weight` class weighting. `OutcomeWeightAdjuster` per-trade synchronous + EMA decay + `[0.5, 2.0]` bounds + audit JSONL. DRY: `extract_json_object` consolidated into `src/utils.py`. ~40 new tests. |
+| 14 | Lane E foundation: trade-context snapshots | ✅ done | `src/state/trade_context_store.py` — Redis-backed snapshot store keyed by trade_id × phase (`signal`, `fill`, `breaker`, `close`), 30-day TTL, NaN→None sanitisation. Trigger gate inside `position_store.record_close()` enqueues a postmortem job iff `realized_pnl < 0 AND (|loss| ≥ 0.5% bankroll OR forced_flat)`. `ForensicsFinding` dataclass + `BaseForensicsAgent` protocol with `_with_timeout` (60s) + `_safe_run` (catches all exceptions → verdict="unknown"). Supervisor wires snapshot capture at signal/fill/breaker phases. ~46 new tests. |
+| 15 | Lane E swarm: 5 specialists + synthesizer | ✅ done | Five forensics agents under `src/loss_postmortem/`, one per root-cause hypothesis: `signal_forensics.py` (Mahalanobis OOD, threshold margin, calibration at this prob bin), `execution_forensics.py` (signal→fill latency, slippage actual vs expected, partial fills, stale ticker, rejection trail, stop-loss drift), `sizing_forensics.py` (recompute drift, fee-deduction audit, correlation cluster, liquidity penalty, % bankroll), `context_forensics.py` (1h news window via `news_research_agent`, Polymarket macro shifts, vol spikes, optional Gemini summarization), `process_integrity.py` (breaker log coherence, kill-switch state, race-condition trail, paper-vs-live divergence). `synthesizer.py` orchestrates all 5 in parallel via `multiprocessing.Pool` with spawn context, classifies root cause, writes `runs/postmortems/{trade_id}.{json,md}`, drives 4 feedback channels (OutcomeAdjuster delta + retrain queue + risk recommender + daily digest via `alerts/notifier`). ~70 new tests. |
+| 16 | Operational hardening for unattended runtime | ✅ done | Position reconciliation script + CLI (`src/ops/reconciliation.py` + `reconciliation_cli.py`) — detects orphans (in store, not on exchange), ghosts (on exchange, not in store), and size drift; emits Prometheus metrics + Sentry breadcrumbs. `AutoPauseGate` (`src/risk/auto_pause.py`) — combined daily-loss + low-confidence (mean < baseline-2σ) trip writes `~/.autopilot_auto_paused` marker. Confidence baseline rolling window in Redis (`src/state/confidence_history.py`). Auto-trip kill switch on N consecutive errors per symbol (latched per-process to prevent alert storms). `position_store.orphan_count()` surface. Full Prometheus metric coverage (tick duration, model confidence, order latency, daily PnL by symbol, shakedown clean-days). GitHub Actions workflow at `.github/workflows/tests.yml` runs the prediction-market test suite on every PR + push. ~42 new tests. |
 
-**Test suite:** 486 tests, all green, ~1.5s runtime. Eleven phases wired + operator tools + multi-symbol predictor. ETH/USD, BTC/USD, SOL/USD models all trained on 90 days of Coinbase OHLCV data with isotonic calibration (test AUC 0.70 / 0.67 / 0.63 respectively).
+**Test suite:** 772 tests, all green, ~3s runtime. Sixteen phases wired across two CEO/eng review rounds. ETH/USD, BTC/USD, SOL/USD models all trained on 90 days of Coinbase OHLCV data with isotonic calibration (test AUC 0.70 / 0.67 / 0.63 respectively). The supervisor is multi-symbol-safe (per-symbol risk isolation, multiprocessing-ready), the trainer evaluates real PnL not just AUC, the calibration agent fuses XGB + LLM via a Bayesian posterior, and every losing trade ≥0.5% of bankroll triggers a 5-agent forensics swarm.
 
 **Mandatory gates:**
 - No live mode until ≥14 days of clean paper-trade PnL on the supervised loop.
@@ -380,6 +385,147 @@ overrides for non-default layouts. With the env var set, `build_dataset.py`
 reads from SQLite by default; pass `--source files` to force the legacy
 filesystem walk or `--source sqlite` to require it.
 
+### Run the multi-symbol crypto supervisor
+
+The supervisor is the live tick loop for crypto trading on Coinbase. It runs paper mode by default; promotion to live requires per-symbol shakedown gates (≥14 days clean PnL).
+
+```bash
+# Paper-mode session, all three symbols, log to a timestamped run directory.
+./.venv/bin/python src/live_supervisor.py \
+    --mode paper \
+    --symbols ETH/USD,BTC/USD,SOL/USD \
+    --log-dir ./runs \
+    --tick-interval-s 60
+
+# Operator stops via Ctrl-C OR by tripping the kill switch:
+touch "$KILL_SWITCH_FILE"   # forces flat, blocks new entries
+
+# After ≥14 days of clean per-symbol paper PnL, eligible symbols can flip to live:
+./.venv/bin/python src/live_supervisor.py --mode live --symbols ETH/USD ...
+```
+
+Required env vars (see `.env.example` Section 4 for the full contract): `COINBASE_API_KEY`, `COINBASE_API_SECRET`, `COINBASE_USE_SANDBOX`, `KILL_SWITCH_FILE`, `REDIS_URL` (defaults to `redis://localhost:6379/0`), `CRYPTO_MODEL_MAP="ETH/USD=path:0.50,BTC/USD=path:0.30,SOL/USD=path:0.40"`. Optional: `DISCORD_WEBHOOK_URL`, `TELEGRAM_BOT_TOKEN`, `SENTRY_DSN`, `PROMETHEUS_PUSHGATEWAY_URL`.
+
+What happens per tick (per symbol, in parallel under multiprocessing):
+1. Fetch ticker + features from Coinbase
+2. Capture **signal-phase snapshot** to Redis (`trade_ctx:{trade_id}:signal`)
+3. Run predictor → `(side, confidence)`
+4. NaN guard + confidence floor
+5. Risk engine sizes via Kelly (with Polymarket fee deduction if applicable)
+6. Circuit breakers gate (kill switch, daily-loss, drawdown, notional caps)
+7. Place order (live) or simulate fill at *next-bar* open (paper, deferred to next tick)
+8. Capture **fill-phase snapshot**
+9. Update per-symbol equity peak, increment Redis error counter on failure
+10. Auto-trip kill switch if 3+ consecutive errors on the symbol
+
+At UTC midnight `daily_close()` auto-fires: rolls per-symbol PnL into shakedown clean-day counters, emits the daily summary alert, scans the day's postmortems and dispatches the digest, evaluates `AutoPauseGate` (pauses if daily loss > 2% AND mean confidence < baseline − 2σ).
+
+### Read live supervisor output
+
+```bash
+# Read-only paper-session monitor (rolling per-symbol stats)
+./.venv/bin/python src/paper_session_monitor.py runs/<UTC-ts>_*/supervisor.log --follow
+```
+
+### Operational tools
+
+```bash
+# Reconcile our position store against the exchange's truth.
+# Flags orphans (in store, not on exchange), ghosts (on exchange, not in store),
+# and size drift. Run as cron, or manually after a restart.
+./.venv/bin/python -m src.ops.reconciliation_cli --symbol ETH/USD
+
+# Inspect the auto-pause marker (presence = supervisor halted itself today)
+ls -la ~/.autopilot_auto_paused 2>/dev/null
+
+# Clear the auto-pause after operator review
+rm ~/.autopilot_auto_paused
+```
+
+### Loss Postmortem Swarm
+
+Every losing trade ≥0.5% of bankroll (or any breaker-forced-flat exit) triggers a 5-agent forensics swarm. The swarm runs as a separate process (or batch job) that drains the Redis queue `postmortem:queue` populated by the supervisor.
+
+```bash
+# Manual trigger for one trade (debugging)
+./.venv/bin/python -c "
+from src.loss_postmortem.synthesizer import LossPostmortemSynthesizer
+s = LossPostmortemSynthesizer.from_env()
+report = s.process_one('your-trade-id-here')
+print(report.summary)
+"
+
+# Drain the queue (production: run as cron / sidecar)
+./.venv/bin/python -c "
+from src.loss_postmortem.synthesizer import LossPostmortemSynthesizer
+LossPostmortemSynthesizer.from_env().drain(max_items=10)
+"
+
+# Read a postmortem
+cat runs/postmortems/<trade-id>.md
+
+# Inspect the retrain queue (auto-populated when 3+ Signal-cause losses cluster on a symbol within 24h)
+cat runs/retrain_queue.jsonl
+
+# Inspect risk recommendations (auto-populated when 5+ Sizing-cause losses cluster — never auto-applied; human review only)
+cat runs/risk_recommendations.jsonl
+```
+
+How the swarm classifies a loss:
+
+```
+                     Loss event (≥0.5% bankroll OR forced_flat)
+                                       │
+                                       ▼
+                          Trigger gate in record_close()
+                                       │
+                                       │ (LPUSH postmortem:queue)
+                                       ▼
+                     Synthesizer.process_one(trade_id)
+                                       │
+                              spawn 5 specialists
+                                  in parallel
+                                  via multiprocessing
+                                       │
+        ┌────────────┬────────────┼────────────┬────────────┐
+        ▼            ▼            ▼            ▼            ▼
+   A1 Signal     A2 Execution  A3 Sizing   A4 Context   A5 Process
+   (Mahalanobis  (slippage,    (Kelly      (news 1h,    (breaker
+    OOD,          latency,      recompute,  Polymarket   logs,
+    threshold     stale         fee audit,  macro,       kill-switch
+    margin,       ticker,       correlation vol spike,   coherence,
+    calibration)  partial       cluster)    Gemini       race-cond)
+                  fills)                    summary)
+        │            │            │            │            │
+        └────────────┴─────┬──────┴────────────┴────────────┘
+                           ▼
+                       Synthesizer
+                  classifies root cause
+            (Signal/Execution/Sizing/Context/Process/Mixed/Unknown)
+                           │
+                ┌──────────┼──────────┬──────────────┐
+                ▼          ▼          ▼              ▼
+      runs/postmortems/  Outcome   retrain_       risk_
+      {trade_id}.json   Adjuster   queue.jsonl   recommendations
+      {trade_id}.md     (weight    (3+ Signal-   .jsonl
+                         delta:    cause cluster (5+ Sizing-
+                         Signal/    in 24h →     cause cluster
+                         Sizing→    auto-queued)  → human-review
+                         -0.05;                    only)
+                         Mixed→
+                         -0.03)
+                           │
+                           ▼
+                  Daily digest via
+                  alerts/notifier.py
+                  (top-3 losses + root-cause
+                   distribution + new actions)
+```
+
+Each specialist is `BaseForensicsAgent`-derived, returns a `ForensicsFinding` with `verdict ∈ {innocent, contributing, primary_cause, unknown}`, evidence bullets, suggested action, severity (1-5), runtime. Per-agent timeout 60s. A crashing agent never blocks the swarm — its `verdict="unknown"` with `error=<exc text>`.
+
+Adding a new specialist: subclass `BaseForensicsAgent`, set `agent_name`, implement `investigate(trade_id) -> ForensicsFinding`, register in the synthesizer's `agent_factories`. See `src/loss_postmortem/signal_forensics.py` for the canonical example.
+
 ### Run the legacy FastAPI trading API
 
 ```bash
@@ -400,15 +546,26 @@ streamlit run src/dashboard_app.py
 
 ## Tests
 
-The repo uses `unittest`.
-
-Example targeted runs:
+The repo uses `unittest`. There are three test trees with different runner conventions — don't assume one command runs them all.
 
 ```bash
-env PYTHONPATH=src ./.venv/bin/python -m unittest discover -s tests/prediction_market_scanner -p 'test_main.py'
-env PYTHONPATH=src ./.venv/bin/python -m unittest discover -s tests/prediction_market_scanner -p 'test_orchestrator.py'
+# Full prediction-market + crypto trading + Lane E swarm suite (772 tests, ~3s)
+env PYTHONPATH=src ./.venv/bin/python -m unittest discover -s tests/prediction_market_scanner
+
+# Single test module
+env PYTHONPATH=src ./.venv/bin/python -m unittest tests.prediction_market_scanner.test_synthesizer
+
+# Single test method
+env PYTHONPATH=src ./.venv/bin/python -m unittest tests.prediction_market_scanner.test_synthesizer.SynthesizerTest.test_root_cause_classification
+
+# Social narrative agent (separate, no PYTHONPATH)
 ./.venv/bin/python -m unittest discover social-narrative-agent/tests
+
+# Legacy core tests (pytest, requires torch + TA-Lib)
+./.venv/bin/python -m pytest tests/test_core.py
 ```
+
+CI: every push and PR to `main` or `feature/prediction-market-bot` triggers `.github/workflows/tests.yml` which installs TA-Lib + the full requirements.txt and runs the prediction-market suite + `test_compute_features`.
 
 ## Repository Map
 
