@@ -841,6 +841,20 @@ class ContextForensicsAgent(BaseForensicsAgent):
             red_flags, extreme_news_cluster=extreme_news_cluster
         )
 
+        # When the news-cluster tier promoted A4 to primary_cause, emit a
+        # Prometheus counter so we can monitor how often the new tier
+        # fires in prod. Wrapped in try/except: a metric failure must
+        # never affect the swarm's verdict / finding.
+        if extreme_news_cluster:
+            try:
+                from observability.monitoring import incr_a4_news_cluster_extreme
+
+                incr_a4_news_cluster_extreme(len(headlines_in_window))
+            except Exception as exc:  # noqa: BLE001 - belt + braces
+                LOGGER.warning(
+                    "context: a4_news_cluster_extreme metric failed: %r", exc
+                )
+
         return ForensicsFinding(
             agent="context",
             verdict=verdict,

@@ -516,5 +516,140 @@ class ProcessIntegrityAgentTests(unittest.TestCase):
         self.assertIsNotNone(finding.error)
 
 
+class ProcessIntegrityClusterMetricTests(unittest.TestCase):
+    """A5's race-cluster tier emits ``autopilot_a5_race_cluster_extreme_total``."""
+
+    def setUp(self) -> None:
+        from observability import monitoring
+
+        self._monitoring = monitoring
+        self._saved_pusher = monitoring._get_default_metrics_pusher()
+
+    def tearDown(self) -> None:
+        self._monitoring.set_default_metrics_pusher(self._saved_pusher)
+
+    def _race_agent_with_counter(
+        self,
+        counter: int,
+        *,
+        symbol: str = "BTC/USD",
+    ) -> "ProcessIntegrityAgent":
+        """Build A5 + seed Redis with a per-symbol error counter."""
+        redis_client = fakeredis.FakeRedis(decode_responses=True)
+        store = _store(redis_client=redis_client)
+        signal = _signal_snap(symbol=symbol, notes=None)
+        store.record_snapshot(signal)
+        store.record_snapshot(_fill_snap(symbol=symbol, notes="paper-deferred-fill"))
+        date_part = signal.captured_at_utc[:10]
+        err_key = f"test:errors:by_symbol:{date_part}"
+        if counter > 0:
+            redis_client.hset(err_key, symbol, str(int(counter)))
+        return ProcessIntegrityAgent(
+            context_store=store,
+            redis_client=redis_client,
+            namespace="test",
+        )
+
+    def test_extreme_race_cluster_increments_metric(self) -> None:
+        from observability import monitoring
+
+        class _Recorder:
+            def __init__(self) -> None:
+                self.calls: List[Dict[str, Any]] = []
+
+            def is_enabled(self) -> bool:
+                return True
+
+            def counter(self, name, increment=1.0, labels=None):
+                self.calls.append(
+                    {"name": name, "increment": float(increment), "labels": labels or {}}
+                )
+
+            def gauge(self, *_a, **_k):  # noqa: ANN001
+                pass
+
+            def histogram(self, *_a, **_k):  # noqa: ANN001
+                pass
+
+            def push(self):
+                return True
+
+        recorder = _Recorder()
+        monitoring.set_default_metrics_pusher(recorder)
+
+        agent = self._race_agent_with_counter(50)
+        finding = agent.investigate("trade-1")
+
+        self.assertEqual(finding.verdict, "primary_cause")
+        cluster_calls = [
+            c for c in recorder.calls if c["name"] == "a5_race_cluster_extreme_total"
+        ]
+        self.assertEqual(len(cluster_calls), 1)
+        self.assertEqual(cluster_calls[0]["labels"], {"error_bucket": "30-99"})
+
+    def test_below_cluster_tier_does_not_increment_metric(self) -> None:
+        from observability import monitoring
+
+        class _Recorder:
+            def __init__(self) -> None:
+                self.calls: List[Dict[str, Any]] = []
+
+            def is_enabled(self) -> bool:
+                return True
+
+            def counter(self, name, increment=1.0, labels=None):
+                self.calls.append(
+                    {"name": name, "increment": float(increment), "labels": labels or {}}
+                )
+
+            def gauge(self, *_a, **_k):  # noqa: ANN001
+                pass
+
+            def histogram(self, *_a, **_k):  # noqa: ANN001
+                pass
+
+            def push(self):
+                return True
+
+        recorder = _Recorder()
+        monitoring.set_default_metrics_pusher(recorder)
+
+        # 5 errors fires the contributing tier but not the cluster tier.
+        agent = self._race_agent_with_counter(5)
+        finding = agent.investigate("trade-1")
+
+        self.assertEqual(finding.verdict, "contributing")
+        cluster_calls = [
+            c for c in recorder.calls if c["name"] == "a5_race_cluster_extreme_total"
+        ]
+        self.assertEqual(cluster_calls, [])
+
+    def test_metric_failure_does_not_break_finding(self) -> None:
+        from observability import monitoring
+
+        class _ExplodingPusher:
+            def is_enabled(self) -> bool:
+                return True
+
+            def counter(self, *_a, **_k):  # noqa: ANN001
+                raise RuntimeError("simulated metrics outage")
+
+            def gauge(self, *_a, **_k):  # noqa: ANN001
+                pass
+
+            def histogram(self, *_a, **_k):  # noqa: ANN001
+                pass
+
+            def push(self):
+                return True
+
+        monitoring.set_default_metrics_pusher(_ExplodingPusher())
+        agent = self._race_agent_with_counter(50)
+        finding = agent.investigate("trade-1")
+        # Finding is unaffected by metric failure.
+        self.assertEqual(finding.verdict, "primary_cause")
+        self.assertIsNone(finding.error)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -268,5 +268,106 @@ class TestMetricsPusherGracefulDegradation(unittest.TestCase):
         self.assertFalse(pusher.push())
 
 
+class TestClusterTierCounters(unittest.TestCase):
+    """A4 / A5 cluster-tier extreme-promotion Prometheus counters."""
+
+    def setUp(self) -> None:
+        from observability import monitoring
+
+        self._monitoring = monitoring
+        self._saved_pusher = monitoring._get_default_metrics_pusher()
+        self.pusher = _RecordingPusher()
+        monitoring.set_default_metrics_pusher(self.pusher)
+
+    def tearDown(self) -> None:
+        # Restore whatever was registered before the test so the module
+        # state stays clean for subsequent tests.
+        self._monitoring.set_default_metrics_pusher(self._saved_pusher)
+
+    def test_a4_news_cluster_extreme_increments_with_bucket_label(self) -> None:
+        from observability.monitoring import incr_a4_news_cluster_extreme
+
+        incr_a4_news_cluster_extreme(10)
+        self.assertEqual(len(self.pusher.counter_calls), 1)
+        call = self.pusher.counter_calls[0]
+        self.assertEqual(call["name"], "a4_news_cluster_extreme_total")
+        self.assertAlmostEqual(call["increment"], 1.0)
+        self.assertEqual(call["labels"], {"headlines_bucket": "10-19"})
+
+    def test_a4_news_cluster_buckets_handle_each_band(self) -> None:
+        from observability.monitoring import incr_a4_news_cluster_extreme
+
+        incr_a4_news_cluster_extreme(15)  # → "10-19"
+        incr_a4_news_cluster_extreme(25)  # → "20-49"
+        incr_a4_news_cluster_extreme(80)  # → "50+"
+        labels = [c["labels"]["headlines_bucket"] for c in self.pusher.counter_calls]
+        self.assertEqual(labels, ["10-19", "20-49", "50+"])
+
+    def test_a5_race_cluster_extreme_increments_with_bucket_label(self) -> None:
+        from observability.monitoring import incr_a5_race_cluster_extreme
+
+        incr_a5_race_cluster_extreme(50)
+        self.assertEqual(len(self.pusher.counter_calls), 1)
+        call = self.pusher.counter_calls[0]
+        self.assertEqual(call["name"], "a5_race_cluster_extreme_total")
+        self.assertAlmostEqual(call["increment"], 1.0)
+        self.assertEqual(call["labels"], {"error_bucket": "30-99"})
+
+    def test_a5_race_cluster_buckets_handle_each_band(self) -> None:
+        from observability.monitoring import incr_a5_race_cluster_extreme
+
+        incr_a5_race_cluster_extreme(20)   # → "15-29"
+        incr_a5_race_cluster_extreme(50)   # → "30-99"
+        incr_a5_race_cluster_extreme(150)  # → "100+"
+        labels = [c["labels"]["error_bucket"] for c in self.pusher.counter_calls]
+        self.assertEqual(labels, ["15-29", "30-99", "100+"])
+
+    def test_helpers_are_no_op_when_pusher_unset(self) -> None:
+        """Without a registered pusher the helpers must silently no-op."""
+        from observability.monitoring import (
+            incr_a4_news_cluster_extreme,
+            incr_a5_race_cluster_extreme,
+            set_default_metrics_pusher,
+        )
+
+        # Clear the default pusher this test set up.
+        set_default_metrics_pusher(None)
+        # Both helpers must not raise when the default is None.
+        incr_a4_news_cluster_extreme(10)
+        incr_a5_race_cluster_extreme(15)
+
+    def test_helpers_swallow_pusher_exceptions(self) -> None:
+        """A raising pusher must not propagate — observability is best-effort."""
+        from observability.monitoring import (
+            incr_a4_news_cluster_extreme,
+            incr_a5_race_cluster_extreme,
+            set_default_metrics_pusher,
+        )
+
+        class _ExplodingPusher:
+            def is_enabled(self) -> bool:
+                return True
+
+            def counter(self, *_args, **_kwargs):  # noqa: ANN001
+                raise RuntimeError("simulated metrics outage")
+
+            def gauge(self, *_args, **_kwargs):  # noqa: ANN001
+                pass
+
+            def histogram(self, *_args, **_kwargs):  # noqa: ANN001
+                pass
+
+            def push(self) -> bool:
+                return True
+
+        set_default_metrics_pusher(_ExplodingPusher())
+        try:
+            # Both must complete without raising.
+            incr_a4_news_cluster_extreme(10)
+            incr_a5_race_cluster_extreme(15)
+        finally:
+            set_default_metrics_pusher(None)
+
+
 if __name__ == "__main__":
     unittest.main()

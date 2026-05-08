@@ -167,8 +167,10 @@ class ProcessIntegrityAgent(BaseForensicsAgent):
         if ev:
             evidence.append(ev)
 
-        # 4. Race-condition trail.
-        flag_race, ev = self._check_race_condition_trail(
+        # 4. Race-condition trail. Returns (flag, evidence, error_count)
+        # so the cluster-tier counter can record the bucket without
+        # re-querying Redis.
+        flag_race, ev, race_error_count = self._check_race_condition_trail(
             signal_snap or fill_snap or breaker_snap
         )
         if ev:
@@ -187,6 +189,20 @@ class ProcessIntegrityAgent(BaseForensicsAgent):
         )
         if ev:
             evidence.append(ev)
+
+        # When the race-cluster tier promoted A5 to primary_cause, emit a
+        # Prometheus counter so we can monitor how often the new tier
+        # fires in prod. Wrapped in try/except: a metric failure must
+        # never affect the swarm's verdict / finding.
+        if flag_race == "primary" and race_error_count is not None:
+            try:
+                from observability.monitoring import incr_a5_race_cluster_extreme
+
+                incr_a5_race_cluster_extreme(int(race_error_count))
+            except Exception as exc:  # noqa: BLE001 - belt + braces
+                LOGGER.warning(
+                    "process: a5_race_cluster_extreme metric failed: %r", exc
+                )
 
         return self._render_verdict(
             evidence=evidence,
@@ -379,7 +395,7 @@ class ProcessIntegrityAgent(BaseForensicsAgent):
 
     def _check_race_condition_trail(
         self, any_snap: Optional[TradeContextSnapshot]
-    ) -> tuple[Optional[str], Optional[str]]:
+    ) -> tuple[Optional[str], Optional[str], Optional[int]]:
         """Probe Redis ``errors:by_symbol:{date}`` for contention.
 
         Heuristic: a single trade losing on a date with >threshold
@@ -387,24 +403,28 @@ class ProcessIntegrityAgent(BaseForensicsAgent):
         day — concurrent writes are plausible. We can't see HINCRBY
         timestamps from a HASH, so we only check the count and treat it
         as soft evidence. Degrades to no-op if Redis is unavailable.
+
+        Returns ``(flag, evidence, error_count)`` so callers can route
+        the resolved counter into a Prometheus metric without
+        re-querying Redis.
         """
         if self.redis_client is None or any_snap is None:
-            return None, None
+            return None, None, None
         symbol = any_snap.symbol or ""
         date_part = self._extract_date(any_snap.captured_at_utc)
         if not symbol or not date_part:
-            return None, None
+            return None, None, None
         key = f"{self.namespace}:errors:by_symbol:{date_part}"
         try:
             raw = self.redis_client.hget(key, symbol)
         except Exception:  # noqa: BLE001 - degrade gracefully
-            return None, None
+            return None, None, None
         if raw is None:
-            return None, None
+            return None, None, None
         try:
             count = int(raw)
         except (TypeError, ValueError):
-            return None, None
+            return None, None, None
         if count >= _VERY_HIGH_RACE_CLUSTER:
             # Extreme contention — this is the headline, not a side note.
             return (
@@ -412,6 +432,7 @@ class ProcessIntegrityAgent(BaseForensicsAgent):
                 f"extreme error contention (counter={count}) for {symbol} on "
                 f"{date_part} (>= {_VERY_HIGH_RACE_CLUSTER}); "
                 "concurrent error writes very likely the primary cause",
+                count,
             )
         if count >= _RACE_CONCURRENCY_THRESHOLD:
             return (
@@ -419,8 +440,9 @@ class ProcessIntegrityAgent(BaseForensicsAgent):
                 f"error counter for {symbol} on {date_part} = {count} "
                 f"(>= {_RACE_CONCURRENCY_THRESHOLD}); "
                 "concurrent error writes plausible",
+                count,
             )
-        return None, None
+        return None, None, count
 
     def _check_stoploss_price_match(
         self,

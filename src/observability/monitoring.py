@@ -437,6 +437,120 @@ def capture_message(message: str, level: str = "warning") -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Cluster-tier counters (X2 recommendation): A4 news / A5 race extreme tiers
+# ---------------------------------------------------------------------------
+#
+# Both A4 (ContextForensicsAgent) and A5 (ProcessIntegrityAgent) now
+# promote to ``primary_cause`` on extreme cluster signals (>= 10 in-window
+# headlines / >= 15 same-day error counter). These two counters let an
+# operator see how often that promotion fires in prod — a sudden spike
+# almost certainly means we should tune the cluster threshold OR the
+# upstream feature is misbehaving.
+#
+# Both helpers MUST never raise: a metric backend hiccup cannot break the
+# forensics swarm. The bucket label exists so we can spot trend changes
+# without exploding cardinality (3 fixed buckets each, no per-symbol).
+#
+# The pusher is resolved lazily via a module-level helper so the rest of
+# the codebase can keep its existing
+# ``MetricsPusher`` injection patterns without forcing every call site to
+# pass one. ``set_default_metrics_pusher`` is the production seam (called
+# from ``main()``); tests can call it directly with a recording stub.
+
+_DEFAULT_PUSHER: Optional["MetricsPusher"] = None
+
+
+def set_default_metrics_pusher(pusher: Optional["MetricsPusher"]) -> None:
+    """Register the process-wide default :class:`MetricsPusher`.
+
+    Used by inline counter helpers (``incr_a4_news_cluster_extreme`` etc.)
+    that don't take a pusher kwarg. Pass ``None`` to clear (tests use this
+    in tearDown to avoid cross-test pollution).
+    """
+
+    global _DEFAULT_PUSHER
+    _DEFAULT_PUSHER = pusher
+
+
+def _get_default_metrics_pusher() -> Optional["MetricsPusher"]:
+    return _DEFAULT_PUSHER
+
+
+def _bucket_headlines(headlines_count: int) -> str:
+    """Map raw headline count to a low-cardinality bucket label.
+
+    Buckets: ``10-19`` (just-promoted), ``20-49`` (heavy cluster),
+    ``50+`` (firehose). Below 10 the cluster tier doesn't fire so this
+    helper isn't called for those values.
+    """
+
+    n = int(headlines_count)
+    if n < 20:
+        return "10-19"
+    if n < 50:
+        return "20-49"
+    return "50+"
+
+
+def _bucket_errors(error_count: int) -> str:
+    """Map raw error counter to a low-cardinality bucket label.
+
+    Buckets: ``15-29`` (just-promoted), ``30-99`` (severe), ``100+``
+    (catastrophic). Below 15 the cluster tier doesn't fire.
+    """
+
+    n = int(error_count)
+    if n < 30:
+        return "15-29"
+    if n < 100:
+        return "30-99"
+    return "100+"
+
+
+def incr_a4_news_cluster_extreme(headlines_count: int) -> None:
+    """Increment ``autopilot_a4_news_cluster_extreme_total`` by 1.
+
+    Called by A4 when its ``>= 10 in-window headlines`` tier promotes to
+    ``primary_cause``. Failures are swallowed (observability must never
+    break the swarm). The label ``headlines_bucket`` keeps cardinality
+    bounded at 3 buckets.
+    """
+
+    pusher = _get_default_metrics_pusher()
+    if pusher is None:
+        return
+    try:
+        pusher.counter(
+            "a4_news_cluster_extreme_total",
+            increment=1.0,
+            labels={"headlines_bucket": _bucket_headlines(headlines_count)},
+        )
+    except Exception as exc:  # noqa: BLE001 - never crash on metrics
+        LOGGER.warning("incr_a4_news_cluster_extreme failed: %s", exc)
+
+
+def incr_a5_race_cluster_extreme(error_count: int) -> None:
+    """Increment ``autopilot_a5_race_cluster_extreme_total`` by 1.
+
+    Called by A5 when its ``>= 15 same-day error counter`` tier promotes
+    to ``primary_cause``. Failures are swallowed. The label
+    ``error_bucket`` keeps cardinality bounded at 3 buckets.
+    """
+
+    pusher = _get_default_metrics_pusher()
+    if pusher is None:
+        return
+    try:
+        pusher.counter(
+            "a5_race_cluster_extreme_total",
+            increment=1.0,
+            labels={"error_bucket": _bucket_errors(error_count)},
+        )
+    except Exception as exc:  # noqa: BLE001 - never crash on metrics
+        LOGGER.warning("incr_a5_race_cluster_extreme failed: %s", exc)
+
+
 __all__ = [
     "DEFAULT_HISTOGRAM_BUCKETS",
     "DEFAULT_JOB_NAME",
@@ -445,5 +559,8 @@ __all__ = [
     "MetricsPusher",
     "breadcrumb",
     "capture_message",
+    "incr_a4_news_cluster_extreme",
+    "incr_a5_race_cluster_extreme",
     "init_sentry",
+    "set_default_metrics_pusher",
 ]

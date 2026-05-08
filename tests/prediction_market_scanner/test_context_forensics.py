@@ -1045,6 +1045,141 @@ class XSentimentAgentIntegrationTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class ContextForensicsClusterMetricTests(unittest.TestCase):
+    """A4's news-cluster tier emits ``autopilot_a4_news_cluster_extreme_total``."""
+
+    def setUp(self) -> None:
+        from observability import monitoring
+
+        self._monitoring = monitoring
+        self._saved_pusher = monitoring._get_default_metrics_pusher()
+
+    def tearDown(self) -> None:
+        self._monitoring.set_default_metrics_pusher(self._saved_pusher)
+
+    def _seed_cluster_run(self, *, n_headlines: int):
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+        headlines = [
+            _headline(
+                title=f"Cluster headline {i}",
+                published_at=TRADE_TIME - timedelta(seconds=1 + i * 10),
+            )
+            for i in range(n_headlines)
+        ]
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory(headlines),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini(),
+        )
+        return agent
+
+    def test_extreme_news_cluster_increments_metric(self) -> None:
+        from observability import monitoring
+
+        # Use a recording pusher so we can assert the increment fired.
+        class _Recorder:
+            def __init__(self) -> None:
+                self.calls: List[Dict[str, Any]] = []
+
+            def is_enabled(self) -> bool:
+                return True
+
+            def counter(self, name, increment=1.0, labels=None):
+                self.calls.append(
+                    {"name": name, "increment": float(increment), "labels": labels or {}}
+                )
+
+            def gauge(self, *_a, **_k):  # noqa: ANN001
+                pass
+
+            def histogram(self, *_a, **_k):  # noqa: ANN001
+                pass
+
+            def push(self):
+                return True
+
+        recorder = _Recorder()
+        monitoring.set_default_metrics_pusher(recorder)
+
+        agent = self._seed_cluster_run(n_headlines=15)
+        finding = agent.investigate("trade-A4")
+
+        # Promoted to primary on the cluster tier.
+        self.assertEqual(finding.verdict, "primary_cause")
+        # Counter was invoked exactly once with the right name + bucket.
+        cluster_calls = [
+            c for c in recorder.calls if c["name"] == "a4_news_cluster_extreme_total"
+        ]
+        self.assertEqual(len(cluster_calls), 1)
+        self.assertEqual(cluster_calls[0]["labels"], {"headlines_bucket": "10-19"})
+
+    def test_below_cluster_tier_does_not_increment_metric(self) -> None:
+        from observability import monitoring
+
+        class _Recorder:
+            def __init__(self) -> None:
+                self.calls: List[Dict[str, Any]] = []
+
+            def is_enabled(self) -> bool:
+                return True
+
+            def counter(self, name, increment=1.0, labels=None):
+                self.calls.append(
+                    {"name": name, "increment": float(increment), "labels": labels or {}}
+                )
+
+            def gauge(self, *_a, **_k):  # noqa: ANN001
+                pass
+
+            def histogram(self, *_a, **_k):  # noqa: ANN001
+                pass
+
+            def push(self):
+                return True
+
+        recorder = _Recorder()
+        monitoring.set_default_metrics_pusher(recorder)
+
+        # 7 headlines fires the contributing tier but NOT the cluster tier.
+        agent = self._seed_cluster_run(n_headlines=7)
+        finding = agent.investigate("trade-A4")
+
+        self.assertEqual(finding.verdict, "contributing")
+        cluster_calls = [
+            c for c in recorder.calls if c["name"] == "a4_news_cluster_extreme_total"
+        ]
+        self.assertEqual(cluster_calls, [])
+
+    def test_metric_failure_does_not_break_finding(self) -> None:
+        from observability import monitoring
+
+        class _ExplodingPusher:
+            def is_enabled(self) -> bool:
+                return True
+
+            def counter(self, *_a, **_k):  # noqa: ANN001
+                raise RuntimeError("simulated metrics outage")
+
+            def gauge(self, *_a, **_k):  # noqa: ANN001
+                pass
+
+            def histogram(self, *_a, **_k):  # noqa: ANN001
+                pass
+
+            def push(self):
+                return True
+
+        monitoring.set_default_metrics_pusher(_ExplodingPusher())
+
+        agent = self._seed_cluster_run(n_headlines=15)
+        # Despite the metric raising, the finding is emitted cleanly.
+        finding = agent.investigate("trade-A4")
+        self.assertEqual(finding.verdict, "primary_cause")
+        self.assertIsNone(finding.error)
+
+
 class ContextForensicsSafeInvestigateTests(unittest.TestCase):
     def test_safe_investigate_returns_finding_for_clean_run(self) -> None:
         store = _store()
