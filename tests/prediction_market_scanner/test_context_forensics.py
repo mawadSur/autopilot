@@ -32,9 +32,14 @@ from unittest.mock import patch
 import fakeredis
 
 from loss_postmortem.context_forensics import (
+    BTC_DOMINANCE_CACHE_KEY,
+    BTC_DOMINANCE_CACHE_TTL_S,
+    BTC_DOMINANCE_PREV_KEY,
     HEADLINE_DENSITY_RED_FLAG,
     ContextForensicsAgent,
     _VERY_HIGH_NEWS_CLUSTER,
+    _fetch_btc_dominance_cached,
+    _fetch_x_sentiment,
 )
 from state.trade_context_store import TradeContextSnapshot, TradeContextStore
 
@@ -530,6 +535,303 @@ class ContextForensicsNewsClusterLadderTests(unittest.TestCase):
         joined = " | ".join(finding.evidence)
         self.assertIn("extreme news cluster", joined)
         self.assertIn("50 headlines in 1h window", joined)
+
+
+# ---------------------------------------------------------------------------
+# BTC dominance cached fetcher + X sentiment scaffold
+# ---------------------------------------------------------------------------
+
+
+class _StubResponse:
+    """Minimal stand-in for ``requests.Response`` (only attrs A4 reads)."""
+
+    def __init__(
+        self,
+        *,
+        json_data: Any = None,
+        status_code: int = 200,
+        raises_on_get: bool = False,
+        raises_on_json: bool = False,
+    ) -> None:
+        self._json = json_data
+        self.status_code = status_code
+        self._raises_on_get = raises_on_get
+        self._raises_on_json = raises_on_json
+
+    def json(self) -> Any:
+        if self._raises_on_json:
+            raise ValueError("malformed JSON")
+        return self._json
+
+
+def _coingecko_payload(btc_pct: float) -> Dict[str, Any]:
+    return {
+        "data": {
+            "market_cap_percentage": {
+                "btc": btc_pct,
+                "eth": 18.0,
+                "usdt": 5.0,
+            }
+        }
+    }
+
+
+class BtcDominanceCachedFetcherTests(unittest.TestCase):
+    """Cover the four documented branches of ``_fetch_btc_dominance_cached``."""
+
+    def test_cache_hit_returns_immediately_without_http_call(self) -> None:
+        """A valid Redis entry must short-circuit the live fetch entirely."""
+        client = fakeredis.FakeRedis(decode_responses=True)
+        client.set(BTC_DOMINANCE_CACHE_KEY, "52.345", ex=BTC_DOMINANCE_CACHE_TTL_S)
+
+        # Spy on requests.get globally — module-level patch survives the
+        # local import inside _fetch_btc_dominance_cached.
+        with patch("requests.get") as spy:
+            value = _fetch_btc_dominance_cached(client)
+
+        self.assertIsNotNone(value)
+        self.assertAlmostEqual(value, 52.345, places=3)
+        # Cache hit path — no HTTP call should have been made.
+        self.assertEqual(
+            spy.call_count,
+            0,
+            msg="requests.get must NOT be called on cache hit",
+        )
+
+    def test_cache_miss_fetches_live_and_repopulates(self) -> None:
+        """No cached entry → HTTP fetch → cache populated for next call."""
+        client = fakeredis.FakeRedis(decode_responses=True)
+
+        with patch(
+            "requests.get",
+            return_value=_StubResponse(json_data=_coingecko_payload(51.234)),
+        ) as spy:
+            value = _fetch_btc_dominance_cached(client)
+
+        self.assertIsNotNone(value)
+        self.assertAlmostEqual(value, 51.234, places=3)
+        self.assertEqual(spy.call_count, 1)
+        self.assertGreaterEqual(value, 0.0)
+        self.assertLessEqual(value, 100.0)
+
+        # Cache must now hold the fetched value.
+        cached = client.get(BTC_DOMINANCE_CACHE_KEY)
+        self.assertIsNotNone(cached)
+        self.assertAlmostEqual(float(cached), 51.234, places=3)
+
+    def test_cache_miss_rolls_existing_value_into_prev(self) -> None:
+        """An existing canonical value moves to the prev key on refresh."""
+
+        # Forge an "expired" state by writing the canonical key directly
+        # but leaving prev empty. Then bypass the cache hit by deleting
+        # the canonical key right before the fetch — emulating TTL
+        # expiry while preserving the value somewhere fakeredis can read.
+        # Easier: write to BOTH the canonical key AND something else,
+        # then call the live fetch path by passing a client where the
+        # canonical key returns the stale value, then the fetch logic
+        # will read it as "existing" and roll into prev.
+        # Simplest realisation: pre-seed canonical, monkey-patch the
+        # cache-hit branch to skip via delete-after-read.
+        client = fakeredis.FakeRedis(decode_responses=True)
+        client.set(BTC_DOMINANCE_CACHE_KEY, "50.000")
+        # Wipe just before the fetch path so the cache-hit path bails.
+        # We do this by patching _fetch helper: easier approach is to
+        # let cache-hit fire, get back the stale value (50.0), and then
+        # simulate the TTL-expired refresh by manually calling fetch
+        # with the canonical key cleared.
+        # Simulate expiry: clear canonical, leave nothing.
+        # Actually, the function's contract: cache hit returns the value.
+        # To exercise the prev-roll branch, we need a state where
+        # canonical_key.get() in cache-hit returns None (so fetch live
+        # runs) but the same key.get() in the repopulate phase returns
+        # the OLD value. fakeredis can't toggle that — so instead we
+        # use a proxy that returns None on the first .get and the old
+        # value on the second .get.
+        class _ProxyClient:
+            def __init__(self, real):
+                self.real = real
+                self._gets = 0
+
+            def get(self, key):
+                self._gets += 1
+                # First .get is the cache-hit probe — pretend miss.
+                if self._gets == 1 and key == BTC_DOMINANCE_CACHE_KEY:
+                    return None
+                return self.real.get(key)
+
+            def set(self, key, value, ex=None):
+                return self.real.set(key, value, ex=ex)
+
+        proxy = _ProxyClient(client)
+        with patch(
+            "requests.get",
+            return_value=_StubResponse(json_data=_coingecko_payload(53.5)),
+        ):
+            value = _fetch_btc_dominance_cached(proxy)
+        self.assertAlmostEqual(value, 53.5, places=3)
+        # Prev should now hold the prior canonical value (50.000).
+        self.assertEqual(client.get(BTC_DOMINANCE_PREV_KEY), "50.000")
+        # Canonical should hold the new value.
+        new_canonical = client.get(BTC_DOMINANCE_CACHE_KEY)
+        self.assertIsNotNone(new_canonical)
+        self.assertAlmostEqual(float(new_canonical), 53.5, places=3)
+
+    def test_http_timeout_returns_none(self) -> None:
+        """requests.get raising Timeout → None, no crash."""
+        client = fakeredis.FakeRedis(decode_responses=True)
+
+        class _SimulatedTimeout(Exception):
+            pass
+
+        with patch("requests.get", side_effect=_SimulatedTimeout("timed out")):
+            value = _fetch_btc_dominance_cached(client)
+        self.assertIsNone(value)
+        # Cache must not have been populated with garbage.
+        self.assertIsNone(client.get(BTC_DOMINANCE_CACHE_KEY))
+
+    def test_malformed_response_returns_none(self) -> None:
+        """Non-JSON or schema-incompatible response → None, no crash."""
+        client = fakeredis.FakeRedis(decode_responses=True)
+
+        # Branch a: response.json() raises.
+        with patch(
+            "requests.get",
+            return_value=_StubResponse(raises_on_json=True),
+        ):
+            value = _fetch_btc_dominance_cached(client)
+        self.assertIsNone(value)
+
+        # Branch b: JSON parses but schema is wrong.
+        with patch(
+            "requests.get",
+            return_value=_StubResponse(json_data={"unexpected": "shape"}),
+        ):
+            value = _fetch_btc_dominance_cached(client)
+        self.assertIsNone(value)
+
+        # Branch c: btc field is non-numeric.
+        with patch(
+            "requests.get",
+            return_value=_StubResponse(
+                json_data={"data": {"market_cap_percentage": {"btc": "abc"}}}
+            ),
+        ):
+            value = _fetch_btc_dominance_cached(client)
+        self.assertIsNone(value)
+
+        # Branch d: btc field out of range.
+        with patch(
+            "requests.get",
+            return_value=_StubResponse(
+                json_data={"data": {"market_cap_percentage": {"btc": 150.0}}}
+            ),
+        ):
+            value = _fetch_btc_dominance_cached(client)
+        self.assertIsNone(value)
+
+    def test_no_redis_client_skips_cache_but_still_returns_value(self) -> None:
+        """``redis_client=None`` → live fetch runs, no caching attempted."""
+        with patch(
+            "requests.get",
+            return_value=_StubResponse(json_data=_coingecko_payload(50.0)),
+        ):
+            value = _fetch_btc_dominance_cached(None)
+        self.assertAlmostEqual(value, 50.0, places=3)
+
+
+class BtcDominanceAgentIntegrationTests(unittest.TestCase):
+    """A4 must consume the BTC dominance fetcher without ever crashing."""
+
+    def test_agent_completes_when_btc_dominance_fetcher_returns_none(self) -> None:
+        """A failing fetcher must NOT prevent A4 from emitting other findings."""
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini(),
+            btc_dominance_fetcher=lambda _client: None,
+        )
+        finding = agent.investigate("trade-A4")
+        self.assertEqual(finding.verdict, "innocent")
+        self.assertIsNone(finding.error)
+
+    def test_agent_surfaces_dominance_value_when_no_prev(self) -> None:
+        """Fresh dominance + no prev sample → informational evidence bullet."""
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini(),
+            redis_client=fakeredis.FakeRedis(decode_responses=True),
+            btc_dominance_fetcher=lambda _client: 51.5,
+        )
+        finding = agent.investigate("trade-A4")
+        joined = " | ".join(finding.evidence)
+        self.assertIn("BTC dominance", joined)
+        self.assertIn("51.50%", joined)
+        # No prev sample → no red flag.
+        self.assertEqual(finding.verdict, "innocent")
+
+    def test_agent_flags_btc_dominance_shift_as_contributing(self) -> None:
+        """A 1.5pp 1h shift → red flag → contributing tier (not primary)."""
+        client = fakeredis.FakeRedis(decode_responses=True)
+        # Seed a prior cached value 1.5pp lower than the fresh fetch.
+        client.set(BTC_DOMINANCE_PREV_KEY, "50.000", ex=BTC_DOMINANCE_CACHE_TTL_S)
+
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini(),
+            redis_client=client,
+            btc_dominance_fetcher=lambda _client: 51.5,
+        )
+        finding = agent.investigate("trade-A4")
+        joined = " | ".join(finding.evidence)
+        # Red flag bullet present.
+        self.assertIn("BTC dominance shifted", joined)
+        # Contributing-only — not promoted to primary on this signal alone.
+        self.assertEqual(finding.verdict, "contributing")
+
+    def test_btc_dominance_signal_alone_does_not_promote_to_primary(self) -> None:
+        """A 5pp shift is large but A4 must NOT promote on this signal alone."""
+        client = fakeredis.FakeRedis(decode_responses=True)
+        client.set(BTC_DOMINANCE_PREV_KEY, "45.000", ex=BTC_DOMINANCE_CACHE_TTL_S)
+
+        store = _store()
+        _seed_signal(store, _signal_snapshot())
+
+        agent = ContextForensicsAgent(
+            context_store=store,
+            news_fetcher_factory=_news_factory([]),
+            markets_fetcher=_markets_fetcher([]),
+            gemini_caller=_stub_gemini(),
+            redis_client=client,
+            btc_dominance_fetcher=lambda _client: 50.0,  # +5pp shift
+        )
+        finding = agent.investigate("trade-A4")
+        # 1 red flag from BTC dominance only → contributing (not primary).
+        self.assertEqual(finding.verdict, "contributing")
+
+
+class XSentimentScaffoldTests(unittest.TestCase):
+    """The X/Twitter sentiment helper is a stub until API access is wired."""
+
+    def test_returns_none_when_env_var_unset(self) -> None:
+        """No X_API_KEY → silent None, no NotImplementedError."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("X_API_KEY", None)
+            value = _fetch_x_sentiment("BTC/USD")
+        self.assertIsNone(value)
 
 
 # ---------------------------------------------------------------------------

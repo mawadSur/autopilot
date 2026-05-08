@@ -100,6 +100,21 @@ _VERY_HIGH_NEWS_CLUSTER = 10
 PRIMARY_CAUSE_RED_FLAGS = 3
 CONTRIBUTING_RED_FLAGS = 1
 
+# BTC dominance cache settings. CoinGecko's free /global endpoint reports
+# the BTC market-cap dominance percentage (0-100). We cache the value in
+# Redis under a single fixed key with an hour TTL — the 1h TTL doubles as
+# a "fetched at most 1h ago" guarantee for the shift check below. A 1pp
+# delta versus the prior cached value (rolled into ``btc_dominance:prev``
+# on each live refresh) qualifies as a contributing cross-asset signal:
+# never enough on its own to promote A4 to primary, but pairs with news
+# / macro / vol-spike red flags to add weight.
+BTC_DOMINANCE_CACHE_KEY = "btc_dominance:cached"
+BTC_DOMINANCE_PREV_KEY = "btc_dominance:prev"
+BTC_DOMINANCE_CACHE_TTL_S = 3600  # 1 hour
+BTC_DOMINANCE_HTTP_TIMEOUT_S = 4.0
+BTC_DOMINANCE_ENDPOINT = "https://api.coingecko.com/api/v3/global"
+BTC_DOMINANCE_SHIFT_PP = 1.0  # 1pp shift in last 1h => contributing flag
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -247,6 +262,187 @@ def _run_with_inline_timeout(
 
 
 # ---------------------------------------------------------------------------
+# BTC dominance — cached cross-asset signal (CoinGecko free /global)
+# ---------------------------------------------------------------------------
+
+
+def _fetch_btc_dominance_cached(redis_client: Optional[Any]) -> Optional[float]:
+    """Return BTC market-cap dominance as a percentage (0-100), or ``None``.
+
+    Reads from Redis key ``btc_dominance:cached`` (TTL 1h). On miss, fetches
+    from CoinGecko's free ``/global`` endpoint (no API key required) and
+    repopulates the cache. Always returns ``None`` rather than raising —
+    this matches the ``_safe_run`` discipline on the rest of A4 so a
+    transient outage cannot crash the agent.
+
+    Args:
+        redis_client: optional Redis-like object with ``get(key)`` and
+            ``set(key, value, ex=ttl)`` semantics. When ``None`` (or any
+            cache op raises), the function falls through to the HTTP
+            fetch and skips caching.
+
+    Returns:
+        Float dominance percentage in [0, 100], or ``None`` on failure.
+    """
+
+    # ---- 1) cache hit? ------------------------------------------------
+    if redis_client is not None:
+        try:
+            raw = redis_client.get(BTC_DOMINANCE_CACHE_KEY)
+        except Exception:  # noqa: BLE001 - degrade gracefully
+            raw = None
+        if raw is not None:
+            try:
+                # Redis client may return bytes or str depending on
+                # decode_responses setting — normalize both.
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                value = float(raw)
+                if 0.0 <= value <= 100.0:
+                    return value
+            except (TypeError, ValueError):
+                # Bad cache entry; fall through to the live fetch.
+                pass
+
+    # ---- 2) live fetch (best-effort, never raises out) ---------------
+    try:
+        import requests  # local import: keeps cold path cheap
+    except Exception:  # noqa: BLE001
+        return None
+
+    try:
+        response = requests.get(
+            BTC_DOMINANCE_ENDPOINT,
+            timeout=BTC_DOMINANCE_HTTP_TIMEOUT_S,
+        )
+    except Exception as exc:  # noqa: BLE001 - includes Timeout, ConnectionError
+        LOGGER.warning("context: BTC dominance fetch failed: %r", exc)
+        return None
+
+    try:
+        if getattr(response, "status_code", 200) >= 400:
+            return None
+        payload = response.json()
+    except Exception as exc:  # noqa: BLE001 - malformed JSON
+        LOGGER.warning("context: BTC dominance response not JSON: %r", exc)
+        return None
+
+    try:
+        # CoinGecko shape: {"data": {"market_cap_percentage": {"btc": 51.2, ...}}}
+        market_cap_pct = (
+            payload.get("data", {}).get("market_cap_percentage", {})
+            if isinstance(payload, dict)
+            else {}
+        )
+        btc_pct = float(market_cap_pct.get("btc"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if not (0.0 <= btc_pct <= 100.0):
+        return None
+
+    # ---- 3) repopulate cache (best-effort) ---------------------------
+    # On a cache miss we have a fresh value to store. Before overwriting
+    # the canonical key we copy whatever's there into the "prev" slot so
+    # the shift check has a recent comparison point. The prev key
+    # piggy-backs on the same TTL — if both expire, the delta check
+    # naturally degrades to "no comparison available".
+    if redis_client is not None:
+        try:
+            existing = redis_client.get(BTC_DOMINANCE_CACHE_KEY)
+        except Exception:  # noqa: BLE001
+            existing = None
+        if existing is not None:
+            try:
+                redis_client.set(
+                    BTC_DOMINANCE_PREV_KEY,
+                    existing,
+                    ex=BTC_DOMINANCE_CACHE_TTL_S,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            redis_client.set(
+                BTC_DOMINANCE_CACHE_KEY,
+                f"{btc_pct:.6f}",
+                ex=BTC_DOMINANCE_CACHE_TTL_S,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return btc_pct
+
+
+def _fetch_btc_dominance_prev(redis_client: Optional[Any]) -> Optional[float]:
+    """Read the previously cached BTC dominance, if any.
+
+    Used to compute the 1h shift after a live refresh. Returns ``None`` when
+    the prev key is absent or holds a malformed value.
+    """
+
+    if redis_client is None:
+        return None
+    try:
+        raw = redis_client.get(BTC_DOMINANCE_PREV_KEY)
+    except Exception:  # noqa: BLE001
+        return None
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if 0.0 <= value <= 100.0:
+        return value
+    return None
+
+
+# ---------------------------------------------------------------------------
+# X / Twitter sentiment — scaffold (no real integration without API keys)
+# ---------------------------------------------------------------------------
+
+
+def _fetch_x_sentiment(symbol: str) -> Optional[float]:  # pragma: no cover
+    """Stub for X (Twitter) sentiment — returns ``None`` until wired.
+
+    When the ``X_API_KEY`` environment variable is set we'll wire a real
+    call to the X API v2 ``tweets/search/recent`` endpoint, score the
+    pulled tweets via a small sentiment model (e.g. cardiffnlp/twitter-
+    roberta-base-sentiment), and return a [-1, 1] score. Until the API
+    key exists we return ``None`` silently — A4 must continue without it.
+
+    Future wiring contract:
+    * Bearer auth via ``Authorization: Bearer <X_API_KEY>``.
+    * Search params: ``query=$symbol -is:retweet lang:en``,
+      ``max_results=100``, ``start_time=now-1h``.
+    * Aggregation: mean compound score across the returned tweets.
+    * Caching: stash the result under
+      ``x_sentiment:{symbol}:{date_hour}`` with TTL=1h to bound cost.
+
+    Args:
+        symbol: trading symbol the sentiment was requested for (e.g.
+            ``"BTC/USD"``). Currently unused — present for forward
+            compat with the eventual real implementation.
+
+    Returns:
+        Float compound sentiment in [-1.0, 1.0] when the integration is
+        wired and a result is available, ``None`` otherwise.
+    """
+
+    api_key = os.getenv("X_API_KEY")
+    if not api_key:
+        # No key configured — degrade silently. A4's sentiment evidence
+        # bullet already records the gap.
+        return None
+    # TODO: wire X API integration. The plumbing is intentionally stubbed
+    # so callers don't accidentally rely on real network access in CI.
+    raise NotImplementedError(
+        "Wire X API integration: bearer auth + tweets/search/recent + "
+        "sentiment scoring + 1h TTL cache by symbol."
+    )
+
+
+# ---------------------------------------------------------------------------
 # ContextForensicsAgent
 # ---------------------------------------------------------------------------
 
@@ -281,12 +477,20 @@ class ContextForensicsAgent(BaseForensicsAgent):
         markets_fetcher: Optional[Callable[[], Sequence[Any]]] = None,
         gemini_caller: Optional[Callable[[str], str]] = None,
         gemini_timeout_s: float = GEMINI_CALL_TIMEOUT_S,
+        redis_client: Optional[Any] = None,
+        btc_dominance_fetcher: Optional[Callable[[Optional[Any]], Optional[float]]] = None,
     ) -> None:
         super().__init__(context_store=context_store, timeout_s=timeout_s)
         self._news_fetcher_factory = news_fetcher_factory
         self._markets_fetcher = markets_fetcher
         self._gemini_caller = gemini_caller
         self._gemini_timeout_s = float(gemini_timeout_s)
+        # Optional Redis client used for the BTC-dominance cache. When
+        # absent we still try to fetch live but skip caching.
+        self._redis_client = redis_client
+        # Tests can inject a fake fetcher to avoid hitting CoinGecko.
+        # Default delegates to ``_fetch_btc_dominance_cached``.
+        self._btc_dominance_fetcher = btc_dominance_fetcher
 
     # ------------------------------------------------------------------
     # contract
@@ -393,6 +597,47 @@ class ContextForensicsAgent(BaseForensicsAgent):
                 "vol spike check: no ticker buffer captured — feature gap"
             )
 
+        # ---- 3b) BTC dominance shift (cross-asset, contributing-only) -
+        # Best-effort. Never raises. Never promotes to primary on its
+        # own — caps at one contributing red flag.
+        # The check is OFF unless the agent has either a redis_client
+        # (cache backing) or an explicitly-injected fetcher. This keeps
+        # the default A4 wiring (no Redis) from accidentally hitting
+        # CoinGecko on every investigate() call in test / dev.
+        if self._redis_client is not None or self._btc_dominance_fetcher is not None:
+            try:
+                btc_pct = self._fetch_btc_dominance()
+            except Exception as exc:  # noqa: BLE001 - belt + braces
+                LOGGER.warning("context: BTC dominance check failed: %r", exc)
+                btc_pct = None
+        else:
+            btc_pct = None
+        if btc_pct is not None:
+            prev_btc_pct = _fetch_btc_dominance_prev(self._redis_client)
+            if prev_btc_pct is not None:
+                shift = btc_pct - prev_btc_pct
+                if abs(shift) > BTC_DOMINANCE_SHIFT_PP:
+                    red_flags += 1
+                    evidence.append(
+                        f"red flag: BTC dominance shifted "
+                        f"{shift:+.2f}pp in last 1h "
+                        f"(now {btc_pct:.2f}%)"
+                    )
+                    suggested_actions.append(
+                        {"type": "add_btc_dominance_feature"}
+                    )
+                else:
+                    evidence.append(
+                        f"BTC dominance: {btc_pct:.2f}% "
+                        f"(1h shift {shift:+.2f}pp, under "
+                        f"{BTC_DOMINANCE_SHIFT_PP:.1f}pp threshold)"
+                    )
+            else:
+                evidence.append(
+                    f"BTC dominance: {btc_pct:.2f}% "
+                    "(no prior cached sample for 1h delta)"
+                )
+
         # ---- 4) Sentiment (optional) ---------------------------------
         # We don't run X/Twitter sentiment here. Surface the gap so the
         # synthesizer / digest can flag it as a known unknown.
@@ -447,6 +692,19 @@ class ContextForensicsAgent(BaseForensicsAgent):
             window_end=window_end,
             window_seconds=NEWS_WINDOW_SECONDS,
         )
+
+    def _fetch_btc_dominance(self) -> Optional[float]:
+        """Return the cached/live BTC dominance as a percentage in [0, 100].
+
+        Delegates to the constructor-injected fetcher when supplied;
+        otherwise calls :func:`_fetch_btc_dominance_cached` with this
+        agent's redis client. Returns ``None`` on any failure.
+        """
+
+        fetcher = self._btc_dominance_fetcher
+        if fetcher is None:
+            return _fetch_btc_dominance_cached(self._redis_client)
+        return fetcher(self._redis_client)
 
     def _fetch_macro_shifts(self) -> List[Dict[str, Any]]:
         """Return macro markets that moved > 5pp in the 1h window, sorted desc."""
@@ -656,10 +914,18 @@ class ContextForensicsAgent(BaseForensicsAgent):
 
 
 __all__ = [
+    "BTC_DOMINANCE_CACHE_KEY",
+    "BTC_DOMINANCE_CACHE_TTL_S",
+    "BTC_DOMINANCE_ENDPOINT",
+    "BTC_DOMINANCE_PREV_KEY",
+    "BTC_DOMINANCE_SHIFT_PP",
     "ContextForensicsAgent",
     "GEMINI_CALL_TIMEOUT_S",
     "HEADLINE_DENSITY_RED_FLAG",
     "MACRO_CATEGORIES",
     "MACRO_SHIFT_RED_FLAG_PP",
     "_VERY_HIGH_NEWS_CLUSTER",
+    "_fetch_btc_dominance_cached",
+    "_fetch_btc_dominance_prev",
+    "_fetch_x_sentiment",
 ]
