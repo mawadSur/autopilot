@@ -461,6 +461,12 @@ class TestConfidenceFloor(unittest.TestCase):
 
 class TestPaperModeSynthesisesFill(unittest.TestCase):
     def test_run_once_paper_synthesizes_fill_when_mode_paper(self) -> None:
+        """Paper fill is deferred-to-next-tick (P0 #4 state machine).
+
+        First ``run_once`` emits a signal and queues a PendingPaperFill;
+        no position is recorded yet. The next ``run_once`` drains the queue
+        against the *next* tick's ticker — that is the fill price.
+        """
         store = StubPositionStore()
         exch = StubExchange(ticker_mid=2_000.0)
         sup, refs = _build_supervisor(
@@ -469,14 +475,19 @@ class TestPaperModeSynthesisesFill(unittest.TestCase):
             exchange=exch,
             predict_fn=lambda s, t: ("buy", 0.9),
         )
+        # Signal tick: queue, no live order, no recorded fill yet.
         ticks = sup.run_once()
         self.assertEqual(ticks[0].action_taken, "allowed")
-        # No live order placed.
         self.assertEqual(len(exch.market_orders), 0)
-        # Position recorded synthetically.
+        self.assertEqual(len(store.recorded_open), 0)
+        # Now flip the ticker so we can prove the fill price comes from
+        # the SECOND tick, not the first.
+        exch.ticker_mid = 2_050.0
+        sup.run_once()
+        self.assertEqual(len(exch.market_orders), 0)
         self.assertEqual(len(store.recorded_open), 1)
         synth = store.recorded_open[0]
-        expected_price = 2_000.0 * (1.0 + PAPER_SLIPPAGE_BPS / 10_000.0)
+        expected_price = 2_050.0 * (1.0 + PAPER_SLIPPAGE_BPS / 10_000.0)
         self.assertAlmostEqual(synth.entry_price, expected_price, places=6)
         self.assertEqual(synth.exchange, "coinbase-paper")
         self.assertEqual(synth.side, "long")
@@ -484,6 +495,8 @@ class TestPaperModeSynthesisesFill(unittest.TestCase):
 
 class TestLiveLockedFallsBackToPaper(unittest.TestCase):
     def test_run_once_live_blocked_when_shakedown_not_unlocked(self) -> None:
+        """Locked-live -> paper fallback uses the same defer-to-next-tick
+        state machine as direct paper mode (P0 #4)."""
         store = StubPositionStore()
         exch = StubExchange(ticker_mid=2_000.0)
         sup, refs = _build_supervisor(
@@ -493,14 +506,97 @@ class TestLiveLockedFallsBackToPaper(unittest.TestCase):
             position_store=store,
             exchange=exch,
         )
+        # Signal tick: queues a pending paper fill but does NOT record it.
         ticks = sup.run_once()
         self.assertEqual(ticks[0].action_taken, "halted_breaker")
         self.assertEqual(ticks[0].notes, "live_mode_locked")
-        # No live order placed.
         self.assertEqual(len(exch.market_orders), 0)
-        # But paper-trade fallback recorded a synthetic position.
+        self.assertEqual(len(store.recorded_open), 0)
+        # Next tick drains the queue and synthesises the fill.
+        sup.run_once()
         self.assertEqual(len(store.recorded_open), 1)
         self.assertEqual(store.recorded_open[0].exchange, "coinbase-paper")
+
+
+class TestPaperFillDeferredToNextTick(unittest.TestCase):
+    """P0 #4 regression: paper fill price MUST come from the next tick's
+    ticker, not the same ticker that produced the signal.
+
+    Without this guard, a live-trader paper backtest secretly leaks the
+    signal-tick mid into the fill price -- a subtle but very real
+    look-ahead bias that inflates apparent edge.
+    """
+
+    def test_paper_fill_uses_next_tick_price_not_signal_tick(self) -> None:
+        from live_supervisor import PendingPaperFill
+
+        store = StubPositionStore()
+        exch = StubExchange(ticker_mid=1_000.0)
+        sup, _ = _build_supervisor(
+            mode="paper",
+            position_store=store,
+            exchange=exch,
+            predict_fn=lambda s, t: ("buy", 0.95),
+        )
+        # First tick at 1000 -- queue, no fill recorded.
+        sup.run_once()
+        self.assertEqual(len(store.recorded_open), 0)
+        self.assertIn("ETH/USDT", sup._pending_paper_fills)
+        self.assertIsInstance(
+            sup._pending_paper_fills["ETH/USDT"], PendingPaperFill
+        )
+
+        # Second tick at 3000 -- the fill is synthesised here against the
+        # NEW ticker. The first-tick ticker (1000) must not appear in the
+        # fill price; the second-tick ticker (3000) plus 5 bps slippage is
+        # the only valid price.
+        exch.ticker_mid = 3_000.0
+        # Predictor returns < floor so no NEW signal is queued.
+        sup.model_predict_fn = lambda s, t: ("buy", 0.1)
+        sup.run_once()
+        self.assertEqual(len(store.recorded_open), 1)
+        recorded = store.recorded_open[0]
+        slip = PAPER_SLIPPAGE_BPS / 10_000.0
+        self.assertAlmostEqual(
+            recorded.entry_price, 3_000.0 * (1.0 + slip), places=4
+        )
+        # Pending queue is now empty.
+        self.assertNotIn("ETH/USDT", sup._pending_paper_fills)
+
+    def test_stale_pending_fill_dropped_after_max_age_ticks(self) -> None:
+        """A pending fill older than 2 ticks is dropped, not filled."""
+        from live_supervisor import (
+            PAPER_PENDING_FILL_MAX_AGE_TICKS,
+            PendingPaperFill,
+        )
+
+        store = StubPositionStore()
+        exch = StubExchange(ticker_mid=2_000.0)
+        sup, _ = _build_supervisor(
+            mode="paper",
+            position_store=store,
+            exchange=exch,
+            predict_fn=lambda s, t: ("buy", 0.1),  # always below floor
+        )
+        # Manually inject a stale pending fill (enqueued at tick 0, but
+        # we'll claim the current tick index is way ahead).
+        sup._pending_paper_fills["ETH/USDT"] = PendingPaperFill(
+            symbol="ETH/USDT",
+            side="buy",
+            quote_size_usd=50.0,
+            base_size=0.025,
+            signal_tick_at="2026-04-26T11:00:00+00:00",
+            slippage_bps=PAPER_SLIPPAGE_BPS,
+            enqueued_tick_index=0,
+        )
+        # Pretend we already advanced N ticks beyond the max age.
+        sup._symbol_tick_index["ETH/USDT"] = (
+            PAPER_PENDING_FILL_MAX_AGE_TICKS + 5
+        )
+        sup.run_once()
+        # Fill was DROPPED, not synthesised.
+        self.assertEqual(len(store.recorded_open), 0)
+        self.assertNotIn("ETH/USDT", sup._pending_paper_fills)
 
 
 class TestLiveAllowedAfterShakedown(unittest.TestCase):

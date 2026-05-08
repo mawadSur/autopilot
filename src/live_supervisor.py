@@ -41,6 +41,7 @@ testing — every Phase 1-4 collaborator is injected at construction time.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import os
@@ -91,6 +92,35 @@ def _capture_exception(exc: BaseException) -> None:
 # 5 bps = 0.05% -- conservative but representative of real Coinbase taker
 # slippage on liquid majors. Buys eat ask side, sells eat bid side.
 PAPER_SLIPPAGE_BPS = 5.0
+
+
+# A paper-mode signal is queued at one tick and filled at the next tick's
+# ticker price (the supervisor's best approximation of the next-bar open
+# relative to the signal). Pending fills older than this many ticks are
+# treated as stale and dropped with a warning -- a long-deferred fill is
+# almost certainly a sign the supervisor was paused / lost ticks for the
+# symbol.
+PAPER_PENDING_FILL_MAX_AGE_TICKS = 2
+
+
+@dataclasses.dataclass
+class PendingPaperFill:
+    """A paper-trade signal that has been emitted but not yet filled.
+
+    The supervisor consumes one pending entry per symbol per tick. The
+    fill price is the ticker observed at the *consuming* tick, not the
+    signal tick — this approximates "fill at next bar open" rather than
+    "fill at signal-tick mid", removing the magic look-ahead that came
+    from immediately filling at the same ticker that produced the signal.
+    """
+
+    symbol: str
+    side: Literal["buy", "sell"]
+    quote_size_usd: float
+    base_size: float
+    signal_tick_at: str
+    slippage_bps: float
+    enqueued_tick_index: int = 0
 
 
 _ActionTaken = Literal[
@@ -291,6 +321,17 @@ class Supervisor:
         # One-time warning latches, keyed by symbol so the live-locked
         # warning fires once per locked symbol per process.
         self._warned_live_locked: Dict[str, bool] = {}
+
+        # Defer-to-next-tick paper fill state machine: one pending fill per
+        # symbol. Populated when paper mode produces a signal; drained at
+        # the start of the next tick for that symbol against the live
+        # ticker. See PendingPaperFill above for the rationale.
+        self._pending_paper_fills: Dict[str, PendingPaperFill] = {}
+        # Monotonic per-symbol tick counter, used to age out stale pending
+        # fills (anything older than PAPER_PENDING_FILL_MAX_AGE_TICKS).
+        self._symbol_tick_index: Dict[str, int] = {
+            sym: 0 for sym in config.symbols
+        }
 
         # Hydrate (or initialise) the shakedown evidence file.
         self.shakedown_state: ShakedownState = self._load_or_init_shakedown()
@@ -680,6 +721,15 @@ class Supervisor:
                 notes=f"get_ticker: {exc!r}",
             )
 
+        # 2b. Bump per-symbol tick index, then drain any pending paper fill
+        # against the FRESH ticker. This is the heart of the
+        # defer-to-next-tick state machine -- the fill price for a paper
+        # signal emitted at tick N is the ticker observed at tick N+1.
+        self._symbol_tick_index[symbol] = (
+            self._symbol_tick_index.get(symbol, 0) + 1
+        )
+        self._drain_pending_paper_fill(symbol, ticker)
+
         # 3. Build context + run breakers.
         proposed = float(self.config.bankroll_usd) * float(
             self.config.risk_pct_per_trade
@@ -904,25 +954,90 @@ class Supervisor:
         ticker: Ticker,
         proposed_usd: float,
     ) -> None:
-        """Synthesise a paper-trade fill and record it directly.
+        """Queue a paper-trade signal for next-tick fill (P0 #4).
 
-        Slippage model: 5 bps off the ticker mid, signed against the order
-        (buys pay above mid, sells receive below mid). Fees are zeroed.
+        The classic mistake here was to fill at the *current* ticker mid,
+        which leaks the same bar that produced the signal back into the
+        fill price (a kind of look-ahead bias). The defer-to-next-tick
+        state machine instead records a :class:`PendingPaperFill` against
+        ``symbol``; the *next* tick that runs ``_tick_symbol(symbol)``
+        drains the queue and synthesises the actual position using the
+        ticker observed at that later tick.
+
+        Slippage at 5 bps is still applied -- but only when the deferred
+        fill consumes against the next ticker.
+
+        If a pending fill already exists for ``symbol`` (eg. the previous
+        tick produced a signal that hasn't been drained yet), the existing
+        one is replaced with the newer signal: the next tick consumes only
+        one entry, and a fresher signal is more representative of intent.
         """
-        slip = PAPER_SLIPPAGE_BPS / 10_000.0
-        if side == "buy":
+        # Compute base size off the *signal-tick* ticker only as a
+        # provisional sizing input -- the actual fill price is set when
+        # the pending entry is drained.
+        provisional_price = float(ticker.mid) or 1.0
+        base_size = float(proposed_usd) / provisional_price
+        self._pending_paper_fills[symbol] = PendingPaperFill(
+            symbol=symbol,
+            side=side,
+            quote_size_usd=float(proposed_usd),
+            base_size=base_size,
+            signal_tick_at=self._now().isoformat(),
+            slippage_bps=PAPER_SLIPPAGE_BPS,
+            enqueued_tick_index=self._symbol_tick_index.get(symbol, 0),
+        )
+        LOGGER.info(
+            "paper signal queued for next-tick fill: %s side=%s notional=%.2f USD "
+            "(provisional_price=%.4f)",
+            symbol,
+            side,
+            float(proposed_usd),
+            provisional_price,
+        )
+
+    def _drain_pending_paper_fill(
+        self, symbol: str, ticker: Ticker
+    ) -> Optional[Position]:
+        """Consume a queued :class:`PendingPaperFill` against ``ticker``.
+
+        Returns the recorded :class:`Position` if a fill was synthesised,
+        ``None`` otherwise. Stale pending fills (older than
+        :data:`PAPER_PENDING_FILL_MAX_AGE_TICKS` ticks) are discarded with
+        a WARNING -- a long-deferred fill almost always means the
+        supervisor lost ticks for that symbol and re-using the signal would
+        compound the error.
+        """
+        pending = self._pending_paper_fills.pop(symbol, None)
+        if pending is None:
+            return None
+
+        current_tick_index = self._symbol_tick_index.get(symbol, 0)
+        age_ticks = current_tick_index - pending.enqueued_tick_index
+        if age_ticks > PAPER_PENDING_FILL_MAX_AGE_TICKS:
+            LOGGER.warning(
+                "paper fill: dropping stale pending signal for %s "
+                "(age=%d ticks > max=%d); signal_at=%s",
+                symbol,
+                age_ticks,
+                PAPER_PENDING_FILL_MAX_AGE_TICKS,
+                pending.signal_tick_at,
+            )
+            return None
+
+        slip = float(pending.slippage_bps) / 10_000.0
+        if pending.side == "buy":
             fill_price = float(ticker.mid) * (1.0 + slip)
         else:
             fill_price = float(ticker.mid) * (1.0 - slip)
         if fill_price <= 0:
             fill_price = float(ticker.mid) or 1.0
 
-        base_size = float(proposed_usd) / fill_price
+        base_size = float(pending.quote_size_usd) / fill_price
         position = Position(
             position_id=str(uuid.uuid4()),
             exchange="coinbase-paper",
             symbol=symbol,
-            side="long" if side == "buy" else "short",
+            side="long" if pending.side == "buy" else "short",
             status="open",
             entry_price=fill_price,
             entry_quote_usd=fill_price * base_size,
@@ -930,9 +1045,19 @@ class Supervisor:
             entry_order_id=f"paper-{uuid.uuid4().hex[:12]}",
             opened_at_utc=self._now().isoformat(),
             fees_usd=0.0,
-            notes="paper-simulated",
+            notes="paper-deferred-fill",
         )
         self.position_store.record_open(position)
+        LOGGER.info(
+            "paper fill: drained pending %s side=%s at next-tick price %.4f "
+            "(signal_at=%s, fill_at=%s)",
+            symbol,
+            pending.side,
+            fill_price,
+            pending.signal_tick_at,
+            position.opened_at_utc,
+        )
+        return position
 
     def _position_from_order(
         self,
