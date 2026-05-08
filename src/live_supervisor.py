@@ -95,6 +95,112 @@ def _capture_exception(exc: BaseException) -> None:
 PAPER_SLIPPAGE_BPS = 5.0
 
 
+# Exponential backoff (seconds) used when an exclusive flock on the
+# shakedown JSON is contested. Five attempts spread over ~310ms total --
+# generous enough to ride out a peer process's atomic-rename window
+# without hanging the loop on a stuck holder.
+_SHAKEDOWN_LOCK_BACKOFF_S: Tuple[float, ...] = (0.010, 0.020, 0.040, 0.080, 0.160)
+
+
+class _NullLock:
+    """Best-effort no-op file-lock context manager.
+
+    Returned when the platform doesn't expose ``fcntl`` (Windows) or the
+    lock acquisition fails after exhausting the backoff schedule. We
+    prefer to keep persisting state under contention rather than crash;
+    the supervisor can always re-load and re-write on the next iteration.
+    """
+
+    def __enter__(self) -> "_NullLock":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+
+class _FileLock:
+    """``fcntl.flock(LOCK_EX | LOCK_NB)`` with exponential-backoff retries.
+
+    Python's ``fcntl`` works on macOS and Linux; on Windows the supervisor
+    falls back to :class:`_NullLock`. The lock is held for the duration
+    of the ``with`` block and released by closing the underlying fd.
+    """
+
+    def __init__(self, path: Path, *, exclusive: bool = True) -> None:
+        self._path = Path(path)
+        self._exclusive = exclusive
+        self._fd: Optional[int] = None
+
+    def __enter__(self) -> "_FileLock":
+        try:
+            import fcntl  # type: ignore[import-not-found]
+        except ImportError:
+            # Windows or otherwise unavailable: act like _NullLock.
+            return self
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        # Open the lock file (we lock the SAME file we read/write so that
+        # a fresh process opening it also sees the lock; using a sibling
+        # ``.lock`` file would be slightly cleaner but means more state
+        # to manage on disk).
+        flags = os.O_CREAT | os.O_RDWR
+        self._fd = os.open(str(self._path), flags, 0o644)
+        op = fcntl.LOCK_EX if self._exclusive else fcntl.LOCK_SH
+        op |= fcntl.LOCK_NB
+        for delay in _SHAKEDOWN_LOCK_BACKOFF_S:
+            try:
+                fcntl.flock(self._fd, op)
+                return self
+            except OSError:
+                time.sleep(delay)
+        # One last attempt without backoff.
+        try:
+            fcntl.flock(self._fd, op)
+        except OSError as exc:
+            LOGGER.warning(
+                "shakedown lock contended for %s after %d retries (%s); "
+                "proceeding without lock",
+                self._path,
+                len(_SHAKEDOWN_LOCK_BACKOFF_S),
+                exc,
+            )
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._fd is None:
+            return
+        try:
+            import fcntl  # type: ignore[import-not-found]
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        except Exception:  # noqa: BLE001 - best-effort unlock
+            pass
+        try:
+            os.close(self._fd)
+        except OSError:
+            pass
+        self._fd = None
+
+
+def _acquire_file_lock(path: Path, *, exclusive: bool = True) -> Any:
+    """Return a context manager protecting ``path`` from concurrent writers.
+
+    On platforms with ``fcntl`` the lock is process-shared and protects
+    against multi-process races (the D1 multiprocessing-per-symbol
+    deployment makes this mandatory, not optional). On platforms without
+    ``fcntl`` the returned object is a no-op so the call site doesn't
+    have to branch.
+    """
+    try:
+        import fcntl  # noqa: F401  - test for availability only
+    except ImportError:
+        return _NullLock()
+    return _FileLock(path, exclusive=exclusive)
+
+
 # A paper-mode signal is queued at one tick and filled at the next tick's
 # ticker price (the supervisor's best approximation of the next-bar open
 # relative to the signal). Pending fills older than this many ticks are
@@ -353,33 +459,55 @@ class Supervisor:
     # Shakedown persistence
     # ------------------------------------------------------------------
     def _load_or_init_shakedown(self) -> ShakedownState:
+        """flock-guarded boot-time read of the shakedown state.
+
+        Boot-time read is part of the same race that ``_persist_shakedown``
+        guards on the write side: without an exclusive lock here, two
+        processes booting simultaneously can both observe a partial blob
+        from each other's atomic-rename window and mutually wipe the
+        shakedown counters. The lock is held for the duration of the
+        read + (optional) re-persist after migration.
+        """
         path = self.config.shakedown_state_path
-        if path.exists():
-            try:
-                blob = path.read_text(encoding="utf-8")
-                state, was_migrated = self._parse_shakedown_blob(blob)
-                # Make sure every configured symbol has an entry so callers
-                # can rely on ``per_symbol[symbol]`` after construction.
-                missing_symbols = [
-                    s for s in self.config.symbols if s not in state.per_symbol
-                ]
-                for sym in missing_symbols:
+        with _acquire_file_lock(path, exclusive=True):
+            if path.exists():
+                try:
+                    blob = path.read_text(encoding="utf-8")
+                    state, was_migrated = self._parse_shakedown_blob(blob)
+                    # Make sure every configured symbol has an entry so
+                    # callers can rely on ``per_symbol[symbol]``.
+                    missing_symbols = [
+                        s for s in self.config.symbols
+                        if s not in state.per_symbol
+                    ]
+                    for sym in missing_symbols:
+                        state.get_or_init(sym)
+                    # Persist if we migrated or added new symbols. This is
+                    # done OUTSIDE the lock context to avoid re-acquiring
+                    # the same lock recursively (fcntl flock isn't
+                    # reentrant on macOS / Linux).
+                    needs_persist = bool(was_migrated or missing_symbols)
+                except Exception as exc:  # noqa: BLE001 - corrupt-file recovery
+                    LOGGER.warning(
+                        "Shakedown state at %s is corrupt (%s); reinitialising.",
+                        path,
+                        exc,
+                    )
+                    state = ShakedownState(started_at_utc=self._now().isoformat())
+                    for sym in self.config.symbols:
+                        state.get_or_init(sym)
+                    needs_persist = True
+                else:
+                    # Successful read.
+                    pass
+            else:
+                state = ShakedownState(started_at_utc=self._now().isoformat())
+                for sym in self.config.symbols:
                     state.get_or_init(sym)
-                # Persist now if we migrated or added new symbols, so the
-                # next process boot reads the canonical layout.
-                if was_migrated or missing_symbols:
-                    self._persist_shakedown(state)
-                return state
-            except Exception as exc:  # noqa: BLE001 - corrupt file recovery
-                LOGGER.warning(
-                    "Shakedown state at %s is corrupt (%s); reinitialising.",
-                    path,
-                    exc,
-                )
-        state = ShakedownState(started_at_utc=self._now().isoformat())
-        for sym in self.config.symbols:
-            state.get_or_init(sym)
-        self._persist_shakedown(state)
+                needs_persist = True
+        # Out of the lock now; re-persist takes its own lock.
+        if needs_persist:
+            self._persist_shakedown(state)
         return state
 
     def _parse_shakedown_blob(self, blob: str) -> Tuple[ShakedownState, bool]:
@@ -485,10 +613,43 @@ class Supervisor:
             return 0
 
     def _persist_shakedown(self, state: ShakedownState) -> None:
+        """Atomic, flock-guarded write of the shakedown state file.
+
+        Under D1's multiprocessing-per-symbol model, two booting peers can
+        race on this file -- without flock + atomic-rename, one peer can
+        read a torn JSON blob and reset clean-day counters to 0. The
+        sequence here:
+
+          1. Acquire an exclusive flock on the canonical path.
+          2. Write the new JSON to a sibling ``.tmp`` file.
+          3. fsync the tmp file so the bytes are durable before rename.
+          4. ``os.replace`` (atomic on POSIX) the tmp over the canonical.
+          5. Release the lock.
+
+        Failures are swallowed (with a WARNING) -- the supervisor must
+        keep ticking even if disk IO falters; the in-memory state is the
+        live source of truth for the current process.
+        """
         path = self.config.shakedown_state_path
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(state.model_dump_json(indent=2), encoding="utf-8")
+            blob = state.model_dump_json(indent=2)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with _acquire_file_lock(path, exclusive=True):
+                # Write + fsync into the tmp file.
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write(blob)
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        # Some filesystems (tmpfs) don't support fsync;
+                        # the rename below is still effectively atomic.
+                        pass
+                # Atomic rename. ``os.replace`` overwrites on POSIX +
+                # Windows; ``Path.rename`` would raise on Windows when
+                # the target exists.
+                os.replace(tmp, path)
         except Exception as exc:  # noqa: BLE001 - best-effort persistence
             LOGGER.warning("Failed to persist shakedown state to %s: %s", path, exc)
 

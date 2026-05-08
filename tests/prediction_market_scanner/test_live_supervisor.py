@@ -1214,6 +1214,86 @@ class TestRedisBackedErrorCounter(unittest.TestCase):
         )
 
 
+class TestShakedownFileLock(unittest.TestCase):
+    """P0 #2: persisted shakedown state is flock-guarded + atomic-renamed.
+
+    Two booting peers can no longer mutually wipe each other's clean-day
+    counters by reading a partial JSON blob mid-write.
+    """
+
+    def test_persist_uses_atomic_rename(self) -> None:
+        """A partial write to the .tmp sibling must be invisible from the
+        canonical path's perspective (the rename is atomic)."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "shake.json"
+            sup, _ = _build_supervisor(shakedown_path=path)
+            # First persist creates the canonical file.
+            self.assertTrue(path.exists())
+            # The .tmp file must NOT linger after a clean rename.
+            self.assertFalse(
+                (path.with_suffix(path.suffix + ".tmp")).exists(),
+                "tmp file should have been renamed away",
+            )
+            # Second persist on a slightly different state still leaves
+            # only the canonical file behind.
+            sup.shakedown_state.get_or_init("ETH/USDT").paper_days_clean = 5
+            sup._persist_shakedown(sup.shakedown_state)
+            self.assertFalse((path.with_suffix(path.suffix + ".tmp")).exists())
+            # Re-read confirms write committed.
+            sup2, _ = _build_supervisor(shakedown_path=path)
+            self.assertEqual(
+                sup2.shakedown_state.per_symbol["ETH/USDT"].paper_days_clean, 5
+            )
+
+    def test_concurrent_writers_serialize_via_flock(self) -> None:
+        """Two threads writing simultaneously each leave a valid JSON blob
+        on disk -- no torn reads, no half-written files. We can't easily
+        prove "this is a flock that serialised them" without intercepting
+        kernel calls, but we CAN prove the invariant: the final file is
+        always parseable."""
+        import threading
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "concurrent.json"
+            sup, _ = _build_supervisor(shakedown_path=path)
+            errors: List[BaseException] = []
+
+            def writer(days: int) -> None:
+                try:
+                    s = sup.shakedown_state.model_copy(deep=True)
+                    s.get_or_init("ETH/USDT").paper_days_clean = days
+                    sup._persist_shakedown(s)
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=writer, args=(i,)) for i in range(8)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertFalse(errors, f"writer thread errored: {errors!r}")
+            # Final file must be parseable.
+            blob = path.read_text(encoding="utf-8")
+            loaded = ShakedownState.model_validate_json(blob)
+            # The exact paper_days_clean value depends on which writer
+            # last won the lock -- the contract is just "no torn reads".
+            self.assertIn("ETH/USDT", loaded.per_symbol)
+
+    def test_load_path_flock_protects_from_simulated_partial_blob(self) -> None:
+        """Even if the file currently contains an unparseable blob (a
+        partial write from a peer that crashed), the supervisor must
+        recover by reinitialising rather than crashing."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "bad.json"
+            # Simulate a peer that crashed mid-write.
+            path.write_text("{not json", encoding="utf-8")
+            sup, _ = _build_supervisor(shakedown_path=path)
+            # Recovered cleanly with fresh state, NOT a crash.
+            self.assertEqual(sup.shakedown_state.paper_days_clean, 0)
+
+
 class TestRunDirOutputSaving(unittest.TestCase):
     """``--log-dir`` flag creates a timestamped subdir + FileHandler."""
 
