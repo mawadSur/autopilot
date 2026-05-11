@@ -16,11 +16,14 @@ from typing import List
 import numpy as np
 import pandas as pd
 
+from unittest.mock import MagicMock, patch
+
 from alpha_lab.correlation_miner import FeatureSource
 from alpha_lab.feature_sources import (
     CryptoFeatureSource,
     PolymarketFeatureSource,
     build_default_feature_sources,
+    make_clob_history_fetcher,
 )
 
 
@@ -221,6 +224,146 @@ class FactoryTests(unittest.TestCase):
         # Skeleton state: no production sources wired. Operators override
         # build_default_feature_sources via a deploy-only module.
         self.assertEqual(build_default_feature_sources(), [])
+
+
+class ClobHistoryFetcherTests(unittest.TestCase):
+    """Tests for ``make_clob_history_fetcher`` — the production wiring of
+    ``PolymarketFeatureSource`` against the CLOB ``prices-history`` endpoint."""
+
+    def _samples(self, start: datetime, n: int = 3):
+        return [
+            (start + timedelta(hours=i), 0.40 + 0.05 * i) for i in range(n)
+        ]
+
+    def test_fetcher_calls_upstream_and_returns_dataframe(self) -> None:
+        start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        upstream = MagicMock(return_value=self._samples(start))
+        with patch(
+            "alpha_lab.feature_sources.fetch_market_price_history",
+            new=upstream,
+        ):
+            fetch = make_clob_history_fetcher()
+            df = fetch("0xmarket", start, end)
+        upstream.assert_called_once()
+        self.assertEqual(list(df.columns), ["midpoint"])
+        self.assertEqual(len(df), 3)
+        self.assertIsNotNone(df.index.tz)
+
+    def test_inmemory_cache_short_circuits_second_call(self) -> None:
+        start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        upstream = MagicMock(return_value=self._samples(start))
+        with patch(
+            "alpha_lab.feature_sources.fetch_market_price_history",
+            new=upstream,
+        ):
+            fetch = make_clob_history_fetcher(cache_ttl_s=300)
+            fetch("0xmarket", start, end)
+            fetch("0xmarket", start, end)
+        # Second call must hit the in-memory cache, not the upstream.
+        self.assertEqual(upstream.call_count, 1)
+
+    def test_distinct_windows_each_hit_upstream(self) -> None:
+        start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        upstream = MagicMock(return_value=self._samples(start))
+        with patch(
+            "alpha_lab.feature_sources.fetch_market_price_history",
+            new=upstream,
+        ):
+            fetch = make_clob_history_fetcher()
+            fetch("0xmarket", start, start + timedelta(days=1))
+            fetch("0xmarket", start, start + timedelta(days=2))
+        self.assertEqual(upstream.call_count, 2)
+
+    def test_redis_cache_read_short_circuits_upstream(self) -> None:
+        # When Redis has a cached payload, the fetcher should NOT call
+        # upstream and must reconstruct the DataFrame from the cache.
+        start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        cached_payload = {
+            "samples": [
+                [int((start + timedelta(hours=i)).timestamp()), 0.5 + 0.01 * i]
+                for i in range(2)
+            ]
+        }
+        fake_redis = MagicMock()
+        import json as _json
+
+        fake_redis.get.return_value = _json.dumps(cached_payload).encode("utf-8")
+        upstream = MagicMock()
+        with patch(
+            "alpha_lab.feature_sources.fetch_market_price_history",
+            new=upstream,
+        ):
+            fetch = make_clob_history_fetcher(redis_client=fake_redis)
+            df = fetch("0xmarket", start, end)
+        upstream.assert_not_called()
+        self.assertEqual(len(df), 2)
+        self.assertAlmostEqual(float(df["midpoint"].iloc[0]), 0.5)
+
+    def test_redis_cache_write_after_upstream_fetch(self) -> None:
+        start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        fake_redis = MagicMock()
+        fake_redis.get.return_value = None  # cache miss
+        upstream = MagicMock(return_value=self._samples(start, n=2))
+        with patch(
+            "alpha_lab.feature_sources.fetch_market_price_history",
+            new=upstream,
+        ):
+            fetch = make_clob_history_fetcher(redis_client=fake_redis)
+            fetch("0xmarket", start, end)
+        # Upstream called once; setex called with our key prefix.
+        upstream.assert_called_once()
+        fake_redis.setex.assert_called_once()
+        key_arg = fake_redis.setex.call_args[0][0]
+        self.assertTrue(key_arg.startswith("alpha_lab:polymarket_history:"))
+
+    def test_redis_read_failure_falls_through(self) -> None:
+        # If Redis is down on read, the fetcher must still produce results
+        # via the upstream call (in-memory cache also picks up the result).
+        start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        fake_redis = MagicMock()
+        fake_redis.get.side_effect = RuntimeError("redis down")
+        upstream = MagicMock(return_value=self._samples(start, n=1))
+        with patch(
+            "alpha_lab.feature_sources.fetch_market_price_history",
+            new=upstream,
+        ):
+            fetch = make_clob_history_fetcher(redis_client=fake_redis)
+            df = fetch("0xmarket", start, end)
+        upstream.assert_called_once()
+        self.assertEqual(len(df), 1)
+
+    def test_empty_upstream_yields_empty_dataframe(self) -> None:
+        start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        with patch(
+            "alpha_lab.feature_sources.fetch_market_price_history",
+            new=MagicMock(return_value=[]),
+        ):
+            fetch = make_clob_history_fetcher()
+            df = fetch("0xmarket", start, end)
+        self.assertTrue(df.empty)
+        self.assertEqual(list(df.columns), ["midpoint"])
+
+    def test_integrates_with_polymarket_source(self) -> None:
+        start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        upstream = MagicMock(return_value=self._samples(start))
+        with patch(
+            "alpha_lab.feature_sources.fetch_market_price_history",
+            new=upstream,
+        ):
+            src = PolymarketFeatureSource(
+                "0xabc", fetcher=make_clob_history_fetcher()
+            )
+            df = src.fetch_window(start, end)
+        self.assertEqual(list(df.columns), ["midpoint"])
+        self.assertEqual(len(df), 3)
+        self.assertIsNotNone(df.index.tz)
 
 
 if __name__ == "__main__":  # pragma: no cover - manual run

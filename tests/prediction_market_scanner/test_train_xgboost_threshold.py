@@ -54,11 +54,12 @@ class SweepThresholdsTests(unittest.TestCase):
         y = np.concatenate([y_wins, y_losses])
         proba = np.clip(np.concatenate([p_wins, p_losses]), 0.0, 1.0)
 
-        best_thr, per_threshold = _sweep_thresholds_for_sharpe(y, proba)
+        best_thr, per_threshold, status = _sweep_thresholds_for_sharpe(y, proba)
         # The optimal threshold should sit comfortably below 0.85.
         self.assertGreaterEqual(best_thr, 0.3)
         self.assertLess(best_thr, 0.85)
         self.assertGreater(per_threshold[f"{best_thr:.4f}"]["sharpe"], 0)
+        self.assertEqual(status, "ok")
 
     def test_all_zero_labels_defaults_to_05(self) -> None:
         # No wins anywhere -> every triggered trade loses; some
@@ -70,9 +71,12 @@ class SweepThresholdsTests(unittest.TestCase):
         with self.assertLogs(
             "crypto_training.train_xgboost", level=logging.WARNING
         ) as cm:
-            best_thr, _ = _sweep_thresholds_for_sharpe(y, proba)
+            best_thr, _, status = _sweep_thresholds_for_sharpe(y, proba)
         self.assertAlmostEqual(best_thr, 0.5, places=6)
         self.assertTrue(any("0.5" in m for m in cm.output))
+        # Trades happened (some candidates triggered) but all unprofitable;
+        # status flags the genuine signal weakness for downstream gating.
+        self.assertEqual(status, "no_positive_ev")
 
     def test_all_one_labels_returns_finite_threshold(self) -> None:
         # All wins -> simulated Sharpe is positive at every threshold
@@ -80,24 +84,28 @@ class SweepThresholdsTests(unittest.TestCase):
         # candidate in [0.3, 0.8].
         y = np.ones(100, dtype=int)
         proba = np.linspace(0.2, 0.95, 100)
-        best_thr, per_threshold = _sweep_thresholds_for_sharpe(y, proba)
+        best_thr, per_threshold, status = _sweep_thresholds_for_sharpe(y, proba)
         self.assertTrue(np.isfinite(best_thr))
         self.assertGreaterEqual(best_thr, 0.3)
         self.assertLessEqual(best_thr, 0.8)
+        self.assertEqual(status, "ok")
 
     def test_no_triggers_anywhere_defaults_to_05(self) -> None:
         # Probas all 0; every threshold triggers 0 trades; warn + 0.5.
         y = np.array([0, 1, 0, 1, 0, 1])
         proba = np.zeros(6)
-        best_thr, _ = _sweep_thresholds_for_sharpe(y, proba)
+        best_thr, _, status = _sweep_thresholds_for_sharpe(y, proba)
         self.assertAlmostEqual(best_thr, 0.5, places=6)
+        # No trades fired at any candidate → distinct from "no_positive_ev".
+        # Operator should retune the sweep range, not the model.
+        self.assertEqual(status, "no_trades")
 
     def test_per_threshold_dict_keyed_on_candidate(self) -> None:
         rng = np.random.default_rng(1)
         y = rng.binomial(1, 0.5, size=200)
         p = rng.uniform(0, 1, size=200)
         candidates = np.array([0.4, 0.5, 0.6])
-        _, per_threshold = _sweep_thresholds_for_sharpe(
+        _, per_threshold, _ = _sweep_thresholds_for_sharpe(
             y, p, candidates=candidates
         )
         self.assertEqual(set(per_threshold.keys()), {"0.4000", "0.5000", "0.6000"})

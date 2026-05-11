@@ -436,19 +436,31 @@ def _sweep_thresholds_for_sharpe(
     *,
     candidates: Optional[np.ndarray] = None,
     fee_bps: float = 200.0,
-) -> Tuple[float, Dict[str, Dict[str, float]]]:
-    """Sweep thresholds, return ``(best_threshold, per_threshold_metrics)``.
+) -> Tuple[float, Dict[str, Dict[str, float]], str]:
+    """Sweep thresholds, return ``(best_threshold, per_threshold_metrics, status)``.
 
     For each candidate threshold, simulate a long-only PnL stream via
     ``_simulate_strategy_pnl`` and pick the threshold that maximises
     Sharpe (D2: Sharpe-weighted, NOT F1 -- a 60% win-rate at 5% gain
     beats a 70% win-rate at 1% gain even though F1 favours the latter).
 
+    The ``status`` return value tells the caller which path the sweep
+    took so meta.json can record it:
+
+    * ``"ok"`` — at least one candidate produced a finite positive Sharpe.
+      ``best_threshold`` is the argmax.
+    * ``"no_positive_ev"`` — every candidate that produced trades had
+      Sharpe ≤ 0. The signal is too weak to profit at any of the swept
+      thresholds. ``best_threshold`` defaults to 0.5 and the predictor
+      adapter should treat the bundle as no-trade until retrained.
+    * ``"no_trades"`` — no candidate produced any trades (degenerate
+      probabilities, e.g. all proba < min(candidates)). Same caveat as
+      ``no_positive_ev``.
+
     Edge cases:
       * Degenerate inputs (all-zero or all-one labels) -> every
-        threshold's Sharpe is 0 / NaN. Default to 0.5 with a warning.
+        threshold's Sharpe is 0 / NaN. Status is ``no_positive_ev``.
       * Inf or NaN Sharpe values are filtered out before argmax.
-      * No candidate produces a finite positive Sharpe -> default 0.5.
     """
     if candidates is None:
         candidates = np.linspace(0.3, 0.8, 11)
@@ -456,12 +468,9 @@ def _sweep_thresholds_for_sharpe(
 
     per_threshold: Dict[str, Dict[str, float]] = {}
     best_threshold = 0.5
-    # Track the best *positive* Sharpe. If every candidate produces a
-    # zero-or-negative Sharpe (e.g. all-zero labels), there's no
-    # profitable threshold to pick -- fall back to 0.5 with a warning
-    # rather than silently picking the "least bad" loss.
     best_sharpe = -np.inf
     has_positive = False
+    any_trades = False
     for thr in candidates:
         m = _simulate_strategy_pnl(
             y_val, proba_val, threshold=float(thr), fee_bps=fee_bps
@@ -470,22 +479,28 @@ def _sweep_thresholds_for_sharpe(
         sharpe = m["sharpe"]
         if not np.isfinite(sharpe) or m["n_trades"] < 1:
             continue
+        any_trades = True
         if sharpe > best_sharpe:
             best_sharpe = sharpe
             best_threshold = float(thr)
             if sharpe > 0:
                 has_positive = True
 
-    if not has_positive:
-        # No profitable candidate. Default to 0.5 + warn so the operator
-        # reviews the data instead of trusting a "least-bad-loss" pick.
-        LOGGER.warning(
-            "_sweep_thresholds_for_sharpe: no candidate produced a positive "
-            "Sharpe; defaulting threshold to 0.5"
-        )
-        best_threshold = 0.5
+    if has_positive:
+        return best_threshold, per_threshold, "ok"
 
-    return best_threshold, per_threshold
+    # No profitable candidate. Differentiate "no trades at all" (sweep
+    # range mis-fits the proba distribution) from "trades happened but
+    # all unprofitable" (genuine signal weakness) so the operator knows
+    # whether to retune the sweep range or retrain on better features.
+    status = "no_trades" if not any_trades else "no_positive_ev"
+    LOGGER.warning(
+        "_sweep_thresholds_for_sharpe: %s; defaulting threshold to 0.5",
+        "no candidate produced any trades (proba distribution may sit "
+        "outside the sweep range)" if status == "no_trades"
+        else "no candidate produced a positive Sharpe",
+    )
+    return 0.5, per_threshold, status
 
 
 def _evaluate(
@@ -606,14 +621,16 @@ def train(
     # tuning is binary-only for now.
     optimal_threshold: Optional[float] = None
     threshold_metrics: Dict[str, Dict[str, float]] = {}
+    threshold_status: str = "skipped"  # default for the multi-class path
     if len(label_classes) == 2:
-        optimal_threshold, threshold_metrics = _sweep_thresholds_for_sharpe(
-            y_val, prob_val
+        optimal_threshold, threshold_metrics, threshold_status = (
+            _sweep_thresholds_for_sharpe(y_val, prob_val)
         )
         LOGGER.info(
-            "threshold sweep on val: optimal_threshold=%.3f "
+            "threshold sweep on val: optimal_threshold=%.3f status=%s "
             "(out of %d candidates)",
             optimal_threshold,
+            threshold_status,
             len(threshold_metrics),
         )
 
@@ -655,6 +672,11 @@ def train(
         # picks this up via ``meta.optimal_threshold`` unless the
         # operator overrides via CRYPTO_MODEL_THR_LONG / map suffix.
         "optimal_threshold": optimal_threshold,
+        # Sweep outcome: "ok" / "no_positive_ev" / "no_trades" / "skipped".
+        # Predictor adapters can refuse to trade bundles whose sweep status
+        # is anything other than "ok" — silently picking 0.5 on a "weak
+        # signal" bundle is exactly the regression we want to avoid.
+        "threshold_status": threshold_status,
         "threshold_metrics": threshold_metrics,
         # Training-distribution stats for A1 Mahalanobis check.
         # signal_forensics._extract_means_stds() reads the dict-form

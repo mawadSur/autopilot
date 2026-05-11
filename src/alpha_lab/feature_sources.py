@@ -11,13 +11,16 @@ Phase 4 / E2 commit 4. Two adapters:
   time is a separate concern (the regime-memory backfill solves the same
   problem and is the right model to follow when the live wire-up lands).
 
-* :class:`PolymarketFeatureSource` — wraps a Polymarket "macro" market
-  (e.g. CPI / FOMC / election forecasts) and exposes its midpoint price as
-  a single feature column over time. The skeleton accepts an injected
-  fetcher callable so unit tests can stub the network. The default fetcher
-  uses :func:`fetcher.fetch_active_markets`, but the actual conversion of
-  point-in-time market snapshots into a time series requires a Polymarket
-  history API call that this PR explicitly leaves as a TODO.
+* :class:`PolymarketFeatureSource` — wraps a Polymarket binary market
+  (e.g. CPI / FOMC / election forecasts) and exposes its YES-side price
+  as a single ``midpoint`` feature column over time. The class accepts an
+  injected ``fetcher`` callable so unit tests can stub the network. For
+  production wiring, :func:`make_clob_history_fetcher` returns a callable
+  backed by :func:`fetcher.fetch_market_price_history` (Polymarket CLOB
+  ``prices-history`` endpoint at hourly fidelity), with optional Redis +
+  in-memory caching to avoid burning rate limits on nightly re-runs.
+  When ``fetcher`` is ``None``, the source remains in skeleton mode and
+  returns empty DataFrames — the nightly miner skips it cleanly.
 
 Both classes implement the :class:`alpha_lab.correlation_miner.FeatureSource`
 Protocol. ``build_default_feature_sources`` is the factory function the
@@ -27,12 +30,19 @@ wired) so production runs are explicit about which sources to enable.
 
 from __future__ import annotations
 
+import json
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
+
+# Top-level import (not deferred inside the closure) so unit tests can
+# patch ``alpha_lab.feature_sources.fetch_market_price_history`` directly.
+from fetcher import fetch_market_price_history  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
 
@@ -41,7 +51,20 @@ __all__ = [
     "CryptoFeatureSource",
     "PolymarketFeatureSource",
     "build_default_feature_sources",
+    "make_clob_history_fetcher",
 ]
+
+# Default hourly samples for the alpha_lab nightly miner. 60-minute fidelity
+# over a 30-day window = ~720 samples per market — well within the CLOB
+# server-side cap and cheap to cache.
+_DEFAULT_POLYMARKET_FIDELITY_MINUTES = 60
+# Cache TTL for Polymarket history fetches. The nightly runner fires once a
+# day; a 6-hour TTL means a single in-day re-run (e.g. after a transient
+# fetch error) reuses the cached payload instead of hitting the CLOB again.
+_DEFAULT_POLYMARKET_CACHE_TTL_SECONDS = 6 * 60 * 60
+# Redis key prefix — namespaced so the Polymarket history cache doesn't
+# collide with the alpha_lab rank-IC history list or any other system key.
+_REDIS_KEY_PREFIX = "alpha_lab:polymarket_history:"
 
 
 # Default columns excluded from the rank-IC mine even when present in the
@@ -269,6 +292,169 @@ class PolymarketFeatureSource:
             df = df.copy()
             df.index = df.index.tz_localize(timezone.utc)
         return df
+
+
+# ---------------------------------------------------------------------------
+# Production CLOB history fetcher factory
+# ---------------------------------------------------------------------------
+def _samples_to_dataframe(
+    samples: Sequence[Tuple[datetime, float]],
+) -> pd.DataFrame:
+    """Convert ``[(utc_ts, price), ...]`` to a UTC-indexed DataFrame."""
+    if not samples:
+        return pd.DataFrame(columns=["midpoint"])
+    ts, prices = zip(*samples)
+    return pd.DataFrame(
+        {"midpoint": list(prices)},
+        index=pd.DatetimeIndex(list(ts), tz=timezone.utc),
+    )
+
+
+def _df_to_cache_payload(df: pd.DataFrame) -> Dict[str, Any]:
+    if df.empty:
+        return {"samples": []}
+    return {
+        "samples": [
+            [int(idx.timestamp()), float(row.midpoint)]
+            for idx, row in df.iterrows()
+        ]
+    }
+
+
+def _cache_payload_to_df(payload: Dict[str, Any]) -> pd.DataFrame:
+    samples = payload.get("samples") or []
+    pairs = [
+        (datetime.fromtimestamp(int(t), tz=timezone.utc), float(p))
+        for t, p in samples
+    ]
+    return _samples_to_dataframe(pairs)
+
+
+def make_clob_history_fetcher(
+    *,
+    redis_client: Optional[Any] = None,
+    redis_url: Optional[str] = None,
+    cache_ttl_s: int = _DEFAULT_POLYMARKET_CACHE_TTL_SECONDS,
+    fidelity_minutes: int = _DEFAULT_POLYMARKET_FIDELITY_MINUTES,
+) -> Callable[[str, datetime, datetime], pd.DataFrame]:
+    """Build the production fetcher for :class:`PolymarketFeatureSource`.
+
+    Returns a callable matching the source's ``fetcher`` signature
+    ``(market_id, start_utc, end_utc) -> DataFrame`` that wraps
+    :func:`fetcher.fetch_market_price_history` and caches results in Redis
+    (when a client is supplied) plus a process-local in-memory dict.
+
+    Cache key incorporates ``(market_id, start_ts, end_ts)`` — distinct
+    windows hit upstream independently; identical windows reuse the cached
+    payload for ``cache_ttl_s`` seconds. The default 6h TTL means a nightly
+    runner that retries within the same day reuses the cached fetch.
+
+    Failure handling:
+    * Network or parsing errors raised by ``fetch_market_price_history``
+      are caught inside :meth:`PolymarketFeatureSource.fetch_window`'s try/
+      except — this callable raises through so the source's own logging
+      kicks in.
+    * Redis read/write errors are warned-and-fallen-through — the in-memory
+      cache plus upstream call still produce a result.
+
+    Parameters
+    ----------
+    redis_client:
+        Pre-built ``redis.Redis`` instance. Mutually exclusive with
+        ``redis_url`` (client takes precedence if both are set).
+    redis_url:
+        URL like ``redis://127.0.0.1:6379/0``. Lazily instantiates a client
+        from ``redis.Redis.from_url`` on first use. Pass this OR
+        ``redis_client``, not both.
+    cache_ttl_s:
+        Redis TTL + in-memory expiry for cached fetches.
+    fidelity_minutes:
+        Forwarded to :func:`fetch_market_price_history`. 60 = hourly.
+    """
+    resolved_client = redis_client
+    if resolved_client is None and redis_url:
+        try:
+            import redis  # type: ignore[import-not-found]
+            resolved_client = redis.Redis.from_url(redis_url)
+        except Exception as exc:  # noqa: BLE001 - cache is best-effort
+            LOGGER.warning(
+                "polymarket cache: redis init from url failed (%s); "
+                "falling back to in-memory cache only",
+                exc,
+            )
+            resolved_client = None
+
+    inmem: Dict[Tuple[str, int, int], Tuple[float, pd.DataFrame]] = {}
+    lock = threading.Lock()
+
+    def _fetch(
+        market_id: str, start_utc: datetime, end_utc: datetime
+    ) -> pd.DataFrame:
+        if start_utc.tzinfo is None:
+            start_utc = start_utc.replace(tzinfo=timezone.utc)
+        if end_utc.tzinfo is None:
+            end_utc = end_utc.replace(tzinfo=timezone.utc)
+        cache_key = (
+            market_id,
+            int(start_utc.timestamp()),
+            int(end_utc.timestamp()),
+        )
+        redis_key = _REDIS_KEY_PREFIX + ":".join(str(x) for x in cache_key)
+
+        # Redis cache check.
+        if resolved_client is not None:
+            try:
+                raw = resolved_client.get(redis_key)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "polymarket cache: redis get failed (%s); skipping cache",
+                    exc,
+                )
+                raw = None
+            if raw:
+                try:
+                    payload = json.loads(raw)
+                    return _cache_payload_to_df(payload)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning(
+                        "polymarket cache: redis payload parse failed (%s); refetching",
+                        exc,
+                    )
+
+        # In-memory cache check.
+        now = time.time()
+        with lock:
+            hit = inmem.get(cache_key)
+            if hit is not None and now - hit[0] < cache_ttl_s:
+                return hit[1]
+
+        # Upstream fetch.
+        samples = fetch_market_price_history(
+            market_id,
+            start_utc,
+            end_utc,
+            fidelity_minutes=fidelity_minutes,
+        )
+        df = _samples_to_dataframe(samples)
+
+        # Write-through cache (best-effort).
+        if resolved_client is not None:
+            try:
+                resolved_client.setex(
+                    redis_key,
+                    int(cache_ttl_s),
+                    json.dumps(_df_to_cache_payload(df)),
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "polymarket cache: redis setex failed (%s); in-memory only",
+                    exc,
+                )
+        with lock:
+            inmem[cache_key] = (now, df)
+        return df
+
+    return _fetch
 
 
 # ---------------------------------------------------------------------------

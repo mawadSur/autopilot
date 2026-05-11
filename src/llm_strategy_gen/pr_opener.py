@@ -40,14 +40,16 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from llm_strategy_gen.backtest_runner import BacktestResult
 from llm_strategy_gen.feature_proposal import FeatureProposal
 
 LOGGER = logging.getLogger(__name__)
+AUDIT_LOGGER = logging.getLogger("llm_strategy_gen.pr_opener.audit")
 
 
 # Default location for the proposed-feature artifacts. Test runs
@@ -314,10 +316,113 @@ class PROpener:
         )
 
 
+def make_subprocess_gh_runner(
+    *,
+    timeout_s: float = 30.0,
+    cwd: Optional[Path] = None,
+    body_log_chars: int = 200,
+) -> Callable[[List[str]], Dict[str, Any]]:
+    """Build the production ``gh_runner`` callable for :class:`PROpener`.
+
+    The returned callable executes ``gh pr create ...`` via ``subprocess.run``
+    and parses the PR URL from stdout (``gh`` prints the URL on its own line).
+    A dedicated audit logger (``llm_strategy_gen.pr_opener.audit``) records the
+    full invocation — operators wire this to a file handler for the paper
+    trail required before any LLM-proposed PR can be merged.
+
+    The caller is responsible for staging the branch + commit BEFORE invoking
+    the opener — ``gh pr create --head <branch>`` expects the branch to exist
+    locally (and ``gh`` will push it if needed). The opener writes files only;
+    branch creation, commit, and push are out of scope for this skeleton.
+
+    Parameters
+    ----------
+    timeout_s:
+        Hard timeout for the ``gh`` invocation. Default 30s.
+    cwd:
+        Working directory for ``gh``. ``None`` uses the parent process cwd.
+    body_log_chars:
+        How many characters of ``--body`` to include in the audit log.
+        The full body lives in the PR itself; logging the whole thing every
+        time bloats audit files.
+    """
+
+    def _runner(argv: List[str]) -> Dict[str, Any]:
+        truncated_argv = _truncate_body_for_log(argv, body_log_chars)
+        AUDIT_LOGGER.info("PROpener.gh: invoking argv=%s cwd=%s", truncated_argv, cwd)
+        try:
+            completed = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_s,
+                cwd=str(cwd) if cwd is not None else None,
+            )
+        except subprocess.TimeoutExpired as exc:
+            AUDIT_LOGGER.error(
+                "PROpener.gh: timeout after %.1fs argv=%s", timeout_s, truncated_argv
+            )
+            return {
+                "url": None,
+                "returncode": -1,
+                "stdout": exc.stdout or "",
+                "stderr": (exc.stderr or "") + f"\n[timeout after {timeout_s}s]",
+            }
+        except FileNotFoundError as exc:
+            AUDIT_LOGGER.error("PROpener.gh: gh CLI not found: %s", exc)
+            return {"url": None, "returncode": -1, "stdout": "", "stderr": str(exc)}
+
+        AUDIT_LOGGER.info(
+            "PROpener.gh: returncode=%d stdout=%r stderr=%r",
+            completed.returncode,
+            completed.stdout[:500],
+            completed.stderr[:500],
+        )
+        url = _extract_pr_url(completed.stdout) if completed.returncode == 0 else None
+        return {
+            "url": url,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        }
+
+    return _runner
+
+
+_PR_URL_PATTERN = re.compile(r"https://github\.com/[^\s]+/pull/\d+")
+
+
+def _extract_pr_url(stdout: str) -> Optional[str]:
+    """Parse ``gh pr create`` stdout for the PR URL.
+
+    ``gh`` prints the URL on its own line (sometimes with surrounding
+    informational text in newer versions). Take the first match.
+    """
+    match = _PR_URL_PATTERN.search(stdout or "")
+    return match.group(0) if match else None
+
+
+def _truncate_body_for_log(argv: List[str], max_body_chars: int) -> List[str]:
+    """Return a copy of ``argv`` with ``--body <text>`` truncated for logs."""
+    out = list(argv)
+    try:
+        idx = out.index("--body")
+    except ValueError:
+        return out
+    if idx + 1 >= len(out):
+        return out
+    body = out[idx + 1]
+    if len(body) > max_body_chars:
+        out[idx + 1] = body[:max_body_chars] + f"...[{len(body) - max_body_chars} more chars]"
+    return out
+
+
 __all__ = [
     "PROpener",
     "PROpenResult",
     "DEFAULT_FEATURES_DIR",
     "DEFAULT_TESTS_DIR",
     "DEFAULT_BASE_BRANCH",
+    "make_subprocess_gh_runner",
 ]

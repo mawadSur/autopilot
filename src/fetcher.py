@@ -19,12 +19,16 @@ from models import Market
 LOGGER = logging.getLogger(__name__)
 
 GAMMA_API_BASE_URL = "https://gamma-api.polymarket.com"
+CLOB_API_BASE_URL = "https://clob.polymarket.com"
 DEFAULT_PAGE_SIZE = 100
 DEFAULT_MIN_VOLUME_24H = 5000.0
 DEFAULT_TIMEOUT_SECONDS = 20
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BACKOFF_SECONDS = 1.0
 DEFAULT_USER_AGENT = "autopilot-polymarket-scanner/1.0"
+# CLOB ``prices-history`` ``fidelity`` is in minutes. 60 = hourly samples,
+# the default the alpha_lab nightly miner wants over a 30-day window.
+DEFAULT_HISTORY_FIDELITY_MINUTES = 60
 
 
 def _coerce_float(value: Any, default: float = 0.0) -> float:
@@ -459,6 +463,199 @@ def fetch_resolved_markets(
             skipped_ambiguous,
         )
     return results
+
+
+def _request_clob_json(
+    session: requests.Session,
+    url: str,
+    *,
+    params: Dict[str, Any],
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
+) -> Dict[str, Any]:
+    """Like :func:`_request_json` but tolerates a dict (not list) response.
+
+    The CLOB ``prices-history`` endpoint returns ``{"history": [{"t": ..., "p": ...}, ...]}``
+    whereas the Gamma list endpoints return a top-level JSON array. The retry /
+    rate-limit / backoff machinery is identical so this helper is intentionally
+    a near-duplicate of :func:`_request_json`.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            response = session.get(url, params=params, timeout=timeout)
+            if response.status_code == 429:
+                if attempt >= max_retries:
+                    response.raise_for_status()
+                retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+                sleep_for = retry_after if retry_after is not None else backoff_seconds * (2 ** attempt)
+                sleep_for += random.uniform(0.0, 0.25)
+                LOGGER.warning("Polymarket CLOB API rate limited request. Sleeping for %.2fs", sleep_for)
+                time.sleep(sleep_for)
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("CLOB API returned a non-dict payload for prices-history")
+            return payload
+        except (requests.RequestException, ValueError) as exc:
+            if attempt >= max_retries:
+                raise
+            sleep_for = backoff_seconds * (2 ** attempt) + random.uniform(0.0, 0.25)
+            LOGGER.warning("CLOB API request failed (%s). Retrying in %.2fs", exc, sleep_for)
+            time.sleep(sleep_for)
+    return {}
+
+
+def _resolve_clob_token_id(
+    market_id: str,
+    *,
+    session: requests.Session,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+) -> Optional[str]:
+    """Resolve a Gamma ``market_id`` to the YES-outcome CLOB token id.
+
+    The CLOB ``prices-history`` endpoint keys on the per-outcome ERC-1155
+    token id (a long decimal string), not the Gamma market id. The Gamma
+    market payload exposes these in ``clobTokenIds`` as a JSON string of a
+    two-element array ``[yes_token, no_token]`` for binary markets. We
+    return the first element (the YES side) because that's what the rest
+    of the codebase treats as the canonical "midpoint" series.
+
+    Returns ``None`` if the market has no ``clobTokenIds`` (non-binary or
+    not yet listed on the CLOB) — callers should treat that as "no history
+    available".
+    """
+    payload = _request_json(
+        session,
+        f"{GAMMA_API_BASE_URL}/markets",
+        params={"id": market_id},
+        timeout=timeout,
+    )
+    if not payload:
+        return None
+    market_payload = payload[0] if isinstance(payload, list) else payload
+    raw_tokens = market_payload.get("clobTokenIds") if isinstance(market_payload, dict) else None
+    if raw_tokens in (None, ""):
+        return None
+    if isinstance(raw_tokens, str):
+        try:
+            raw_tokens = json.loads(raw_tokens)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw_tokens, list) or not raw_tokens:
+        return None
+    token = str(raw_tokens[0]).strip()
+    return token or None
+
+
+def fetch_market_price_history(
+    market_id: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    *,
+    fidelity_minutes: int = DEFAULT_HISTORY_FIDELITY_MINUTES,
+    session: Optional[requests.Session] = None,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    token_id: Optional[str] = None,
+) -> List[Tuple[datetime, float]]:
+    """Fetch the time-series of YES-outcome prices for a Polymarket market.
+
+    Pulls from ``GET https://clob.polymarket.com/prices-history`` over the
+    requested ``[start_utc, end_utc]`` window at the requested ``fidelity``
+    (in minutes). The CLOB returns at most one sample per ``fidelity`` step
+    and silently caps very-long windows server-side; the alpha_lab nightly
+    runner's 30-day window at 60-minute fidelity is well within that cap.
+
+    Args:
+        market_id: Gamma market id. Resolved to a CLOB token id via the
+            Gamma ``/markets`` endpoint unless ``token_id`` is supplied.
+        start_utc / end_utc: inclusive window. Both must be tz-aware (we
+            coerce naive datetimes to UTC for safety).
+        fidelity_minutes: sample spacing. 60 = hourly. CLOB-side minimum is
+            ~1 minute; values <1 are silently raised to 1.
+        session: optional ``requests.Session`` for connection reuse. A fresh
+            session is built (and closed) when None.
+        token_id: optional pre-resolved YES-side CLOB token id. When set,
+            skips the Gamma lookup (one HTTP call saved per market).
+
+    Returns:
+        A list of ``(utc_datetime, price)`` tuples, sorted ascending by
+        time. Empty list when the market has no CLOB tokens, when the
+        window is entirely outside the available history, or when the CLOB
+        returns an empty ``history`` array.
+
+    Raises:
+        ``requests.RequestException`` or ``ValueError`` for unrecoverable
+        HTTP / JSON errors (after the retry loop in :func:`_request_clob_json`).
+        Callers that want best-effort behavior (e.g.
+        :class:`alpha_lab.feature_sources.PolymarketFeatureSource`) should
+        catch and degrade to an empty result.
+    """
+    if not market_id:
+        raise ValueError("market_id must be a non-empty string")
+    if start_utc.tzinfo is None:
+        start_utc = start_utc.replace(tzinfo=timezone.utc)
+    if end_utc.tzinfo is None:
+        end_utc = end_utc.replace(tzinfo=timezone.utc)
+    if end_utc < start_utc:
+        return []
+
+    own_session = session is None
+    http = session or requests.Session()
+    if "Accept" not in http.headers:
+        http.headers["Accept"] = "application/json"
+    if "User-Agent" not in http.headers:
+        http.headers["User-Agent"] = DEFAULT_USER_AGENT
+
+    try:
+        resolved_token = token_id or _resolve_clob_token_id(
+            market_id, session=http, timeout=timeout
+        )
+        if not resolved_token:
+            LOGGER.info(
+                "fetch_market_price_history: no clob token id for market_id=%s "
+                "(non-binary or not listed on CLOB) — returning empty history",
+                market_id,
+            )
+            return []
+
+        fidelity = max(1, int(fidelity_minutes))
+        payload = _request_clob_json(
+            http,
+            f"{CLOB_API_BASE_URL}/prices-history",
+            params={
+                "market": resolved_token,
+                "startTs": int(start_utc.timestamp()),
+                "endTs": int(end_utc.timestamp()),
+                "fidelity": fidelity,
+            },
+            timeout=timeout,
+        )
+    finally:
+        if own_session:
+            http.close()
+
+    raw_history = payload.get("history") if isinstance(payload, dict) else None
+    if not isinstance(raw_history, list) or not raw_history:
+        return []
+
+    samples: List[Tuple[datetime, float]] = []
+    for entry in raw_history:
+        if not isinstance(entry, dict):
+            continue
+        t_raw = entry.get("t")
+        p_raw = entry.get("p")
+        if t_raw in (None, "") or p_raw in (None, ""):
+            continue
+        try:
+            ts = datetime.fromtimestamp(float(t_raw), tz=timezone.utc)
+            price = float(p_raw)
+        except (TypeError, ValueError):
+            continue
+        samples.append((ts, price))
+    samples.sort(key=lambda pair: pair[0])
+    return samples
 
 
 def main() -> None:

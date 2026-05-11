@@ -17,7 +17,10 @@ from llm_strategy_gen.pr_opener import (
     DEFAULT_BASE_BRANCH,
     PROpener,
     PROpenResult,
+    _extract_pr_url,
     _slugify,
+    _truncate_body_for_log,
+    make_subprocess_gh_runner,
 )
 from llm_strategy_gen.weekly_job import WeeklyJob
 
@@ -337,6 +340,125 @@ class WeeklyJobCLITests(unittest.TestCase):
         from llm_strategy_gen.weekly_job import _resolve_gate_threshold
         # CLI value wins
         self.assertEqual(_resolve_gate_threshold(0.5), 0.5)
+
+
+class SubprocessGhRunnerTests(unittest.TestCase):
+    def test_extract_pr_url_finds_canonical_pr_link(self):
+        stdout = (
+            "Creating pull request for foo into bar in owner/repo\n"
+            "https://github.com/owner/repo/pull/42\n"
+        )
+        self.assertEqual(
+            _extract_pr_url(stdout), "https://github.com/owner/repo/pull/42"
+        )
+
+    def test_extract_pr_url_returns_none_on_missing(self):
+        self.assertIsNone(_extract_pr_url("error: nothing here"))
+        self.assertIsNone(_extract_pr_url(""))
+
+    def test_truncate_body_for_log_preserves_short_bodies(self):
+        argv = ["gh", "pr", "create", "--body", "short body"]
+        self.assertEqual(_truncate_body_for_log(argv, 200), argv)
+
+    def test_truncate_body_for_log_truncates_long_bodies(self):
+        long_body = "X" * 500
+        argv = ["gh", "pr", "create", "--body", long_body, "--draft"]
+        out = _truncate_body_for_log(argv, 50)
+        # other argv positions untouched
+        self.assertEqual(out[0:4], argv[0:4])
+        self.assertEqual(out[5], "--draft")
+        # body slot is truncated + carries a "more chars" marker
+        self.assertLess(len(out[4]), len(long_body))
+        self.assertIn("more chars", out[4])
+
+    def test_truncate_body_for_log_handles_missing_body_flag(self):
+        argv = ["gh", "pr", "list"]
+        self.assertEqual(_truncate_body_for_log(argv, 200), argv)
+
+    def test_subprocess_runner_parses_url_on_success(self):
+        # Patch subprocess.run inside the pr_opener module so the runner
+        # exercises its parsing/audit-logging code path without shelling out.
+        from unittest.mock import patch
+
+        completed = MagicMock(
+            returncode=0,
+            stdout="https://github.com/owner/repo/pull/7\n",
+            stderr="",
+        )
+        with patch("llm_strategy_gen.pr_opener.subprocess.run", return_value=completed):
+            runner = make_subprocess_gh_runner()
+            result = runner(["gh", "pr", "create", "--draft"])
+        self.assertEqual(result["url"], "https://github.com/owner/repo/pull/7")
+        self.assertEqual(result["returncode"], 0)
+
+    def test_subprocess_runner_returns_none_url_on_non_zero_exit(self):
+        from unittest.mock import patch
+
+        completed = MagicMock(
+            returncode=1,
+            stdout="https://github.com/owner/repo/pull/7\n",
+            stderr="auth required",
+        )
+        with patch("llm_strategy_gen.pr_opener.subprocess.run", return_value=completed):
+            runner = make_subprocess_gh_runner()
+            result = runner(["gh", "pr", "create"])
+        # Non-zero exit ⇒ even if stdout looks like a URL, don't trust it.
+        self.assertIsNone(result["url"])
+        self.assertEqual(result["returncode"], 1)
+        self.assertEqual(result["stderr"], "auth required")
+
+    def test_subprocess_runner_handles_timeout(self):
+        import subprocess as _subprocess
+        from unittest.mock import patch
+
+        def _raise_timeout(*_args, **_kwargs):
+            raise _subprocess.TimeoutExpired(cmd="gh", timeout=0.1, output=b"", stderr=b"")
+
+        with patch("llm_strategy_gen.pr_opener.subprocess.run", side_effect=_raise_timeout):
+            runner = make_subprocess_gh_runner(timeout_s=0.1)
+            result = runner(["gh", "pr", "create"])
+        self.assertIsNone(result["url"])
+        self.assertEqual(result["returncode"], -1)
+        self.assertIn("timeout", result["stderr"].lower())
+
+    def test_subprocess_runner_handles_gh_not_installed(self):
+        from unittest.mock import patch
+
+        with patch(
+            "llm_strategy_gen.pr_opener.subprocess.run",
+            side_effect=FileNotFoundError("gh not found"),
+        ):
+            runner = make_subprocess_gh_runner()
+            result = runner(["gh", "pr", "create"])
+        self.assertIsNone(result["url"])
+        self.assertEqual(result["returncode"], -1)
+        self.assertIn("gh", result["stderr"])
+
+    def test_subprocess_runner_integrates_with_propener_live_mode(self):
+        # End-to-end: PROpener with a real subprocess-based runner (mocked
+        # subprocess.run). The opener should receive a dict with `url` and
+        # surface it as `pr_url`.
+        from unittest.mock import patch
+
+        completed = MagicMock(
+            returncode=0,
+            stdout="https://github.com/owner/repo/pull/99\n",
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                "llm_strategy_gen.pr_opener.subprocess.run", return_value=completed
+            ):
+                opener = PROpener(
+                    repo_root=Path(tmp), gh_runner=make_subprocess_gh_runner()
+                )
+                proposal = _make_proposal()
+                result = opener.open_pr(
+                    proposal, _passing_result(proposal), dry_run=False
+                )
+        self.assertEqual(result.pr_url, "https://github.com/owner/repo/pull/99")
+        self.assertFalse(result.dry_run)
+        self.assertEqual(result.branch_name, "e3/llm-proposed-atr_z")
 
 
 if __name__ == "__main__":

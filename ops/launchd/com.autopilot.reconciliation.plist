@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Daily Coinbase ↔ position-store reconciliation.
+
+  Schedule: 03:00 UTC every day (see alpha-lab plist for the local/UTC
+  caveat — this plist sets TZ=UTC so launchd interprets Hour=3 as UTC).
+
+  Install:
+    cp ops/launchd/com.autopilot.reconciliation.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.autopilot.reconciliation.plist
+
+  The CLI is hermetic: it reads positions from Redis (REDIS_URL), fetches
+  Coinbase balances, and writes a reconciliation report to stdout (and
+  optionally a JSON file via --output). Set REDIS_URL +
+  COINBASE_API_KEY / COINBASE_API_SECRET in your shell profile or pass
+  them via EnvironmentVariables below.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.autopilot.reconciliation</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mawad/Desktop/autopilot/.venv/bin/python</string>
+        <string>-m</string>
+        <string>ops.reconciliation_cli</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mawad/Desktop/autopilot</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/mawad/Desktop/autopilot/src</string>
+        <key>TZ</key>
+        <string>UTC</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mawad/Library/Logs/autopilot/reconciliation.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/mawad/Library/Logs/autopilot/reconciliation.stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
