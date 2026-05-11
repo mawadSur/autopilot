@@ -41,5 +41,14 @@ runs/
 data/crypto/datasets/*.parquet
 model_crypto/
 
+# Regime memory stores (regen via `PYTHONPATH=src python -m regime_memory.backfill`)
+data/regime_stores/
+
+# Local logs from training, retrain, and supervisor smoke runs
+logs/
+
+# Scheduled-task lockfile from /loop's ScheduleWakeup
+.claude/scheduled_tasks.lock
+
 # Polymarket scanner JSON exports
 output/
