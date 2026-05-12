@@ -444,6 +444,12 @@ class SupervisorTick(BaseModel):
     symbol: str
     verdict: CircuitBreakerVerdict
     model_confidence: Optional[float] = None
+    # raw_max_prob and raw_probs let observers see *how close* a skipped tick
+    # was to the threshold — invaluable for tuning thr_long/thr_short. They
+    # are filled when the wired predictor exposes ``predict_full``; older
+    # 2-tuple-only stubs leave them as None.
+    raw_max_prob: Optional[float] = None
+    raw_probs: Optional[Dict[str, float]] = None
     action_taken: _ActionTaken
     notes: Optional[str] = None
 
@@ -1318,8 +1324,26 @@ class Supervisor:
         # We need a tentative side for the breaker context. Predict first so
         # the breaker sees the actual side, but the canonical confidence
         # gate happens AFTER the breaker decides.
+        #
+        # Prefer ``predict_full`` when the wired predictor exposes it — the
+        # rich PredictorResult carries the raw class probs which we surface
+        # via SupervisorTick.raw_max_prob/raw_probs so operators can tell
+        # *how close* a skipped tick was to the threshold.
+        raw_probs: Optional[Dict[str, float]] = None
+        raw_max_prob: Optional[float] = None
         try:
-            side, confidence = self.model_predict_fn(symbol, ticker)
+            rich_call = getattr(self.model_predict_fn, "predict_full", None)
+            if callable(rich_call):
+                result = rich_call(symbol, ticker)
+                side, confidence = result.side, float(result.confidence)
+                mp = getattr(result, "model_probs", None)
+                if isinstance(mp, dict) and mp:
+                    raw_probs = {k: float(v) for k, v in mp.items()}
+                    finite_vals = [v for v in raw_probs.values() if math.isfinite(v)]
+                    if finite_vals:
+                        raw_max_prob = max(finite_vals)
+            else:
+                side, confidence = self.model_predict_fn(symbol, ticker)
         except Exception as exc:  # noqa: BLE001 - model errors should not crash
             self._handle_tick_error(symbol)
             self._safe_alert(
@@ -1372,6 +1396,8 @@ class Supervisor:
                 symbol=symbol,
                 verdict=verdict,
                 model_confidence=confidence,
+                raw_max_prob=raw_max_prob,
+                raw_probs=raw_probs,
                 action_taken="force_flatted",
                 notes=f"force_closed={count}",
             )
@@ -1382,6 +1408,8 @@ class Supervisor:
                 symbol=symbol,
                 verdict=verdict,
                 model_confidence=confidence,
+                raw_max_prob=raw_max_prob,
+                raw_probs=raw_probs,
                 action_taken="halted_breaker",
                 notes=verdict.reason or None,
             )
@@ -1397,6 +1425,8 @@ class Supervisor:
                 symbol=symbol,
                 verdict=verdict,
                 model_confidence=None,
+                raw_max_prob=raw_max_prob,
+                raw_probs=raw_probs,
                 action_taken="skipped_low_confidence",
                 notes="nan_confidence",
             )
@@ -1408,6 +1438,8 @@ class Supervisor:
                 symbol=symbol,
                 verdict=verdict,
                 model_confidence=confidence,
+                raw_max_prob=raw_max_prob,
+                raw_probs=raw_probs,
                 action_taken="skipped_low_confidence",
                 notes=(
                     f"confidence {confidence:.3f} < floor "
@@ -1462,6 +1494,8 @@ class Supervisor:
                     symbol=symbol,
                     verdict=verdict,
                     model_confidence=confidence,
+                    raw_max_prob=raw_max_prob,
+                    raw_probs=raw_probs,
                     action_taken="halted_breaker",
                     notes="live_mode_locked",
                 )
@@ -1495,6 +1529,8 @@ class Supervisor:
                 symbol=symbol,
                 verdict=verdict,
                 model_confidence=confidence,
+                raw_max_prob=raw_max_prob,
+                raw_probs=raw_probs,
                 action_taken="errored",
                 notes=f"order: {exc!r}",
             )
@@ -1510,6 +1546,8 @@ class Supervisor:
                 symbol=symbol,
                 verdict=verdict,
                 model_confidence=confidence,
+                raw_max_prob=raw_max_prob,
+                raw_probs=raw_probs,
                 action_taken="errored",
                 notes=f"order: {exc!r}",
             )
@@ -1519,6 +1557,8 @@ class Supervisor:
             symbol=symbol,
             verdict=verdict,
             model_confidence=confidence,
+            raw_max_prob=raw_max_prob,
+            raw_probs=raw_probs,
             action_taken="allowed",
             notes=notes_extra,
         )
