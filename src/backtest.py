@@ -124,11 +124,9 @@ def _warn_on_sparse_l2_depth(total_bars: int, missing_bars: int, *, threshold: f
         return
 
     logger.warning(
-        "[backtest] L2 depth data missing on %.2f%% (%d/%d) of bars. "
-        "Depth-aware execution will fall back to top-of-book or ATR slippage heuristics more often.",
-        missing_ratio * 100.0,
-        missing_bars,
-        total_bars,
+        f"[backtest] L2 depth data missing on {missing_ratio * 100.0:.2f}% "
+        f"({missing_bars}/{total_bars}) of bars. "
+        "Depth-aware execution will fall back to top-of-book or ATR slippage heuristics more often."
     )
 
 # =========================
