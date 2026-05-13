@@ -35,6 +35,8 @@ from utils import (
     fmt_pct,
     compute_features,
     load_model_bundle,
+    load_inference_bundle,
+    is_xgboost_model_dir,
     normalize_headers,
     FEATURE_COLUMNS_PROFITABLE,
     DEFAULT_SEQ_LEN,
@@ -172,33 +174,78 @@ class ConsensusFilter:
         return 1
 
 # =========================
+# XGBoost inference adapter
+# =========================
+class XGBoostInferenceAdapter:
+    """Wraps an XGBoost binary classifier to produce [N, 3] prob arrays.
+
+    Columns: [1 - p_long, 0.0, p_long] so downstream StrategyGate (size>=3 path)
+    treats col-0 as short-prob and col-2 as long-prob. The synthetic hold column
+    is 0.0 which is fine — gating compares col-2 vs thr_long.
+    """
+
+    def __init__(self, model, scaler, feature_cols: List[str], meta: Dict) -> None:
+        self.model = model
+        self.scaler = scaler
+        self.feature_cols = feature_cols
+        self.meta = meta
+
+    def predict_probs(self, rows: np.ndarray) -> np.ndarray:
+        """rows: [N, F] float32. Returns [N, 3] float64."""
+        X = rows.astype(np.float64)
+        if self.scaler is not None:
+            X = self.scaler.transform(X)
+        p_long = self.model.predict_proba(X)[:, 1]
+        N = p_long.shape[0]
+        out = np.zeros((N, 3), dtype=np.float64)
+        out[:, 2] = p_long
+        out[:, 0] = 1.0 - p_long
+        return out
+
+
+# =========================
 # Online portfolio simulator
 # =========================
 class ProfitOptimizedBacktester:
     def __init__(self, model_dir: str, files: List[Path]) -> None:
         self.model_dir = model_dir
         self.files = files
+        self._kind: str = "legacy"
 
     def _load_and_validate(self):
-        model, scaler, meta = load_model_bundle(self.model_dir)
+        kind, model, scaler, meta = load_inference_bundle(self.model_dir)
+        self._kind = kind
+        if kind == "xgboost":
+            feature_cols = list(meta.get("feature_cols") or [])
+            if not feature_cols:
+                raise ValueError("XGBoost meta.json missing feature_cols")
+            return model, scaler, meta
+        # legacy path: enforce feature_count sentinel
         feature_cols = list(meta.get("feature_names") or meta.get("feature_cols") or FEATURE_COLUMNS_PROFITABLE)
         if int(meta.get("feature_count") or 0) != len(feature_cols): raise ValueError("Model retrain required for profitability — delete old checkpoint in seq_dir and retrain.")
         return model, scaler, meta
 
     def _run_stream(self, model, scaler, meta, *, leverage: float = 1.0) -> Dict:
+        is_xgb = self._kind == "xgboost"
         feature_cols = list(meta.get("feature_names") or meta.get("feature_cols") or FEATURE_COLUMNS_PROFITABLE)
 
-        window_size = int(cfg.window_size or meta.get("window_size", DEFAULT_SEQ_LEN))
+        if is_xgb:
+            xgb_adapter = XGBoostInferenceAdapter(model, scaler, feature_cols, meta)
+            # Window size 2 is the minimum; XGBoost uses only the last row of each window.
+            window_size = 2
+        else:
+            window_size = int(cfg.window_size or meta.get("window_size", DEFAULT_SEQ_LEN))
+
         fee_pct = 0.00075
         tp_pct = float(meta.get("tp_pct", cfg.tp_pct))
         sl_pct = float(meta.get("sl_pct", cfg.sl_pct))
 
-        task = str(meta.get("task", "")).lower()
-        is_regression = bool(task == "regression" or int(meta.get("num_classes", 3)) == 1)
-        temperature = float(meta.get("temperature", 1.0))
-
-        device = torch.device(cfg.device if cfg.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
-        model = model.to(device).eval()
+        if not is_xgb:
+            task = str(meta.get("task", "")).lower()
+            is_regression = bool(task == "regression" or int(meta.get("num_classes", 3)) == 1)
+            temperature = float(meta.get("temperature", 1.0))
+            device = torch.device(cfg.device if cfg.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
+            model = model.to(device).eval()
 
         overlap_rows = max(window_size + 5, 2000)
 
@@ -228,7 +275,7 @@ class ProfitOptimizedBacktester:
             thr_long=float(cfg.thr_long),
             thr_short=float(cfg.thr_short),
             margin=float(cfg.margin),
-            feature_cols=feature_cols,
+            feature_cols=feature_cols if not is_xgb else [],
             use_hard_gating=bool(sim_cfg.use_hard_gating),
         )
 
@@ -247,6 +294,31 @@ class ProfitOptimizedBacktester:
             chunksize=int(cfg.chunksize),
             overlap_rows=int(overlap_rows),
         )
+
+        def _flush_batch_xgb() -> None:
+            nonlocal total_pred
+            if not X_batch:
+                return
+            rows = np.stack(X_batch, axis=0).astype(np.float64)
+            probs = xgb_adapter.predict_probs(rows)  # [N, 3]
+            for k, bar in enumerate(bar_batch):
+                raw_sig = _raw_signal_from_probs(
+                    probs[k],
+                    float(cfg.thr_long),
+                    float(cfg.thr_short),
+                    float(cfg.margin),
+                    feature_meta_batch[k],
+                    window=None,
+                    strategy_gate=strategy_gate,
+                )
+                sig = consensus_filter.step(raw_sig)
+                atr = float(bar.atr) if bar.atr is not None and np.isfinite(bar.atr) else None
+                sim.config.slippage_pct = (0.5 * atr / max(1e-12, float(bar.close))) if atr is not None else 0.0
+                sim.step(bar, signal=sig)
+                total_pred += 1
+            X_batch.clear()
+            bar_batch.clear()
+            feature_meta_batch.clear()
 
         def _flush_batch():
             nonlocal total_pred
@@ -299,6 +371,8 @@ class ProfitOptimizedBacktester:
             bar_batch.clear()
             feature_meta_batch.clear()
 
+        _flush_fn = _flush_batch_xgb if is_xgb else _flush_batch
+
         for window, _label, meta_row in streamer:
             total_bars += 1
             if sim_cfg.use_market_depth and not _bar_has_usable_l2_depth(meta_row):
@@ -315,7 +389,8 @@ class ProfitOptimizedBacktester:
             if cfg.use_regime_filter and np.isfinite(ema50) and np.isfinite(ema200):
                 regime = 1 if ema50 > ema200 * 1.0005 else (-1 if ema50 < ema200 * 0.9995 else 0)
 
-            X_batch.append(window)
+            # XGBoost: use only last row of window as 1D feature vector
+            X_batch.append(window[-1] if is_xgb else window)
             feature_meta_batch.append(dict(meta_row))
             bar_batch.append(Bar(
                 open=o,
@@ -343,9 +418,9 @@ class ProfitOptimizedBacktester:
                 vwap_ask_20=meta_row.get("vwap_ask_20"),
             ))
             if len(X_batch) >= int(cfg.batch_size):
-                _flush_batch()
+                _flush_fn()
 
-        _flush_batch()
+        _flush_fn()
         if last_close_for_end is not None:
             sim.finalize(last_close_for_end)
         _warn_on_sparse_l2_depth(total_bars, missing_l2_bars)
@@ -449,13 +524,19 @@ if __name__ == "__main__":
     setup_logging()
     files = _list_csvs(cfg.data_dir)
     model_root = Path(cfg.model_dir)
-    meta_path = model_root / "model_meta.json"
-    if meta_path.exists():
+    # XGBoost bundle: model.joblib + meta.json
+    if is_xgboost_model_dir(str(model_root)):
+        logger.info("[backtest] Detected XGBoost bundle at %s", model_root)
+        ProfitOptimizedBacktester(str(model_root), files).run()
+    elif (model_root / "model_meta.json").exists():
         ProfitOptimizedBacktester(str(model_root), files).run()
     else:
         seq_dirs = sorted([p for p in model_root.glob("seq_*") if (p / "model_meta.json").exists()])
         if not seq_dirs:
-            raise FileNotFoundError(f"model_meta.json not found in {cfg.model_dir} or any seq_* subdir")
+            raise FileNotFoundError(
+                f"No supported model found in {cfg.model_dir}. "
+                "Expected model.joblib+meta.json (XGBoost) or model_meta.json (LegacyTransformer)."
+            )
         for seq_dir in seq_dirs:
             print(f"\n[seq] Running backtest for {seq_dir.name} ...")
             ProfitOptimizedBacktester(str(seq_dir), files).run()

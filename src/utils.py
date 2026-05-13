@@ -1607,6 +1607,48 @@ def load_model_bundle(model_dir: str):
     return model.eval(), scaler, meta
 
 
+def is_xgboost_model_dir(model_dir: str) -> bool:
+    """Return True iff model_dir contains an XGBoost bundle (model.joblib + meta.json)."""
+    p = Path(model_dir)
+    return (p / "model.joblib").exists() and (p / "meta.json").exists()
+
+
+def load_inference_bundle(model_dir: str):
+    """Load either a LegacyTransformer or XGBoost bundle.
+
+    Returns (kind, model, scaler_or_None, meta_dict) where kind in {"legacy", "xgboost"}.
+    Callers should branch on kind; downstream inference is model-type-specific.
+    """
+    if is_xgboost_model_dir(model_dir):
+        import joblib
+        # On macOS with Apple Silicon, torch + XGBoost OpenMP clash causes SIGABRT.
+        # Pin OMP_NUM_THREADS=1 before the joblib load to avoid the crash.
+        _prev_omp = os.environ.get("OMP_NUM_THREADS")
+        os.environ["OMP_NUM_THREADS"] = "1"
+        try:
+            p = Path(model_dir)
+            with (p / "meta.json").open() as fh:
+                meta = json.load(fh)
+            model = joblib.load(p / "model.joblib")
+            scaler_path = p / "scaler.joblib"
+            scaler = joblib.load(scaler_path) if scaler_path.exists() else None
+        finally:
+            if _prev_omp is None:
+                os.environ.pop("OMP_NUM_THREADS", None)
+            else:
+                os.environ["OMP_NUM_THREADS"] = _prev_omp
+        if scaler is not None and hasattr(scaler, "feature_names_in_"):
+            expected = list(meta.get("feature_cols") or [])
+            actual = list(scaler.feature_names_in_)
+            if actual != expected:
+                raise ValueError(
+                    f"XGBoost scaler column order mismatch: scaler={actual[:5]} meta={expected[:5]}"
+                )
+        return "xgboost", model, scaler, meta
+    model, scaler, meta = load_model_bundle(model_dir)
+    return "legacy", model, scaler, meta
+
+
 # ---------------------------
 # Simple binary label helper (optional)
 # ---------------------------
@@ -1804,7 +1846,7 @@ __all__ = [
     # formatting
     "fmt_money", "fmt_pct",
     # meta/model
-    "load_meta", "load_model_bundle", "SignalGenerator",
+    "load_meta", "load_model_bundle", "load_inference_bundle", "is_xgboost_model_dir", "SignalGenerator",
     # labels
     "binary_label_next_bar_up",
     "DashboardClient",
