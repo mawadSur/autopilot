@@ -50,5 +50,14 @@ logs/
 # Scheduled-task lockfile from /loop's ScheduleWakeup
 .claude/scheduled_tasks.lock
 
+# Ruflo runtime/state (regenerable via `npx @claude-flow/cli init --preset standard`
+# + `daemon start` / `memory init` / `swarm init`).
+.claude-flow/
+.swarm/
+.claude/memory.db
+agentdb.rvf
+agentdb.rvf.lock
+ruvector.db
+
 # Polymarket scanner JSON exports
 output/
