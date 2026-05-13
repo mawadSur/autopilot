@@ -616,11 +616,22 @@ class CoinbaseExchange:
             or ((bid + ask) / 2.0 if (bid and ask) else 0.0),
         )
         volume = _coerce_float(data.get("volume_24h"))
+        # Public Coinbase products endpoint sometimes returns empty strings
+        # for best_bid_price/best_ask_price (auth-gated). Fall back to last
+        # trade price as both sides — loses spread realism but gains price
+        # realism, which is what matters for paper-fill correctness. The
+        # alternative ($1.0 default OR raising every tick) is worse.
+        if (bid <= 0.0 or ask <= 0.0) and last > 0.0:
+            if bid <= 0.0:
+                bid = last
+            if ask <= 0.0:
+                ask = last
         if bid <= 0.0 or ask <= 0.0:
             raise ExchangeError(
                 f"Coinbase ticker for {norm_symbol} returned non-positive "
-                f"bid/ask (bid={bid}, ask={ask}); the field schema may have "
-                f"changed again. Available keys: {sorted(data.keys())[:8]}..."
+                f"bid/ask/last (bid={bid}, ask={ask}, last={last}); the "
+                f"field schema may have changed. Available keys: "
+                f"{sorted(data.keys())[:8]}..."
             )
         return Ticker(
             symbol=norm_symbol,

@@ -389,17 +389,48 @@ class AccountAndMarketDataTests(unittest.TestCase):
         self.assertAlmostEqual(ticker.ask, 2240.50, places=4)
         self.assertAlmostEqual(ticker.mid, 2240.00, places=4)
 
-    def test_fetch_ticker_raises_when_bid_and_ask_both_missing(self) -> None:
+    def test_fetch_ticker_falls_back_to_last_price_when_bid_ask_empty(
+        self,
+    ) -> None:
+        ex, _ = _make_exchange()
+        from unittest import mock
+
+        # 2026-05-13: Coinbase's unauthenticated products endpoint started
+        # returning empty strings for best_bid_price/best_ask_price (the
+        # depth-of-book fields are auth-gated). When that happens we fall
+        # back to the last-trade price as both sides — loses spread realism
+        # but gains price realism. The alternative (raising every tick OR
+        # silent $1.0 fills) is worse for paper trading.
+        fake_response = mock.MagicMock(
+            status_code=200,
+            json=lambda: {
+                "best_bid_price": "",
+                "best_ask_price": "",
+                "mid_market_price": "",
+                "price": "2239.98",
+                "volume_24h": "90000.0",
+            },
+        )
+        with mock.patch(
+            "exchanges.coinbase.requests.get",
+            return_value=fake_response,
+        ):
+            ticker = ex.get_ticker("ETH-USD")
+        self.assertAlmostEqual(ticker.bid, 2239.98, places=4)
+        self.assertAlmostEqual(ticker.ask, 2239.98, places=4)
+        self.assertAlmostEqual(ticker.mid, 2239.98, places=4)
+
+    def test_fetch_ticker_raises_when_all_price_fields_missing(self) -> None:
         ex, _ = _make_exchange()
         from unittest import mock
 
         # Defense-in-depth: if the schema changes AGAIN and the parser sees
-        # neither legacy nor current bid/ask fields, raise loudly rather
-        # than silently returning a 0.0 ticker that would feed downstream
-        # paper-fill code and produce $1.0 fills.
+        # no usable price fields at all, raise loudly rather than silently
+        # returning a 0.0 ticker that would feed downstream paper-fill code
+        # and produce $1.0 fills.
         fake_response = mock.MagicMock(
             status_code=200,
-            json=lambda: {"price": "2239.98", "volume_24h": "90000.0"},
+            json=lambda: {"volume_24h": "90000.0"},
         )
         with mock.patch(
             "exchanges.coinbase.requests.get",
