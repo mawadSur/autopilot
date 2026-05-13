@@ -538,6 +538,24 @@ def _evaluate(
     return out
 
 
+def _compute_test_gate(
+    y_test: np.ndarray,
+    proba_test: np.ndarray,
+    optimal_threshold: float,
+) -> Tuple[float, int]:
+    """Return (win_rate, n_trades) at ``optimal_threshold`` on the test split.
+
+    Win rate is precision at threshold: fraction of triggered rows where
+    label==1, matching the label semantics used by validate_xgboost_winrate.py.
+    """
+    mask = proba_test >= optimal_threshold
+    n_trades = int(mask.sum())
+    if n_trades == 0:
+        return 0.0, 0
+    win_rate = float(y_test[mask].mean())
+    return win_rate, n_trades
+
+
 def train(
     *,
     dataset_path: Path,
@@ -546,6 +564,8 @@ def train(
     test_frac: float = 0.15,
     calibration_method: Literal["isotonic", "sigmoid"] = "isotonic",
     xgb_kwargs: Optional[Dict[str, Any]] = None,
+    min_test_winrate: float = 0.55,
+    min_test_ntrades: int = 10,
 ) -> TrainSummary:
     """Train + calibrate + persist."""
     df = _load_dataset(dataset_path)
@@ -622,6 +642,9 @@ def train(
     optimal_threshold: Optional[float] = None
     threshold_metrics: Dict[str, Dict[str, float]] = {}
     threshold_status: str = "skipped"  # default for the multi-class path
+    test_winrate_at_optimal: Optional[float] = None
+    test_ntrades_at_optimal: Optional[int] = None
+    test_gate_reason: Optional[str] = None
     if len(label_classes) == 2:
         optimal_threshold, threshold_metrics, threshold_status = (
             _sweep_thresholds_for_sharpe(y_val, prob_val)
@@ -633,6 +656,35 @@ def train(
             threshold_status,
             len(threshold_metrics),
         )
+
+        # Test-split gate: compute win-rate at val-chosen threshold on
+        # the held-out test set. If it misses either floor, null out the
+        # threshold so the predictor adapter doesn't trade a failing model.
+        test_wr, test_nt = _compute_test_gate(y_test, prob_test, optimal_threshold)
+        test_winrate_at_optimal = test_wr
+        test_ntrades_at_optimal = test_nt
+
+        reasons: List[str] = []
+        if test_wr < min_test_winrate:
+            reasons.append(f"test_winrate={test_wr:.4f} < {min_test_winrate}")
+        if test_nt < min_test_ntrades:
+            reasons.append(f"test_ntrades={test_nt} < {min_test_ntrades}")
+
+        if reasons:
+            test_gate_reason = "; ".join(reasons)
+            threshold_status = "test_gate_failed"
+            print(
+                f"[train_xgboost] test gate: winrate={test_wr:.3f} "
+                f"ntrades={test_nt} → FAILED ({test_gate_reason}); "
+                f"optimal_threshold=null"
+            )
+            optimal_threshold = None
+        else:
+            print(
+                f"[train_xgboost] test gate: winrate={test_wr:.3f} "
+                f"ntrades={test_nt} → OK "
+                f"(optimal_threshold={optimal_threshold:.2f} written)"
+            )
 
     # Per-feature training-set distribution stats. A1 SignalForensics uses
     # these to compute Mahalanobis distance between the latest signal-time
@@ -672,12 +724,17 @@ def train(
         # picks this up via ``meta.optimal_threshold`` unless the
         # operator overrides via CRYPTO_MODEL_THR_LONG / map suffix.
         "optimal_threshold": optimal_threshold,
-        # Sweep outcome: "ok" / "no_positive_ev" / "no_trades" / "skipped".
-        # Predictor adapters can refuse to trade bundles whose sweep status
-        # is anything other than "ok" — silently picking 0.5 on a "weak
-        # signal" bundle is exactly the regression we want to avoid.
+        # Sweep outcome: "ok" / "no_positive_ev" / "no_trades" / "skipped"
+        # / "test_gate_failed". Predictor adapters can refuse to trade
+        # bundles whose sweep status is anything other than "ok".
         "threshold_status": threshold_status,
         "threshold_metrics": threshold_metrics,
+        # Test-split gate fields. Present only for binary classifiers.
+        # test_winrate_at_optimal_threshold and test_ntrades_at_optimal_threshold
+        # are the raw numbers; test_gate_reason explains a gate failure.
+        "test_winrate_at_optimal_threshold": test_winrate_at_optimal,
+        "test_ntrades_at_optimal_threshold": test_ntrades_at_optimal,
+        "test_gate_reason": test_gate_reason,
         # Training-distribution stats for A1 Mahalanobis check.
         # signal_forensics._extract_means_stds() reads the dict-form
         # ``feature_means`` / ``feature_stds`` first; we use exactly that
@@ -860,6 +917,24 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default="isotonic",
         help="Calibration method (default isotonic)",
     )
+    p.add_argument(
+        "--min-test-winrate",
+        type=float,
+        default=0.55,
+        help=(
+            "Minimum test-split win rate to accept optimal_threshold "
+            "(default 0.55). Fails gate → optimal_threshold=null."
+        ),
+    )
+    p.add_argument(
+        "--min-test-ntrades",
+        type=int,
+        default=10,
+        help=(
+            "Minimum number of test-split trades at optimal_threshold "
+            "(default 10). Fails gate → optimal_threshold=null."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -876,6 +951,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         val_frac=args.val_frac,
         test_frac=args.test_frac,
         calibration_method=args.calibration,
+        min_test_winrate=args.min_test_winrate,
+        min_test_ntrades=args.min_test_ntrades,
     )
     print(json.dumps(asdict(summary), default=str, indent=2))
     return 0
