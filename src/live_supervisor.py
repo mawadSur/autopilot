@@ -502,7 +502,7 @@ class Supervisor:
         metrics_pusher: Optional[Any] = None,
         auto_pause_gate: Optional[AutoPauseGate] = None,
         confidence_history: Optional[ConfidenceHistory] = None,
-        auto_trip_threshold: int = 3,
+        auto_trip_threshold: int = 10,
         trade_context_store: Optional[TradeContextStore] = None,
     ) -> None:
         self.config = config
@@ -534,9 +534,11 @@ class Supervisor:
         )
         # Task 3: N consecutive errors on the same symbol auto-trips the
         # kill switch by writing the configured kill-switch file. The
-        # threshold is conservative (3 errors) and bounded; the supervisor
-        # keeps an in-process latch so we only emit the alert + metric
-        # once per trip.
+        # threshold is 10 errors (~50s at 5s tick interval) — a real outage,
+        # not a transient DNS / TLS handshake blip. (Previously 3, which
+        # tripped a multi-day session on a 10-second DNS hiccup.) Supervisor
+        # keeps an in-process latch so we only emit the alert + metric once
+        # per trip.
         self.auto_trip_threshold = int(auto_trip_threshold)
         self._auto_tripped_symbols: set[str] = set()
 

@@ -599,13 +599,29 @@ class CoinbaseExchange:
         except Exception as exc:
             raise ExchangeError(f"products GET returned non-JSON: {exc}") from exc
 
-        bid = _coerce_float(data.get("best_bid"))
-        ask = _coerce_float(data.get("best_ask"))
+        # Coinbase Advanced Trade renamed these fields: ``best_bid`` →
+        # ``best_bid_price`` and ``best_ask`` → ``best_ask_price``. Read both
+        # legacy + current names so we keep working if Coinbase reverts or
+        # publishes both. Also expose ``mid_market_price`` as a fallback for
+        # ``last`` when ``price`` is missing.
+        bid = _coerce_float(
+            data.get("best_bid_price") or data.get("best_bid")
+        )
+        ask = _coerce_float(
+            data.get("best_ask_price") or data.get("best_ask")
+        )
         last = _coerce_float(
             data.get("price"),
-            default=(bid + ask) / 2.0 if (bid and ask) else 0.0,
+            default=_coerce_float(data.get("mid_market_price"))
+            or ((bid + ask) / 2.0 if (bid and ask) else 0.0),
         )
         volume = _coerce_float(data.get("volume_24h"))
+        if bid <= 0.0 or ask <= 0.0:
+            raise ExchangeError(
+                f"Coinbase ticker for {norm_symbol} returned non-positive "
+                f"bid/ask (bid={bid}, ask={ask}); the field schema may have "
+                f"changed again. Available keys: {sorted(data.keys())[:8]}..."
+            )
         return Ticker(
             symbol=norm_symbol,
             bid=bid,

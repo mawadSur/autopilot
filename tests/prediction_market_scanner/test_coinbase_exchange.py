@@ -362,6 +362,53 @@ class AccountAndMarketDataTests(unittest.TestCase):
         called_url = patched_get.call_args.args[0]
         self.assertIn("/api/v3/brokerage/market/products/ETH-USD", called_url)
 
+    def test_fetch_ticker_reads_renamed_best_bid_price_fields(self) -> None:
+        ex, _ = _make_exchange()
+        from unittest import mock
+
+        # Coinbase Advanced Trade renamed best_bid/best_ask to
+        # best_bid_price/best_ask_price. A 2026-05 prod incident saw paper
+        # fills land at $1.0 because the adapter still read the old names
+        # (both came back as None). This test pins the new field names.
+        fake_response = mock.MagicMock(
+            status_code=200,
+            json=lambda: {
+                "best_bid_price": "2239.50",
+                "best_ask_price": "2240.50",
+                "price": "2239.98",
+                "mid_market_price": "2240.00",
+                "volume_24h": "90000.0",
+            },
+        )
+        with mock.patch(
+            "exchanges.coinbase.requests.get",
+            return_value=fake_response,
+        ):
+            ticker = ex.get_ticker("ETH-USD")
+        self.assertAlmostEqual(ticker.bid, 2239.50, places=4)
+        self.assertAlmostEqual(ticker.ask, 2240.50, places=4)
+        self.assertAlmostEqual(ticker.mid, 2240.00, places=4)
+
+    def test_fetch_ticker_raises_when_bid_and_ask_both_missing(self) -> None:
+        ex, _ = _make_exchange()
+        from unittest import mock
+
+        # Defense-in-depth: if the schema changes AGAIN and the parser sees
+        # neither legacy nor current bid/ask fields, raise loudly rather
+        # than silently returning a 0.0 ticker that would feed downstream
+        # paper-fill code and produce $1.0 fills.
+        fake_response = mock.MagicMock(
+            status_code=200,
+            json=lambda: {"price": "2239.98", "volume_24h": "90000.0"},
+        )
+        with mock.patch(
+            "exchanges.coinbase.requests.get",
+            return_value=fake_response,
+        ):
+            with self.assertRaises(Exception) as cm:
+                ex.get_ticker("ETH-USD")
+        self.assertIn("non-positive", str(cm.exception).lower())
+
     def test_fetch_recent_candles_returns_oldest_first(self) -> None:
         ex, _ = _make_exchange()
         from unittest import mock

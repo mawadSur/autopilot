@@ -355,6 +355,7 @@ def _build_supervisor(
     notifier: Optional[StubNotifier] = None,
     predict_fn=None,
     symbols: Optional[List[str]] = None,
+    auto_trip_threshold: int = 10,
 ) -> Tuple[Supervisor, Dict[str, Any]]:
     """Construct a supervisor with stubbed dependencies, returning both."""
     if shakedown_path is None:
@@ -396,6 +397,7 @@ def _build_supervisor(
         model_predict_fn=predict_fn or (lambda s, t: ("buy", 0.9)),
         sleep_fn=_fake_sleep,
         now_fn=_fake_now,
+        auto_trip_threshold=auto_trip_threshold,
     )
     if paper_days_clean:
         # Per-symbol: seed every configured symbol's clean-day counter so
@@ -1606,6 +1608,7 @@ class TestConsecutiveErrorAutoTripsKillSwitch(unittest.TestCase):
                 position_store=store,
                 circuit_breakers=breakers,
                 notifier=notifier,
+                auto_trip_threshold=3,
             )
             sup.metrics_pusher = pusher
 
