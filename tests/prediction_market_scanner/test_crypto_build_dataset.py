@@ -27,6 +27,103 @@ from crypto_training.build_dataset import (
     load_ohlcv,
 )
 
+# ---------------------------------------------------------------------------
+# Vol-normalized label tests
+# ---------------------------------------------------------------------------
+
+
+class VolNormalizedLabelTests(unittest.TestCase):
+    """Tests for label_kind='vol_normalized' in label_forward_return_binary.
+
+    Invariant: a fixed forward move of +X bps should be labeled 1 during
+    *low-vol* bars (where X > k * atrp_14_bps) but labeled 0 during
+    *high-vol* bars (where X < k * atrp_14_bps). This is the opposite of
+    the fixed-threshold behavior and verifies the confound is corrected.
+    """
+
+    def _make_df(self, closes: list, atrp_14: list) -> pd.DataFrame:
+        """Build a minimal DataFrame with close + atrp_14 columns."""
+        return pd.DataFrame({"close": closes, "atrp_14": atrp_14})
+
+    def test_low_vol_bar_labels_positive(self) -> None:
+        # forward move: (102 - 100) / 100 * 10000 = 200 bps
+        # atrp_14 = 0.1% = 10 bps (low vol); dynamic thr = 0.5 * 10 = 5 bps
+        # 200 > 5 -> label=1
+        df = self._make_df(
+            closes=[100.0, 102.0, 102.0],
+            atrp_14=[0.10, 0.10, 0.10],  # 0.10% = 10 bps per ATR%
+        )
+        labels = label_forward_return_binary(
+            df, horizon_bars=1, threshold_bps=10.0, label_kind="vol_normalized", vol_normalize_k=0.5
+        )
+        self.assertEqual(int(labels.iloc[0]), 1)
+
+    def test_high_vol_bar_same_move_labels_negative(self) -> None:
+        # Same 200 bps forward move but atrp_14 = 5% = 500 bps (high vol)
+        # dynamic thr = 0.5 * 500 = 250 bps; 200 < 250 -> label=0
+        df = self._make_df(
+            closes=[100.0, 102.0, 102.0],
+            atrp_14=[5.0, 5.0, 5.0],  # 5% ATR = 500 bps
+        )
+        labels = label_forward_return_binary(
+            df, horizon_bars=1, threshold_bps=10.0, label_kind="vol_normalized", vol_normalize_k=0.5
+        )
+        self.assertEqual(int(labels.iloc[0]), 0)
+
+    def test_fixed_bps_unchanged_behavior(self) -> None:
+        # Verify fixed_bps (default) is unaffected by presence of atrp_14 col.
+        df = self._make_df(
+            closes=[100.0, 102.0, 102.0],
+            atrp_14=[5.0, 5.0, 5.0],
+        )
+        # fixed_bps: 200 bps > 10 bps threshold -> label=1
+        labels_fixed = label_forward_return_binary(
+            df, horizon_bars=1, threshold_bps=10.0, label_kind="fixed_bps"
+        )
+        # vol_normalized: 200 bps < 250 bps dynamic thr -> label=0
+        labels_voln = label_forward_return_binary(
+            df, horizon_bars=1, threshold_bps=10.0, label_kind="vol_normalized", vol_normalize_k=0.5
+        )
+        self.assertEqual(int(labels_fixed.iloc[0]), 1)
+        self.assertEqual(int(labels_voln.iloc[0]), 0)
+
+    def test_trailing_row_is_nan(self) -> None:
+        df = self._make_df(
+            closes=[100.0, 102.0],
+            atrp_14=[0.1, 0.1],
+        )
+        labels = label_forward_return_binary(
+            df, horizon_bars=1, threshold_bps=10.0, label_kind="vol_normalized"
+        )
+        self.assertTrue(pd.isna(labels.iloc[-1]))
+
+    def test_nan_atrp_propagates_to_nan_label(self) -> None:
+        # First bar has NaN atrp (warmup); should produce NaN label even though
+        # forward return is computable.
+        df = self._make_df(
+            closes=[100.0, 105.0, 110.0],
+            atrp_14=[float("nan"), 0.1, 0.1],
+        )
+        labels = label_forward_return_binary(
+            df, horizon_bars=1, threshold_bps=10.0, label_kind="vol_normalized"
+        )
+        self.assertTrue(pd.isna(labels.iloc[0]))
+        self.assertFalse(pd.isna(labels.iloc[1]))
+
+    def test_missing_atrp14_column_raises(self) -> None:
+        df = pd.DataFrame({"close": [100.0, 102.0, 105.0]})
+        with self.assertRaises(ValueError, msg="should raise when atrp_14 absent"):
+            label_forward_return_binary(
+                df, horizon_bars=1, threshold_bps=10.0, label_kind="vol_normalized"
+            )
+
+    def test_invalid_label_kind_raises(self) -> None:
+        df = self._make_df([100.0, 102.0], [0.1, 0.1])
+        with self.assertRaises(ValueError):
+            label_forward_return_binary(
+                df, horizon_bars=1, threshold_bps=10.0, label_kind="bad_kind"  # type: ignore[arg-type]
+            )
+
 
 # ---------------------------------------------------------------------------
 # Synthetic OHLCV generator

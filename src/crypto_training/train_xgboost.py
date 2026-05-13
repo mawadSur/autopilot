@@ -43,6 +43,8 @@ _SRC_DIR = Path(__file__).resolve().parent.parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+import re
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -57,6 +59,42 @@ from sklearn.metrics import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Vol-feature exclusion list
+# ---------------------------------------------------------------------------
+# When training on vol-normalized datasets (*_voln.parquet), these features
+# must be excluded so the model cannot relearn the volatility confound.
+#
+# Root cause (commit that introduced this): scripts/diagnose_features.py
+# revealed that the fixed-bps label (forward_return > threshold) was
+# volatility-confounded — in high-vol training periods, more bars trivially
+# clear the threshold, so top-3 test features by AUC were all vol measures
+# (atrp_14, atr_14, range_ma_20 at 0.64-0.72 AUC) with zero directional
+# features in the top-10. The fix is a vol-normalized label AND dropping
+# vol-magnitude features.
+#
+# Features KEPT intentionally (bar-position, not vol-magnitude):
+#   body_to_range_ratio, upper_wick_ratio, lower_wick_ratio,
+#   close_pos_in_range, range_pct (close relative, not absolute ATR).
+# ---------------------------------------------------------------------------
+VOL_FEATURE_DROP_PATTERNS: List[str] = [
+    r"^atrp_",        # atrp_14
+    r"^atr_",         # atr_14
+    r"^rv_",          # rv_5, rv_15, rv_60, rv_240
+    r"^ret_std_",     # ret_std_30
+    r"^range_ma_",    # range_ma_20
+    r"^range_pct_",   # range_pct_* (magnitude)
+    r"^vol_of_vol_",  # vol_of_vol_60
+    r"^tf\d+_atrp_",  # tf5_atrp_14, tf15_atrp_14, tf60_atrp_14
+    r"^tf\d+_rv_",    # tf5_rv_20, tf15_rv_20, tf60_rv_20
+]
+
+
+def _is_vol_feature(col: str) -> bool:
+    """Return True if *col* matches a vol-magnitude exclusion pattern."""
+    col_lower = col.lower()
+    return any(re.search(pat, col_lower) for pat in VOL_FEATURE_DROP_PATTERNS)
 
 
 DEFAULT_XGB_KWARGS: Dict[str, Any] = {
@@ -566,10 +604,25 @@ def train(
     xgb_kwargs: Optional[Dict[str, Any]] = None,
     min_test_winrate: float = 0.55,
     min_test_ntrades: int = 10,
+    drop_vol_features: bool = False,
 ) -> TrainSummary:
-    """Train + calibrate + persist."""
+    """Train + calibrate + persist.
+
+    When ``drop_vol_features=True``, columns matching
+    ``VOL_FEATURE_DROP_PATTERNS`` are excluded from ``feature_cols`` before
+    fitting. Use this with vol-normalized datasets (*_voln.parquet) to ensure
+    the model cannot relearn the volatility confound via the feature side.
+    """
     df = _load_dataset(dataset_path)
     feature_cols = [c for c in df.columns if c not in ("timestamp", "label")]
+    if drop_vol_features:
+        dropped = [c for c in feature_cols if _is_vol_feature(c)]
+        feature_cols = [c for c in feature_cols if not _is_vol_feature(c)]
+        LOGGER.info(
+            "drop_vol_features=True: removed %d vol-magnitude features: %s",
+            len(dropped),
+            dropped,
+        )
     label_classes = sorted({int(v) for v in df["label"].unique()})
     if len(label_classes) < 2:
         raise ValueError(
@@ -935,6 +988,17 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "(default 10). Fails gate → optimal_threshold=null."
         ),
     )
+    p.add_argument(
+        "--drop-vol-features",
+        action="store_true",
+        default=False,
+        help=(
+            "Exclude volatility-magnitude features (atrp_*, atr_*, rv_*, "
+            "ret_std_*, range_ma_*, vol_of_vol_*, tf*_atrp_*, tf*_rv_*) "
+            "before fitting. Use with vol-normalized datasets (*_voln) to "
+            "prevent the model relearning the vol confound via features."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -953,6 +1017,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         calibration_method=args.calibration,
         min_test_winrate=args.min_test_winrate,
         min_test_ntrades=args.min_test_ntrades,
+        drop_vol_features=args.drop_vol_features,
     )
     print(json.dumps(asdict(summary), default=str, indent=2))
     return 0

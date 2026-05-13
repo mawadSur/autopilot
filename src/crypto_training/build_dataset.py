@@ -61,6 +61,8 @@ class DatasetSummary:
     horizon_bars: int
     threshold_bps: float
     label_distribution: dict
+    label_kind: Literal["fixed_bps", "vol_normalized"] = "fixed_bps"
+    vol_normalize_k: float = 0.5
     output_path: Optional[Path] = None
 
 
@@ -94,12 +96,39 @@ def load_ohlcv(
 
 
 def label_forward_return_binary(
-    df: pd.DataFrame, *, horizon_bars: int, threshold_bps: float
+    df: pd.DataFrame,
+    *,
+    horizon_bars: int,
+    threshold_bps: float,
+    label_kind: Literal["fixed_bps", "vol_normalized"] = "fixed_bps",
+    vol_normalize_k: float = 0.5,
 ) -> pd.Series:
-    """1 if forward return over ``horizon_bars`` exceeds ``threshold_bps`` (after fees).
+    """1 if forward return over ``horizon_bars`` exceeds the label threshold.
 
     The forward return is computed in basis points:
     ``(close[t+horizon] - close[t]) / close[t] * 10000``.
+
+    Two label schemes are supported via ``label_kind``:
+
+    ``fixed_bps`` (default, backwards-compatible):
+        ``label = forward_return_bps > threshold_bps``
+        Simpler but volatility-confounded: in high-vol periods, more bars
+        trivially cross any fixed threshold regardless of direction. The model
+        then learns "high vol -> label=1" instead of "direction -> label=1".
+
+    ``vol_normalized``:
+        ``label = forward_return_bps > vol_normalize_k * atrp_14_bps``
+        where ``atrp_14_bps = atr_14 / close * 10000``.
+        This normalizes the threshold by local volatility so label=1 means
+        "forward move exceeded k standard-deviation moves", not just "moved a
+        lot in absolute terms." The model must learn directional alpha to
+        predict this, not just detect high-volatility regimes.
+
+        Rows where ``atrp_14`` is NaN (typically the first 14 bars of warmup)
+        produce NaN labels and are dropped downstream by ``build_dataset``.
+
+        Requires ``atrp_14`` and ``close`` columns in ``df`` (both are present
+        in any frame returned by ``compute_features``).
     """
     closes = df["close"].astype(float).to_numpy()
     forward = np.full_like(closes, np.nan, dtype=np.float64)
@@ -109,14 +138,33 @@ def label_forward_return_binary(
             / np.where(closes[:-horizon_bars] == 0, 1e-12, closes[:-horizon_bars])
             * 10000.0
         )
+
+    if label_kind == "fixed_bps":
+        label_arr = np.where(
+            np.isnan(forward), np.nan, (forward > threshold_bps).astype(float)
+        )
+    elif label_kind == "vol_normalized":
+        if "atrp_14" not in df.columns:
+            raise ValueError(
+                "label_kind='vol_normalized' requires an 'atrp_14' column. "
+                "Run compute_features() before calling label_forward_return_binary()."
+            )
+        # atrp_14 is already in percent (ATR / close * 100); convert to bps.
+        atrp_bps = df["atrp_14"].astype(float).to_numpy() * 100.0
+        dynamic_thr = vol_normalize_k * atrp_bps
+        label_arr = np.where(
+            np.isnan(forward) | np.isnan(atrp_bps),
+            np.nan,
+            (forward > dynamic_thr).astype(float),
+        )
+    else:
+        raise ValueError(
+            f"Unknown label_kind {label_kind!r}; expected 'fixed_bps' or 'vol_normalized'."
+        )
+
     # Use a nullable float series so we can express NaN for the trailing
     # rows that have no forward target. The trainer downstream casts to int.
-    label = pd.Series(
-        np.where(np.isnan(forward), np.nan, (forward > threshold_bps).astype(float)),
-        index=df.index,
-        name="label",
-    )
-    return label
+    return pd.Series(label_arr, index=df.index, name="label")
 
 
 def label_forward_return_three_class(
@@ -154,6 +202,8 @@ def build_dataset(
     horizon_bars: int = 5,
     threshold_bps: float = 10.0,
     label_mode: Literal["binary", "three_class"] = "binary",
+    label_kind: Literal["fixed_bps", "vol_normalized"] = "fixed_bps",
+    vol_normalize_k: float = 0.5,
     feature_cols: Optional[List[str]] = None,
     output_path: Optional[Path] = None,
 ) -> tuple[pd.DataFrame, DatasetSummary]:
@@ -181,7 +231,11 @@ def build_dataset(
     # Label.
     if label_mode == "binary":
         feats["label"] = label_forward_return_binary(
-            feats, horizon_bars=horizon_bars, threshold_bps=threshold_bps
+            feats,
+            horizon_bars=horizon_bars,
+            threshold_bps=threshold_bps,
+            label_kind=label_kind,
+            vol_normalize_k=vol_normalize_k,
         )
     elif label_mode == "three_class":
         feats["label"] = label_forward_return_three_class(
@@ -235,6 +289,8 @@ def build_dataset(
         horizon_bars=horizon_bars,
         threshold_bps=threshold_bps,
         label_distribution=label_dist,
+        label_kind=label_kind,
+        vol_normalize_k=vol_normalize_k,
     )
 
     if output_path is not None:
@@ -308,6 +364,27 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Label scheme (default binary)",
     )
     p.add_argument(
+        "--label-kind",
+        choices=["fixed_bps", "vol_normalized"],
+        default="fixed_bps",
+        help=(
+            "Label threshold kind for binary mode (default fixed_bps). "
+            "'vol_normalized' uses forward_return_bps > k * atrp_14_bps so "
+            "the threshold scales with local volatility, removing the "
+            "volatility-confound that causes models to learn 'high vol -> label=1'."
+        ),
+    )
+    p.add_argument(
+        "--vol-normalize-k",
+        type=float,
+        default=0.5,
+        help=(
+            "Multiplier for the vol-normalized label threshold: "
+            "label=1 when forward_return_bps > k * atrp_14_bps (default 0.5). "
+            "Only used when --label-kind=vol_normalized."
+        ),
+    )
+    p.add_argument(
         "--out",
         type=Path,
         required=True,
@@ -330,6 +407,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         horizon_bars=args.horizon_bars,
         threshold_bps=args.threshold_bps,
         label_mode=args.label_mode,
+        label_kind=args.label_kind,
+        vol_normalize_k=args.vol_normalize_k,
         output_path=args.out,
     )
     LOGGER.info(
