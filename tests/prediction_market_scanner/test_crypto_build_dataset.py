@@ -24,8 +24,11 @@ from crypto_training.build_dataset import (
     build_dataset,
     label_forward_return_binary,
     label_forward_return_three_class,
+    load_microstructure_sidecars,
     load_ohlcv,
+    merge_microstructure,
 )
+from history_coindesk import L2_FEATURE_COLUMNS, TRADE_AGG_COLUMNS
 
 # ---------------------------------------------------------------------------
 # Vol-normalized label tests
@@ -338,6 +341,212 @@ class BuildDatasetTests(unittest.TestCase):
             list(df.columns), ["timestamp", *chosen, "label"]
         )
         self.assertEqual(summary.feature_count, len(chosen))
+
+
+# ---------------------------------------------------------------------------
+# Microstructure sidecar merge
+# ---------------------------------------------------------------------------
+
+
+def _write_synthetic_microstructure(
+    *,
+    root: Path,
+    symbol: str,
+    timestamps: List[datetime],
+    base_bid: float = 2000.0,
+) -> Path:
+    """Write a synthetic microstructure parquet covering the given timestamps.
+
+    Schema matches the live collector exactly: timestamp + every column in
+    history_coindesk.{L2_FEATURE_COLUMNS, TRADE_AGG_COLUMNS}. Values are
+    deterministic so tests can assert on them.
+    """
+    dir_path = root / symbol.replace("/", "-") / "microstructure_1m"
+    dir_path.mkdir(parents=True, exist_ok=True)
+    # group by UTC date so we write one file per day, like the real collector
+    by_day: dict = {}
+    for i, ts in enumerate(timestamps):
+        day_key = ts.date().isoformat()
+        by_day.setdefault(day_key, []).append((i, ts))
+    last_path: Path = dir_path
+    for day_key, items in by_day.items():
+        rows = []
+        for i, ts in items:
+            row = {"timestamp": ts}
+            for c in L2_FEATURE_COLUMNS:
+                # Encode the index into best_bid so we can verify the join
+                # matched the right row at the right timestamp.
+                row[c] = float(base_bid + i)
+            for c in TRADE_AGG_COLUMNS:
+                row[c] = float(i)
+            rows.append(row)
+        df = pd.DataFrame(rows)
+        path = dir_path / f"{day_key}.parquet"
+        df.to_parquet(path, index=False)
+        last_path = path
+    return last_path
+
+
+class MicrostructureMergeTests(unittest.TestCase):
+    """Regression for 2026-05-14: the live collector's per-day parquet
+    sidecars must be merged into the training dataset, otherwise the
+    booster gets trained on zero values for ~55 microstructure features
+    and never splits on them at inference time.
+    """
+
+    def test_no_sidecar_dir_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self.assertIsNone(
+                load_microstructure_sidecars(
+                    data_root=Path(td), symbol="ETH/USD"
+                )
+            )
+
+    def test_empty_sidecar_dir_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            empty_dir = Path(td) / "ETH-USD" / "microstructure_1m"
+            empty_dir.mkdir(parents=True)
+            self.assertIsNone(
+                load_microstructure_sidecars(
+                    data_root=Path(td), symbol="ETH/USD"
+                )
+            )
+
+    def test_merge_no_micro_is_passthrough(self) -> None:
+        # Regression pin: missing sidecars => merged frame is byte-identical
+        # to the input (the legacy OHLCV-only path).
+        ohlcv = pd.DataFrame(
+            {
+                "timestamp": ["2026-05-13T00:00:00+00:00"],
+                "open": [1.0], "high": [1.1], "low": [0.9],
+                "close": [1.05], "volume": [10.0],
+            }
+        )
+        merged = merge_microstructure(ohlcv, None)
+        pd.testing.assert_frame_equal(merged, ohlcv)
+        merged_empty = merge_microstructure(ohlcv, pd.DataFrame())
+        pd.testing.assert_frame_equal(merged_empty, ohlcv)
+
+    def test_merge_populates_matched_rows_only(self) -> None:
+        ohlcv = pd.DataFrame(
+            {
+                "timestamp": [
+                    "2026-05-13T00:00:00+00:00",
+                    "2026-05-13T00:01:00+00:00",
+                    "2026-05-13T00:02:00+00:00",
+                ],
+                "open": [1.0, 2.0, 3.0], "high": [1.1, 2.1, 3.1],
+                "low": [0.9, 1.9, 2.9], "close": [1.05, 2.05, 3.05],
+                "volume": [10.0, 20.0, 30.0],
+            }
+        )
+        # Sidecar covers only the middle row.
+        micro = pd.DataFrame(
+            {
+                "timestamp": [
+                    pd.Timestamp("2026-05-13T00:01:00+00:00")
+                ],
+                **{c: [123.0] for c in L2_FEATURE_COLUMNS},
+                **{c: [7.0] for c in TRADE_AGG_COLUMNS},
+            }
+        )
+        merged = merge_microstructure(ohlcv, micro)
+        self.assertEqual(len(merged), 3)
+        # Row 1 (matched) has real values; rows 0, 2 have NaN.
+        self.assertEqual(merged.iloc[1]["best_bid"], 123.0)
+        self.assertEqual(merged.iloc[1]["trade_count"], 7.0)
+        self.assertTrue(pd.isna(merged.iloc[0]["best_bid"]))
+        self.assertTrue(pd.isna(merged.iloc[2]["best_bid"]))
+        # All micro columns from history_coindesk schema are present.
+        for c in L2_FEATURE_COLUMNS + TRADE_AGG_COLUMNS:
+            self.assertIn(c, merged.columns)
+
+    def test_merge_drops_overlapping_columns_from_raw(self) -> None:
+        # If raw already has placeholder microstructure columns (zeros),
+        # the sidecar's values must win -- no _micro suffix in output.
+        ohlcv = pd.DataFrame(
+            {
+                "timestamp": ["2026-05-13T00:00:00+00:00"],
+                "open": [1.0], "high": [1.1], "low": [0.9],
+                "close": [1.05], "volume": [10.0],
+                "best_bid": [0.0],  # placeholder zero
+                "trade_count": [0.0],
+            }
+        )
+        micro = pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2026-05-13T00:00:00+00:00")],
+                "best_bid": [42.0],
+                **{c: [1.0] for c in L2_FEATURE_COLUMNS if c != "best_bid"},
+                **{c: [1.0] for c in TRADE_AGG_COLUMNS if c != "trade_count"},
+                "trade_count": [99.0],
+            }
+        )
+        merged = merge_microstructure(ohlcv, micro)
+        self.assertNotIn("best_bid_micro", merged.columns)
+        self.assertNotIn("trade_count_micro", merged.columns)
+        self.assertEqual(merged.iloc[0]["best_bid"], 42.0)
+        self.assertEqual(merged.iloc[0]["trade_count"], 99.0)
+
+    def test_build_dataset_no_sidecars_unchanged_output(self) -> None:
+        # Regression pin: when no sidecars exist for the symbol, the dataset
+        # output is identical to the legacy (pre-2026-05-14) behavior. Any
+        # change in feature_count or schema would break already-trained models.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            day = datetime(2026, 4, 25, tzinfo=timezone.utc)
+            _write_synthetic_day(
+                root=root, symbol="ETH/USD", day=day, n_bars=400
+            )
+            df, summary = build_dataset(
+                data_root=root,
+                symbol="ETH/USD",
+                horizon_bars=5,
+                threshold_bps=5.0,
+                label_mode="binary",
+            )
+        # The microstructure columns are still emitted (with placeholder zeros
+        # from ensure_optional_microstructure_columns), so the schema is
+        # unchanged whether sidecars exist or not.
+        for c in L2_FEATURE_COLUMNS:
+            self.assertIn(c, df.columns)
+        # And they are all zero (no sidecar coverage).
+        for c in L2_FEATURE_COLUMNS:
+            self.assertTrue(
+                (df[c] == 0).all(),
+                f"column {c!r} should be all-zero with no sidecars",
+            )
+
+    def test_build_dataset_with_sidecars_populates_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            day = datetime(2026, 4, 25, tzinfo=timezone.utc)
+            _write_synthetic_day(
+                root=root, symbol="ETH/USD", day=day, n_bars=400
+            )
+            # Sidecar covers a contiguous block of the synthetic day so
+            # most output rows (after warmup + label-trim) have real
+            # microstructure values.
+            covered_ts = [
+                day + timedelta(minutes=i) for i in range(50, 350)
+            ]
+            _write_synthetic_microstructure(
+                root=root, symbol="ETH/USD", timestamps=covered_ts
+            )
+            df, summary = build_dataset(
+                data_root=root,
+                symbol="ETH/USD",
+                horizon_bars=5,
+                threshold_bps=5.0,
+                label_mode="binary",
+            )
+        # Some output rows must have non-zero best_bid (sidecar coverage).
+        self.assertGreater(
+            int((df["best_bid"] != 0).sum()), 0,
+            "build_dataset failed to merge sidecar microstructure values",
+        )
+        # Trade-count slot, which was zero in the legacy path, also picks up.
+        self.assertGreater(int((df["trade_count"] != 0).sum()), 0)
 
 
 if __name__ == "__main__":

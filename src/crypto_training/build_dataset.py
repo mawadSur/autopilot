@@ -95,6 +95,84 @@ def load_ohlcv(
     return df
 
 
+def load_microstructure_sidecars(
+    *, data_root: Path, symbol: str
+) -> Optional[pd.DataFrame]:
+    """Concatenate every per-day microstructure parquet for ``symbol``.
+
+    Reads ``<data_root>/<safe_symbol>/microstructure_1m/*.parquet`` (written
+    by ``src/microstructure_collector.py``). Returns the concatenated frame
+    with duplicate timestamps removed (last-wins) and ascending sort.
+    Returns ``None`` when the directory is missing or empty so the caller
+    can short-circuit to the legacy OHLCV-only path with no behavior change.
+
+    Column schema is whatever the collector wrote -- by construction those
+    are ``history_coindesk.L2_FEATURE_COLUMNS + TRADE_AGG_COLUMNS`` (the
+    collector's own ``test_schema_matches_history_coindesk`` regression
+    test pins this), so downstream feature derivation in
+    :func:`utils.compute_features` finds the columns it expects.
+    """
+    sidecar_dir = (
+        Path(data_root).expanduser().resolve()
+        / _safe_symbol(symbol)
+        / "microstructure_1m"
+    )
+    if not sidecar_dir.exists():
+        return None
+    files = sorted(sidecar_dir.glob("*.parquet"))
+    if not files:
+        return None
+    frames: List[pd.DataFrame] = []
+    for f in files:
+        frames.append(pd.read_parquet(f))
+    df = pd.concat(frames, ignore_index=True)
+    df = df.drop_duplicates(subset="timestamp", keep="last")
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    return df
+
+
+def merge_microstructure(
+    raw: pd.DataFrame, micro: Optional[pd.DataFrame]
+) -> pd.DataFrame:
+    """Left-join microstructure columns onto OHLCV by minute timestamp.
+
+    Both sides are normalised to ``pd.Timestamp`` (UTC) on a temporary
+    ``_join_ts`` column before merging so an ISO-string OHLCV side joins
+    correctly against the parquet's ``datetime64[us, UTC]`` side. The
+    merge is left-outer: every raw OHLCV row survives; microstructure
+    columns are populated where the sidecar covers the timestamp,
+    left as NaN otherwise.
+
+    Any microstructure column already present in ``raw`` is dropped
+    before the merge -- the sidecar wins. This makes the function safe
+    to call on a frame that already has the placeholder columns from
+    some prior step.
+
+    No-op pass-through when ``micro`` is None or empty.
+    """
+    if micro is None or len(micro) == 0:
+        return raw
+    raw = raw.copy()
+    micro = micro.copy()
+
+    raw["_join_ts"] = pd.to_datetime(raw["timestamp"], utc=True)
+    micro["_join_ts"] = pd.to_datetime(micro["timestamp"], utc=True)
+    micro_cols = [c for c in micro.columns if c not in ("timestamp", "_join_ts")]
+
+    # If raw already has any of these columns (placeholder zeros from a
+    # prior pipeline step, say), drop them so the sidecar's values win
+    # instead of getting suffixed to _micro.
+    overlap = [c for c in micro_cols if c in raw.columns]
+    if overlap:
+        raw = raw.drop(columns=overlap)
+
+    merged = raw.merge(
+        micro[["_join_ts", *micro_cols]], on="_join_ts", how="left"
+    )
+    merged = merged.drop(columns=["_join_ts"])
+    return merged
+
+
 def label_forward_return_binary(
     df: pd.DataFrame,
     *,
@@ -221,6 +299,34 @@ def build_dataset(
     )
     rows_in = len(raw)
     LOGGER.info("loaded %d raw OHLCV rows for %s/%s", rows_in, symbol, granularity_label)
+
+    # Merge any per-day microstructure sidecars written by the live
+    # collector. compute_features.ensure_optional_microstructure_columns
+    # already defaults missing columns to zero, so the merge is purely
+    # additive: where sidecars cover a timestamp, real L2/trade values
+    # propagate into downstream derived features; elsewhere the dataset
+    # looks identical to the legacy OHLCV-only path.
+    micro = load_microstructure_sidecars(data_root=data_root, symbol=symbol)
+    if micro is not None:
+        raw = merge_microstructure(raw, micro)
+        micro_cols = [
+            c for c in micro.columns
+            if c not in ("timestamp",)
+        ]
+        coverage = int(raw[micro_cols[0]].notna().sum()) if micro_cols else 0
+        LOGGER.info(
+            "microstructure merge: %d sidecar rows; %d / %d OHLCV rows now have microstructure",
+            len(micro),
+            coverage,
+            rows_in,
+        )
+    else:
+        LOGGER.info(
+            "no microstructure sidecars under %s/%s; "
+            "microstructure features default to zero (legacy path)",
+            symbol,
+            "microstructure_1m",
+        )
 
     # Preserve timestamp -- compute_features drops it during feature
     # engineering but we need it for time-based train/val/test splits.
