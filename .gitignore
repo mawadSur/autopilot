@@ -41,6 +41,10 @@ runs/
 data/crypto/datasets/*.parquet
 model_crypto/
 
+# Live microstructure collector output (per-minute parquet sidecars, regen by
+# running src/microstructure_collector.py against Coinbase Advanced Trade WS).
+data/crypto/*/microstructure_1m/
+
 # Regime memory stores (regen via `PYTHONPATH=src python -m regime_memory.backfill`)
 data/regime_stores/
 
