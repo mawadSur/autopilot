@@ -133,6 +133,7 @@ class StubPositionStore:
         self._closed_today: List[Position] = list(closed_today or [])
         self.recorded_open: List[Position] = []
         self.recorded_pending: List[Position] = []
+        self.recorded_close_calls: List[Dict[str, Any]] = []
         # Lane A P0 #3: error counter shim. The supervisor now calls
         # store.increment_error / errors_today / reset_errors_for_day
         # instead of mutating an in-memory dict on Supervisor itself.
@@ -177,6 +178,66 @@ class StubPositionStore:
         self.recorded_pending.append(position)
         self._open.append(position)
         return position
+
+    def record_close(
+        self,
+        position_id: str,
+        *,
+        exit_price: float,
+        exit_quote_usd: float,
+        fees_usd: float = 0.0,
+        bankroll_usd: Optional[float] = None,
+    ) -> Position:
+        """Mirror PositionStore.record_close just enough for tests.
+
+        Removes the position from _open, mutates status="closed", and
+        records the call so tests can assert on close-side exit_price /
+        exit_quote_usd. PnL math mirrors the production formula so the
+        same realized_pnl_usd assertions work against either backend.
+        """
+        for i, p in enumerate(self._open):
+            if p.position_id == position_id:
+                existing = p
+                break
+        else:
+            raise KeyError(f"unknown position_id: {position_id!r}")
+        total_fees = float(existing.fees_usd) + float(fees_usd)
+        if existing.side == "long":
+            realized = (
+                float(existing.base_size)
+                * (float(exit_price) - float(existing.entry_price))
+                - total_fees
+            )
+        else:
+            realized = (
+                float(existing.base_size)
+                * (float(existing.entry_price) - float(exit_price))
+                - total_fees
+            )
+        updated = existing.model_copy(
+            update={
+                "status": "closed",
+                "exit_price": float(exit_price),
+                "exit_quote_usd": float(exit_quote_usd),
+                "fees_usd": total_fees,
+                "realized_pnl_usd": realized,
+                "closed_at_utc": "2026-04-26T00:00:00+00:00",
+            }
+        )
+        # Remove from open list, add to closed_today so subsequent reads
+        # see consistent state.
+        self._open = [q for q in self._open if q.position_id != position_id]
+        self._closed_today.append(updated)
+        self.recorded_close_calls.append(
+            {
+                "position_id": position_id,
+                "exit_price": float(exit_price),
+                "exit_quote_usd": float(exit_quote_usd),
+                "fees_usd": float(fees_usd),
+                "bankroll_usd": bankroll_usd,
+            }
+        )
+        return updated
 
     # -- error counter shim (Lane A P0 #3)
     def increment_error(
@@ -319,10 +380,11 @@ def _make_position(
     symbol: str = "ETH/USDT",
     entry_price: float = 2_000.0,
     base_size: float = 0.05,
+    exchange: str = "coinbase",
 ) -> Position:
     return Position(
         position_id=str(uuid.uuid4()),
-        exchange="coinbase",
+        exchange=exchange,
         symbol=symbol,
         side=side,  # type: ignore[arg-type]
         status="open",
@@ -461,6 +523,117 @@ class TestRunOnceForceFlat(unittest.TestCase):
         self.assertEqual(len(refs["exchange"].market_orders), 2)
         # And the kill-switch alert went out.
         self.assertEqual(len(refs["notifier"].kill_switch_calls), 1)
+
+
+class TestForceFlatModeAwareDispatch(unittest.TestCase):
+    """Regression for 2026-05-14: paper-mode force-flat must NEVER place a
+    real market order. Dispatch is per-position based on ``position.exchange``
+    (``coinbase-paper`` vs ``coinbase``), not on supervisor mode -- so a
+    stale live position from a prior run still routes correctly even when
+    the current supervisor boot is paper, and a stale paper position never
+    leaks into the live exchange even if the supervisor is in live mode.
+    """
+
+    def test_paper_tagged_position_does_not_call_place_market_order(self) -> None:
+        # Two paper-tagged positions; kill switch tripped; expect zero
+        # exchange order placements and two record_close calls.
+        ticker_mid = 2_500.0
+        paper_long = _make_position(
+            side="long", symbol="ETH/USDT", exchange="coinbase-paper",
+            entry_price=2_400.0, base_size=0.1,
+        )
+        paper_short = _make_position(
+            side="short", symbol="BTC/USDT", exchange="coinbase-paper",
+            entry_price=60_000.0, base_size=0.002,
+        )
+        store = StubPositionStore(open_positions=[paper_long, paper_short])
+        exchange = StubExchange(ticker_mid=ticker_mid)
+        breakers = StubCircuitBreakers(kill_switch=True)
+        sup, refs = _build_supervisor(
+            mode="paper",
+            position_store=store,
+            exchange=exchange,
+            circuit_breakers=breakers,
+        )
+        ticks = sup.run_once()
+        self.assertEqual(ticks[0].action_taken, "force_flatted")
+        # Zero live-exchange order placements.
+        self.assertEqual(
+            refs["exchange"].market_orders, [],
+            "paper-mode force-flat must not place real market orders",
+        )
+        # Both paper positions closed locally.
+        self.assertEqual(len(refs["position_store"].recorded_close_calls), 2)
+        # Exit-price math: long close sells -> mid*(1 - slippage);
+        # short close buys -> mid*(1 + slippage).
+        slip = PAPER_SLIPPAGE_BPS / 10_000.0
+        by_pid = {
+            c["position_id"]: c
+            for c in refs["position_store"].recorded_close_calls
+        }
+        self.assertAlmostEqual(
+            by_pid[paper_long.position_id]["exit_price"],
+            ticker_mid * (1.0 - slip),
+            places=4,
+        )
+        self.assertAlmostEqual(
+            by_pid[paper_short.position_id]["exit_price"],
+            ticker_mid * (1.0 + slip),
+            places=4,
+        )
+
+    def test_live_tagged_position_still_uses_place_market_order(self) -> None:
+        # Regression pin: live-tagged positions must still go through
+        # exchange.place_market_order even when the supervisor is in
+        # paper mode. This is the path for a stale live position from
+        # a prior run that needs to be flattened from the real account.
+        live_long = _make_position(
+            side="long", symbol="ETH/USDT", exchange="coinbase",
+        )
+        store = StubPositionStore(open_positions=[live_long])
+        exchange = StubExchange()
+        breakers = StubCircuitBreakers(kill_switch=True)
+        sup, refs = _build_supervisor(
+            mode="paper",  # critical: supervisor in paper, position is live
+            position_store=store,
+            exchange=exchange,
+            circuit_breakers=breakers,
+        )
+        sup.run_once()
+        # One live order placed, zero local-only closes.
+        self.assertEqual(len(refs["exchange"].market_orders), 1)
+        self.assertEqual(refs["exchange"].market_orders[0]["side"], "sell")
+        self.assertEqual(refs["position_store"].recorded_close_calls, [])
+
+    def test_mixed_positions_dispatch_per_tag(self) -> None:
+        # One paper + one live; verify per-position routing.
+        paper_pos = _make_position(
+            side="long", symbol="ETH/USDT", exchange="coinbase-paper",
+        )
+        live_pos = _make_position(
+            side="short", symbol="BTC/USDT", exchange="coinbase",
+        )
+        store = StubPositionStore(open_positions=[paper_pos, live_pos])
+        exchange = StubExchange()
+        breakers = StubCircuitBreakers(kill_switch=True)
+        sup, refs = _build_supervisor(
+            mode="paper",
+            position_store=store,
+            exchange=exchange,
+            circuit_breakers=breakers,
+        )
+        sup.run_once()
+        # Exactly one live order (for the live-tagged position).
+        self.assertEqual(len(refs["exchange"].market_orders), 1)
+        self.assertEqual(
+            refs["exchange"].market_orders[0]["symbol"], "BTC/USDT"
+        )
+        # Exactly one local close (for the paper-tagged position).
+        self.assertEqual(len(refs["position_store"].recorded_close_calls), 1)
+        self.assertEqual(
+            refs["position_store"].recorded_close_calls[0]["position_id"],
+            paper_pos.position_id,
+        )
 
 
 class TestRunOnceBreakerHaltsEntries(unittest.TestCase):

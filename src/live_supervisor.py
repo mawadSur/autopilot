@@ -1853,7 +1853,17 @@ class Supervisor:
     # Force-flat
     # ------------------------------------------------------------------
     def _force_flat_all(self, *, reason: str) -> int:
-        """Best-effort close of every open position. Returns count closed."""
+        """Best-effort close of every open position. Returns count closed.
+
+        Dispatch is per-position based on ``position.exchange`` rather than
+        on ``self.config.mode``. Positions opened by paper-mode runs are
+        tagged ``coinbase-paper`` (see ``_drain_pending_paper_fill``) and
+        must close via the local paper-fill path -- *never* place a real
+        market order. Live-tagged positions stay on the existing
+        ``place_market_order`` path so a stale live position from a prior
+        run still flattens correctly even if the current supervisor boot
+        is in paper mode.
+        """
         closed = 0
         for position in self.position_store.list_open():
             # Lane E E1: capture a breaker snapshot per affected position
@@ -1866,9 +1876,12 @@ class Supervisor:
                 "sell" if position.side == "long" else "buy"
             )
             try:
-                self.exchange.place_market_order(
-                    position.symbol, close_side, base_size=position.base_size
-                )
+                if position.exchange == "coinbase-paper":
+                    self._paper_force_flat(position, close_side)
+                else:
+                    self.exchange.place_market_order(
+                        position.symbol, close_side, base_size=position.base_size
+                    )
                 closed += 1
             except Exception as exc:  # noqa: BLE001 - keep iterating
                 LOGGER.warning(
@@ -1878,6 +1891,48 @@ class Supervisor:
                     exc,
                 )
         return closed
+
+    def _paper_force_flat(
+        self, position: Position, close_side: Literal["buy", "sell"]
+    ) -> None:
+        """Synthesise a paper close fill and record via position_store.
+
+        Mirrors :meth:`_drain_pending_paper_fill`'s slippage model: 5 bps
+        applied against the current ticker mid in the close direction
+        (sell -> price *down*, buy -> price *up*). Falls back to the
+        position's entry price if ticker mid is non-positive.
+
+        Reading the ticker is a market-data call, not an order, so it is
+        safe to fetch via ``self.exchange.get_ticker`` even when the
+        supervisor is running in paper mode -- only order placement is
+        what we must keep off the live exchange.
+        """
+        ticker = self.exchange.get_ticker(position.symbol)
+        slip = PAPER_SLIPPAGE_BPS / 10_000.0
+        mid = float(ticker.mid)
+        if close_side == "buy":
+            exit_price = mid * (1.0 + slip)
+        else:
+            exit_price = mid * (1.0 - slip)
+        if exit_price <= 0:
+            exit_price = mid if mid > 0 else float(position.entry_price)
+        exit_quote = exit_price * float(position.base_size)
+        self.position_store.record_close(
+            position.position_id,
+            exit_price=exit_price,
+            exit_quote_usd=exit_quote,
+            fees_usd=0.0,
+            bankroll_usd=float(self.config.bankroll_usd),
+        )
+        LOGGER.info(
+            "paper force-flat: %s %s close_side=%s exit_price=%.4f "
+            "(slippage_bps=%.1f)",
+            position.position_id,
+            position.symbol,
+            close_side,
+            exit_price,
+            PAPER_SLIPPAGE_BPS,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
