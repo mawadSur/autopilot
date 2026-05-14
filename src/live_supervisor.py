@@ -548,6 +548,11 @@ class Supervisor:
         # counts now live in Redis (P0 #3) so multiple symbol-supervisor
         # processes can share state under the D1 multiprocessing model.
         self._kill_switch_trips_today = 0
+        # Edge-triggered alert latch: True while the kill-switch file is
+        # detected as present. We alert + force-flatten only on the
+        # False->True edge; subsequent ticks while still tripped no-op
+        # silently. Cleared on the True->False edge (operator removes file).
+        self._kill_switch_active: bool = False
 
         # One-time warning latches, keyed by symbol so the live-locked
         # warning fires once per locked symbol per process.
@@ -1254,13 +1259,24 @@ class Supervisor:
 
     def _tick_symbol(self, symbol: str) -> SupervisorTick:
         now = self._now()
-        # 1. Kill switch first.
-        if self.circuit_breakers.is_kill_switch_tripped():
-            self._kill_switch_trips_today += 1
-            count = self._force_flat_all(reason="kill_switch_file_present")
-            self._safe_kill_switch_alert(
-                f"kill switch tripped; force-closed {count} position(s)"
-            )
+        # 1. Kill switch first. Alert + force-flatten only on the trip
+        # edge (transition into tripped state); subsequent ticks while
+        # still tripped return a silent ``force_flatted`` verdict so the
+        # operator gets one notification, not one per tick. Clearing the
+        # kill-switch file resets the latch.
+        tripped_now = self.circuit_breakers.is_kill_switch_tripped()
+        if tripped_now:
+            if not self._kill_switch_active:
+                self._kill_switch_active = True
+                self._kill_switch_trips_today += 1
+                count = self._force_flat_all(reason="kill_switch_file_present")
+                self._safe_kill_switch_alert(
+                    f"kill switch tripped; force-closed {count} position(s)"
+                )
+                notes = f"force_closed={count}"
+            else:
+                count = 0
+                notes = "kill_switch_held"
             return SupervisorTick(
                 tick_at_utc=now.isoformat(),
                 symbol=symbol,
@@ -1273,7 +1289,12 @@ class Supervisor:
                 ),
                 model_confidence=None,
                 action_taken="force_flatted",
-                notes=f"force_closed={count}",
+                notes=notes,
+            )
+        if self._kill_switch_active:
+            self._kill_switch_active = False
+            LOGGER.info(
+                "kill switch cleared (file removed); resuming normal ticks"
             )
 
         # 2. Fetch ticker (this is the first place a network ExchangeError
