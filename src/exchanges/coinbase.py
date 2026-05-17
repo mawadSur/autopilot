@@ -322,6 +322,42 @@ class CoinbaseExchange:
         self._ccxt = ccxt_module
         self._client = self._build_client()
 
+        # Optional WS market-data stream. Opt-in via COINBASE_WS_STREAM
+        # so existing tests (and operators who want the simpler REST-only
+        # path) see zero behavioural change. When enabled, get_ticker and
+        # fetch_recent_candles consult the stream first and fall back to
+        # REST when the cache is empty/stale.
+        self._stream: Optional["CoinbaseMarketStream"] = None
+        ws_enabled = os.getenv("COINBASE_WS_STREAM", "").strip().lower() in (
+            "1",
+            "on",
+            "true",
+            "yes",
+        )
+        if ws_enabled:
+            try:
+                from exchanges.coinbase_ws import CoinbaseMarketStream
+
+                self._stream = CoinbaseMarketStream()
+                self._stream.start()
+            except Exception as exc:  # noqa: BLE001 -- stream is opt-in; never crash
+                logger.warning(
+                    "CoinbaseExchange: WS stream init failed (%s); REST-only",
+                    exc,
+                )
+                self._stream = None
+
+    def close(self) -> None:
+        """Best-effort shutdown of the optional WS stream thread."""
+        stream = self._stream
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:  # noqa: BLE001
+                logger.warning("CoinbaseExchange: stream stop raised", exc_info=True)
+            finally:
+                self._stream = None
+
     # -- client construction -------------------------------------------------
 
     def _build_client(self) -> Any:
@@ -557,16 +593,37 @@ class CoinbaseExchange:
         return balances
 
     def get_ticker(self, symbol: str) -> Ticker:
-        """Fetch ticker. Uses Coinbase's public REST endpoint directly.
+        """Fetch ticker. Stream cache (if attached + fresh) > REST fallback.
 
-        Bypasses ccxt because ccxt 4.5's coinbase driver raises IndexError
-        from inside its parser against the Advanced Trade unified endpoint.
-        The public ``/api/v3/brokerage/market/products/{product_id}`` endpoint
-        needs no auth and returns exactly the fields we need.
-
-        ccxt is still used for orders / balances / open orders.
+        The REST endpoint is the public Advanced Trade
+        ``/api/v3/brokerage/market/products/{product_id}``. When
+        ``COINBASE_WS_STREAM=on``, get_ticker first consults the
+        WS cache and only falls through to REST on cache miss / staleness;
+        this kills the per-tick latency + DNS-blip fragility documented
+        in [[autopilot-no-exit-policy-blocker-2026-05-16]].
         """
         norm_symbol = _coinbase_market_symbol(symbol)
+        # Stream fast path. The stream itself is a soft dependency --
+        # any failure here silently falls through to REST.
+        stream = self._stream
+        if stream is not None:
+            try:
+                stream.ensure_subscribed(norm_symbol)
+                cached = stream.get_ticker(norm_symbol)
+            except Exception:  # noqa: BLE001
+                cached = None
+            if cached is not None:
+                try:
+                    return Ticker(
+                        symbol=norm_symbol,
+                        bid=float(cached["bid"]),
+                        ask=float(cached["ask"]),
+                        last=float(cached["last"]),
+                        volume_24h_base=float(cached.get("volume_24h_base", 0.0)),
+                        as_of_utc=str(cached.get("as_of_utc") or ""),
+                    )
+                except Exception:  # noqa: BLE001 -- fall back to REST on parse error
+                    pass
         try:
             return self._fetch_ticker_via_rest(norm_symbol)
         except ExchangeError:
@@ -580,7 +637,7 @@ class CoinbaseExchange:
         product_id = norm_symbol.replace("/", "-")
         url = f"https://api.coinbase.com/api/v3/brokerage/market/products/{product_id}"
         try:
-            resp = requests.get(url, timeout=10.0)
+            resp = requests.get(url, timeout=30.0)
         except Exception as exc:
             raise ExchangeError(f"products GET failed: {exc}") from exc
 
@@ -690,12 +747,34 @@ class CoinbaseExchange:
         ] = "ONE_MINUTE",
         limit: int = 350,
     ) -> List[Dict[str, Any]]:
-        """Fetch the most recent ``limit`` candles via Coinbase REST.
+        """Fetch the most recent ``limit`` candles. Stream cache > REST.
 
         Returns rows sorted oldest-first with keys ``timestamp`` (ISO UTC),
         ``open``, ``high``, ``low``, ``close``, ``volume`` (all floats).
-        Coinbase returns at most 350 candles per request.
+        Coinbase returns at most 350 candles per request via REST; the WS
+        cache is bounded the same way (default 400 bars).
+
+        When the attached stream has ``>= limit`` fresh 1m bars it serves
+        them directly (avoids the per-minute 350-bar REST round-trip the
+        predictor would otherwise burn on every refresh). Falls back to
+        REST when the cache is empty (warmup), too short, or stale.
         """
+        # Stream fast path: only meaningful for the canonical ONE_MINUTE
+        # request. Anything else (historical backfill, multi-tf) goes
+        # straight to REST.
+        stream = self._stream
+        if stream is not None and granularity == "ONE_MINUTE":
+            try:
+                stream.ensure_subscribed(_coinbase_market_symbol(symbol))
+                cached = stream.get_candles(symbol, limit=int(limit))
+            except Exception:  # noqa: BLE001
+                cached = None
+            if cached is not None:
+                # Match REST contract: strip the internal ``_unix`` key.
+                rows = [
+                    {k: v for k, v in row.items() if k != "_unix"} for row in cached
+                ]
+                return rows
         granularity_seconds = {
             "ONE_MINUTE": 60,
             "FIVE_MINUTE": 300,
@@ -738,7 +817,7 @@ class CoinbaseExchange:
             "limit": "350",
         }
         try:
-            resp = requests.get(url, params=params, timeout=10.0)
+            resp = requests.get(url, params=params, timeout=30.0)
         except Exception as exc:
             raise ExchangeError(f"candles GET failed: {exc}") from exc
 
