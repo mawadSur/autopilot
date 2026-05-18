@@ -846,7 +846,12 @@ class TestLiveAllowedAfterShakedown(unittest.TestCase):
         self.assertTrue(sup.is_live_unlocked())
         ticks = sup.run_once()
         self.assertEqual(ticks[0].action_taken, "allowed")
-        self.assertEqual(ticks[0].notes, "live")
+        # Sprint 1 Wave 2: the ``notes`` field now embeds the sizing
+        # source (flat / kelly) and the notional in USD so operators can
+        # see at a glance which path won. The legacy ``"live"`` substring
+        # is preserved as a prefix.
+        self.assertTrue(ticks[0].notes.startswith("live"))
+        self.assertIn("sizing=", ticks[0].notes)
         # Live order WAS placed.
         self.assertEqual(len(exch.market_orders), 1)
         order_call = exch.market_orders[0]

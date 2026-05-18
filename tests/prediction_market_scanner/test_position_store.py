@@ -116,6 +116,31 @@ class PositionSchemaTests(unittest.TestCase):
                 opened_at_utc=datetime.now(timezone.utc).isoformat(),
             )
 
+    def test_position_default_bars_held_and_high_water_mark(self) -> None:
+        """Sprint 1 Wave 2: ``bars_held`` defaults to 0 and
+        ``high_water_mark`` defaults to None. Legacy positions in Redis
+        that predate these fields still validate cleanly thanks to the
+        defaults — this is the backward-compat guarantee for Wave 2."""
+        position = Position(
+            position_id="legacy",
+            exchange="coinbase",
+            symbol="ETH/USDT",
+            side="long",
+            status="open",
+            entry_price=100.0,
+            entry_quote_usd=100.0,
+            base_size=1.0,
+            opened_at_utc=datetime.now(timezone.utc).isoformat(),
+        )
+        self.assertEqual(position.bars_held, 0)
+        self.assertIsNone(position.high_water_mark)
+        # Round-trip via model_dump_json → model_validate_json must
+        # preserve the defaults exactly so a Redis re-read does the right
+        # thing for a legacy blob.
+        roundtrip = Position.model_validate_json(position.model_dump_json())
+        self.assertEqual(roundtrip.bars_held, 0)
+        self.assertIsNone(roundtrip.high_water_mark)
+
 
 class PositionStoreTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -373,6 +398,46 @@ class PositionStoreTests(unittest.TestCase):
             store_b.increment_error("ETH/USD")
         self.assertEqual(self.store.errors_today("ETH/USD"), 8)
         self.assertEqual(store_b.errors_today("ETH/USD"), 8)
+
+    # ------------------------------------------------------------------
+    # Sprint 1 Wave 2: update_runtime_fields round-trip
+    # ------------------------------------------------------------------
+    def test_update_runtime_fields_persists_bars_held_and_hwm(self) -> None:
+        """``update_runtime_fields`` is the per-tick seam ExitPolicy uses
+        to keep ``bars_held`` + ``high_water_mark`` fresh across ticks and
+        across supervisor restarts. The Redis blob must reflect the patch
+        atomically — a re-read via ``get`` returns the new values."""
+        pos = self.store.record_open(
+            _new_position(entry_price=100.0, base_size=1.0)
+        )
+        # Initial values reflect the schema defaults.
+        self.assertEqual(pos.bars_held, 0)
+        self.assertIsNone(pos.high_water_mark)
+        updated = self.store.update_runtime_fields(
+            pos.position_id, bars_held=5, high_water_mark=110.0
+        )
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated.bars_held, 5)
+        self.assertEqual(updated.high_water_mark, 110.0)
+        # Round-trip via get() — proves the write hit Redis, not just the
+        # in-memory local.
+        roundtrip = self.store.get(pos.position_id)
+        self.assertIsNotNone(roundtrip)
+        self.assertEqual(roundtrip.bars_held, 5)
+        self.assertEqual(roundtrip.high_water_mark, 110.0)
+
+    def test_update_runtime_fields_returns_none_for_unknown_id(self) -> None:
+        result = self.store.update_runtime_fields(
+            "ghost", bars_held=1, high_water_mark=1.0
+        )
+        self.assertIsNone(result)
+
+    def test_update_runtime_fields_noop_when_both_args_none(self) -> None:
+        pos = self.store.record_open(_new_position(entry_price=100.0))
+        # Calling with no patch returns the existing position unchanged.
+        result = self.store.update_runtime_fields(pos.position_id)
+        self.assertEqual(result.position_id, pos.position_id)
+        self.assertEqual(result.bars_held, 0)
 
 
 class PostmortemTriggerGateTests(unittest.TestCase):

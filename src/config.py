@@ -99,17 +99,34 @@ class TradingConfig(BaseSettings):
     gemini_timeout_s: int = Field(30, env="GEMINI_TIMEOUT_S")
     gemini_use_search_grounding: bool = Field(True, env="GEMINI_USE_SEARCH_GROUNDING")
 
-    # Exit policy (Sprint 1 Wave 1B). All knobs are independently togglable —
-    # the float / int thresholds use None to disable, the master switch uses
-    # False. EXIT_POLICY_ENABLED is OFF by default so this PR is non-breaking;
-    # Wave 2 supervisor wiring flips it on once the high-water-mark plumbing
-    # and reason-tagged force-flat paths have landed.
+    # Exit policy (Sprint 1 Wave 1B + Wave 2). All knobs are independently
+    # togglable — the float / int thresholds use None to disable, the
+    # master switch uses False. ``EXIT_POLICY_ENABLED`` flipped to True in
+    # Wave 2 once the high-water-mark plumbing and reason-tagged force-flat
+    # paths landed; operators can still opt out with
+    # ``EXIT_POLICY_ENABLED=0`` to reproduce the legacy "no exit policy"
+    # behavior (regression sentinel).
     STOP_LOSS_PCT: Optional[float] = Field(-0.004, env="STOP_LOSS_PCT")
     TAKE_PROFIT_PCT: Optional[float] = Field(0.008, env="TAKE_PROFIT_PCT")
     TIME_STOP_BARS: Optional[int] = Field(20, env="TIME_STOP_BARS")
     TRAILING_STOP_PCT: Optional[float] = Field(None, env="TRAILING_STOP_PCT")
     EXIT_SIGNAL_REVERSAL: bool = Field(False, env="EXIT_SIGNAL_REVERSAL")
-    EXIT_POLICY_ENABLED: bool = Field(False, env="EXIT_POLICY_ENABLED")
+    EXIT_POLICY_ENABLED: bool = Field(True, env="EXIT_POLICY_ENABLED")
+
+    # Kelly sizing (Sprint 1 Wave 2). When ``KELLY_SIZING_ENABLED`` is True
+    # and the wired predictor exposes a non-None ``_last_resolved_kelly_pct``
+    # (set by ``XGBoostPredictor`` from the regime-memory lookup), the
+    # supervisor sizes new entries as ``bankroll * resolved_pct`` clipped
+    # to ``[KELLY_FLOOR_PCT, KELLY_CAP_PCT]``. When the predictor doesn't
+    # surface a value, OR the master switch is False, sizing falls back to
+    # the legacy ``bankroll * risk_pct_per_trade`` path (preserving every
+    # existing test fixture). Defaults are deliberately conservative:
+    # 0.5% floor (any opened trade must be at least meaningful) and 5% cap
+    # (Kelly half-fraction ceiling — protects against blown-up resolved
+    # values from a low-confidence regime match).
+    KELLY_SIZING_ENABLED: bool = Field(True, env="KELLY_SIZING_ENABLED")
+    KELLY_FLOOR_PCT: float = Field(0.005, env="KELLY_FLOOR_PCT")
+    KELLY_CAP_PCT: float = Field(0.05, env="KELLY_CAP_PCT")
 
     if _USE_PYDANTIC_SETTINGS and SettingsConfigDict is not None:
         model_config = SettingsConfigDict(

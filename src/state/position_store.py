@@ -147,6 +147,16 @@ class Position(BaseModel):
     partial_fills: Optional[List[Dict[str, Any]]] = None
     rejection_reason: Optional[str] = None
     stop_trigger_price: Optional[float] = None
+    # Sprint 1 Wave 2 (exit policy) — per-tick runtime state. ``bars_held``
+    # is incremented by the supervisor each tick the position survives;
+    # ``high_water_mark`` is the running price extreme (max for longs, min
+    # for shorts) used by the trailing-stop branch in ``ExitPolicy``. Both
+    # default sensibly so legacy positions in Redis that predate this
+    # schema (no Wave 2 fields) round-trip cleanly: pydantic v2 fills the
+    # defaults on load, and ``ExitPolicy.update_high_water_mark`` seeds
+    # ``high_water_mark`` from ``entry_price`` on the first tick when None.
+    bars_held: int = 0
+    high_water_mark: Optional[float] = None
 
 
 class PositionStore:
@@ -293,6 +303,42 @@ class PositionStore:
             # Defensive: pending positions are already in open_set, but a
             # crash mid-record_pending could have left this stale. Re-add.
             pipe.sadd(self._open_set_key, position_id)
+            pipe.execute()
+        return updated
+
+    def update_runtime_fields(
+        self,
+        position_id: str,
+        *,
+        bars_held: Optional[int] = None,
+        high_water_mark: Optional[float] = None,
+    ) -> Optional[Position]:
+        """Patch per-tick runtime fields on an OPEN position.
+
+        Sprint 1 Wave 2: ``ExitPolicy`` needs ``bars_held`` and
+        ``high_water_mark`` to round-trip across ticks (the supervisor may
+        be a short-lived process under multiprocessing, so in-memory state
+        isn't enough). This helper rewrites only those two fields atomically;
+        the position must already exist and be in the open set, or we return
+        ``None`` (caller can decide whether to log — this is a per-tick
+        write, not a control-flow event).
+        """
+
+        existing = self.get(position_id)
+        if existing is None:
+            return None
+        updates: Dict[str, Any] = {}
+        if bars_held is not None:
+            updates["bars_held"] = int(bars_held)
+        if high_water_mark is not None:
+            updates["high_water_mark"] = float(high_water_mark)
+        if not updates:
+            return existing
+        updated = existing.model_copy(update=updates)
+        with self._lock:
+            pipe = self._redis.pipeline()
+            pipe.multi()
+            pipe.set(self._position_key(position_id), self._dump(updated))
             pipe.execute()
         return updated
 

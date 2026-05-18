@@ -82,6 +82,7 @@ if TYPE_CHECKING:  # pragma: no cover - type hints only
 
 from alerts.notifier import Notifier
 from exchanges.coinbase import CoinbaseExchange, ExchangeError, OrderResult, Ticker
+from exit_policy import ExitDecision, ExitPolicy
 from risk.auto_pause import AutoPauseGate
 from risk.circuit_breakers import (
     CircuitBreakerSet,
@@ -298,6 +299,11 @@ _ActionTaken = Literal[
     "halted_breaker",
     "force_flatted",
     "errored",
+    # Sprint 1 Wave 2: a tick where the exit policy closed one or more
+    # positions for the symbol BEFORE any new entry was considered. The
+    # supervisor never reopens on the same tick — the "exited" tick is
+    # terminal for that symbol.
+    "exited",
 ]
 
 
@@ -504,6 +510,25 @@ class Supervisor:
         confidence_history: Optional[ConfidenceHistory] = None,
         auto_trip_threshold: int = 10,
         trade_context_store: Optional[TradeContextStore] = None,
+        # Sprint 1 Wave 2: exit policy + Kelly sizing.
+        # ``exit_policy`` is the ``ExitPolicy`` instance evaluated each tick
+        # against every open position for the current symbol BEFORE any new
+        # entry is considered. When None + ``exit_policy_enabled=True`` the
+        # supervisor builds a default policy from ``src/config.py`` (the
+        # production path). When None + ``exit_policy_enabled=False`` the
+        # policy is disabled — preserves the legacy "no exit policy" path
+        # for the regression-sentinel test.
+        # ``kelly_sizing_enabled`` / ``kelly_floor_pct`` / ``kelly_cap_pct``
+        # govern the per-trade notional sizing seam: when enabled AND the
+        # wired predictor exposes a non-None ``_last_resolved_kelly_pct``
+        # the supervisor sizes new entries as ``bankroll * clip(resolved,
+        # floor, cap)``. Falls back to ``bankroll * risk_pct_per_trade``
+        # otherwise.
+        exit_policy: Optional[ExitPolicy] = None,
+        exit_policy_enabled: Optional[bool] = None,
+        kelly_sizing_enabled: Optional[bool] = None,
+        kelly_floor_pct: Optional[float] = None,
+        kelly_cap_pct: Optional[float] = None,
     ) -> None:
         self.config = config
         self.exchange = exchange
@@ -603,6 +628,39 @@ class Supervisor:
         # (otherwise a freshly booted supervisor would always emit one
         # immediately).
         self._last_close_date: Optional[date] = None
+
+        # ----------------------------------------------------------------
+        # Sprint 1 Wave 2: ExitPolicy + Kelly sizing wire-up.
+        # ----------------------------------------------------------------
+        # Resolve the master switches + Kelly bounds. Explicit kwargs win;
+        # otherwise the singleton ``cfg`` from ``src/config.py`` provides
+        # the defaults so a fresh production boot picks up env-driven
+        # overrides without test fixtures having to import it.
+        resolved = self._resolve_exit_kelly_settings(
+            exit_policy=exit_policy,
+            exit_policy_enabled=exit_policy_enabled,
+            kelly_sizing_enabled=kelly_sizing_enabled,
+            kelly_floor_pct=kelly_floor_pct,
+            kelly_cap_pct=kelly_cap_pct,
+        )
+        self.exit_policy: Optional[ExitPolicy] = resolved["exit_policy"]
+        self.exit_policy_enabled: bool = bool(resolved["exit_policy_enabled"])
+        self.kelly_sizing_enabled: bool = bool(resolved["kelly_sizing_enabled"])
+        self.kelly_floor_pct: float = float(resolved["kelly_floor_pct"])
+        self.kelly_cap_pct: float = float(resolved["kelly_cap_pct"])
+
+        # Reason-tagged exit counters. Keys are the documented reasons from
+        # ``ExitPolicy`` (``time`` / ``sl`` / ``tp`` / ``trail`` / ``reversal``)
+        # plus the synthetic ``error`` bucket for ticks where an exit fill
+        # raised an unexpected error. Exposed via ``_emit_loop_metrics``.
+        self._exits_by_reason: Dict[str, int] = {
+            "time": 0,
+            "sl": 0,
+            "tp": 0,
+            "trail": 0,
+            "reversal": 0,
+            "error": 0,
+        }
 
         # One-shot "supervisor started" gauge -- only if a pusher is wired in.
         self._safe_metric_call(
@@ -1324,10 +1382,61 @@ class Supervisor:
         )
         self._drain_pending_paper_fill(symbol, ticker)
 
-        # 3. Build context + run breakers.
+        # 2c. Sprint 1 Wave 2: evaluate the exit policy against EVERY open
+        # position for THIS symbol BEFORE we consider a new entry. If
+        # anything closed on this tick we short-circuit — never reopen on
+        # the same tick that just closed a position (capital-preservation
+        # invariant; matches the CEO review brief).
+        exits_closed, exit_reason = 0, None
+        if self.exit_policy_enabled and self.exit_policy is not None:
+            try:
+                exits_closed, exit_reason = self._process_exits(
+                    symbol=symbol, ticker=ticker
+                )
+            except ExchangeError as exc:
+                # A live-tagged exit close raised. Treat like any other
+                # ExchangeError on the tick: bump the error counter, alert,
+                # short-circuit with an ``errored`` tick. The kill-switch
+                # auto-trip will fire if these accumulate.
+                self._handle_tick_error(symbol)
+                self._safe_alert(
+                    f"exit close failed for {symbol}: {exc}",
+                    severity="alert",
+                )
+                return SupervisorTick(
+                    tick_at_utc=now.isoformat(),
+                    symbol=symbol,
+                    verdict=self._allow_verdict(),
+                    model_confidence=None,
+                    action_taken="errored",
+                    notes=f"exit_close: {exc!r}",
+                )
+
+        if exits_closed > 0:
+            return SupervisorTick(
+                tick_at_utc=now.isoformat(),
+                symbol=symbol,
+                verdict=self._allow_verdict(),
+                model_confidence=None,
+                action_taken="exited",
+                notes=(
+                    f"exited={exits_closed} reason={exit_reason}"
+                    if exit_reason
+                    else f"exited={exits_closed}"
+                ),
+            )
+
+        # 3. Build context + run breakers. The breakers care about
+        # proposed notional vs cap, so we feed them the FLAT (legacy)
+        # ``bankroll * risk_pct_per_trade`` figure here — the Kelly
+        # resize happens AFTER the predict call so the predictor's
+        # ``_last_resolved_kelly_pct`` (set on each predict) is available.
+        # Source string ends up in SupervisorTick.notes so we can tell at
+        # a glance which path won (per CEO review brief).
         proposed = float(self.config.bankroll_usd) * float(
             self.config.risk_pct_per_trade
         )
+        _sizing_source = "flat"
         daily_pnl = float(self.position_store.daily_realized_pnl_usd())
         # Per-symbol equity tracking (P0 #1). Drawdown is computed against
         # THIS symbol's realised PnL only, against THIS symbol's peak. A
@@ -1470,6 +1579,14 @@ class Supervisor:
                 ),
             )
 
+        # 5a-Kelly. Sprint 1 Wave 2: re-size the proposed notional from the
+        # predictor's resolved Kelly fraction now that the predict call has
+        # populated ``_last_resolved_kelly_pct``. Falls back to the flat
+        # path computed in step 3 if Kelly is disabled or the predictor
+        # didn't surface a value. The breaker context above used the flat
+        # number — Kelly resizing only affects what hits the exchange.
+        proposed, _sizing_source = self._resolve_proposed_notional(symbol=symbol)
+
         # 5b. Lane E E1: capture the signal snapshot BEFORE the mode gate
         # AND before order placement so a forensics agent can reconstruct
         # decision-time context even if the order itself fails or the
@@ -1532,7 +1649,7 @@ class Supervisor:
                     ticker=ticker,
                     proposed_usd=proposed,
                 )
-                notes_extra = "live"
+                notes_extra = f"live sizing={_sizing_source} usd={proposed:.2f}"
             else:
                 self._paper_simulate_fill(
                     symbol=symbol,
@@ -1540,7 +1657,7 @@ class Supervisor:
                     ticker=ticker,
                     proposed_usd=proposed,
                 )
-                notes_extra = "paper"
+                notes_extra = f"paper sizing={_sizing_source} usd={proposed:.2f}"
         except ExchangeError as exc:
             self._handle_tick_error(symbol)
             self._safe_alert(
@@ -1933,6 +2050,350 @@ class Supervisor:
             exit_price,
             PAPER_SLIPPAGE_BPS,
         )
+
+    # ------------------------------------------------------------------
+    # Sprint 1 Wave 2: exit-policy + Kelly sizing helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _resolve_exit_kelly_settings(
+        *,
+        exit_policy: Optional[ExitPolicy],
+        exit_policy_enabled: Optional[bool],
+        kelly_sizing_enabled: Optional[bool],
+        kelly_floor_pct: Optional[float],
+        kelly_cap_pct: Optional[float],
+    ) -> Dict[str, Any]:
+        """Pick effective Wave-2 settings from kwargs, falling back to cfg.
+
+        Kept as a staticmethod so it can be exercised without constructing
+        a full Supervisor. The fallback path lazy-imports ``cfg`` so the
+        rest of the supervisor module stays config-free for the existing
+        test fixtures (which don't write a TradingConfig file).
+        """
+        cfg_obj: Any = None
+
+        def _from_cfg(attr: str, default: Any) -> Any:
+            nonlocal cfg_obj
+            if cfg_obj is None:
+                try:
+                    from config import cfg as _cfg  # noqa: WPS433 - lazy
+                    cfg_obj = _cfg
+                except Exception:  # noqa: BLE001 - cfg load failures fall back
+                    cfg_obj = False  # sentinel: tried + failed
+            if cfg_obj is False:
+                return default
+            return getattr(cfg_obj, attr, default)
+
+        if exit_policy_enabled is None:
+            exit_policy_enabled = bool(_from_cfg("EXIT_POLICY_ENABLED", True))
+        if kelly_sizing_enabled is None:
+            kelly_sizing_enabled = bool(_from_cfg("KELLY_SIZING_ENABLED", True))
+        if kelly_floor_pct is None:
+            kelly_floor_pct = float(_from_cfg("KELLY_FLOOR_PCT", 0.005))
+        if kelly_cap_pct is None:
+            kelly_cap_pct = float(_from_cfg("KELLY_CAP_PCT", 0.05))
+
+        # Construct a default ExitPolicy from cfg when one wasn't supplied
+        # AND the master switch is on. With the switch off we leave the
+        # attribute None — the tick loop guards on the flag, but a None
+        # policy is the unambiguous "no exits configured" signal.
+        if exit_policy is None and exit_policy_enabled:
+            exit_policy = ExitPolicy(
+                time_stop_bars=_from_cfg("TIME_STOP_BARS", 20),
+                stop_loss_pct=_from_cfg("STOP_LOSS_PCT", -0.004),
+                take_profit_pct=_from_cfg("TAKE_PROFIT_PCT", 0.008),
+                trailing_stop_pct=_from_cfg("TRAILING_STOP_PCT", None),
+                signal_reversal=bool(_from_cfg("EXIT_SIGNAL_REVERSAL", False)),
+            )
+
+        return {
+            "exit_policy": exit_policy,
+            "exit_policy_enabled": bool(exit_policy_enabled),
+            "kelly_sizing_enabled": bool(kelly_sizing_enabled),
+            "kelly_floor_pct": float(kelly_floor_pct),
+            "kelly_cap_pct": float(kelly_cap_pct),
+        }
+
+    def _resolve_proposed_notional(self, *, symbol: str) -> Tuple[float, str]:
+        """Pick the per-trade notional in USD for ``symbol``.
+
+        Returns ``(usd, source)`` where ``source`` is ``"kelly"`` when the
+        predictor's resolved Kelly fraction was used (clipped to the
+        floor/cap), and ``"flat"`` when we fell back to the legacy
+        ``bankroll * risk_pct_per_trade`` path. ``source`` is surfaced to
+        ``SupervisorTick.notes`` so operators can see *which* sizing the
+        tick used without reading metrics.
+
+        The Kelly read is via ``getattr(self.model_predict_fn,
+        '_last_resolved_kelly_pct', None)``: the predictor itself decides
+        when to populate it (regime-memory match with confidence >= 0.5).
+        We never re-resolve the regime or re-derive the kelly here — the
+        predictor is the single source of truth.
+        """
+        flat_pct = float(self.config.risk_pct_per_trade)
+        flat_usd = float(self.config.bankroll_usd) * flat_pct
+        if not self.kelly_sizing_enabled:
+            return flat_usd, "flat"
+        kelly_pct = getattr(
+            self.model_predict_fn, "_last_resolved_kelly_pct", None
+        )
+        if kelly_pct is None:
+            return flat_usd, "flat"
+        try:
+            kelly_pct_f = float(kelly_pct)
+        except (TypeError, ValueError):
+            return flat_usd, "flat"
+        if not math.isfinite(kelly_pct_f) or kelly_pct_f <= 0:
+            return flat_usd, "flat"
+        clipped = min(
+            max(kelly_pct_f, float(self.kelly_floor_pct)),
+            float(self.kelly_cap_pct),
+        )
+        return float(self.config.bankroll_usd) * clipped, "kelly"
+
+    @staticmethod
+    def _ticker_to_exit_tick(
+        ticker: Any, signal_prob: Optional[float] = None
+    ) -> Any:
+        """Adapt a ``Ticker`` to the duck-typed contract ``ExitPolicy`` expects.
+
+        ``ExitPolicy`` reads ``tick.price`` (the current mark) and
+        ``tick.signal_prob`` (for the reversal branch). The exchange's
+        ``Ticker`` model uses ``mid`` / ``bid`` / ``ask`` / ``last`` —
+        we collapse those into ``price`` here so the policy stays
+        exchange-agnostic. ``signal_prob`` is set when the supervisor
+        opts into the reversal branch (off by default in Wave 2).
+        """
+        # Pick mid when available; fall back to last; finally to 0.0 to
+        # let the policy's downstream sign checks handle a degenerate
+        # tick rather than crashing here.
+        price: float = 0.0
+        for attr in ("mid", "last", "price"):
+            value = getattr(ticker, attr, None)
+            if value is not None:
+                try:
+                    price = float(value)
+                    break
+                except (TypeError, ValueError):
+                    continue
+        # Use a SimpleNamespace so the policy's _require helper can read
+        # both attrs without us having to define a one-off dataclass.
+        import types
+        return types.SimpleNamespace(
+            price=price,
+            signal_prob=float(signal_prob) if signal_prob is not None else 0.5,
+        )
+
+    def _process_exits(
+        self, *, symbol: str, ticker: Ticker
+    ) -> Tuple[int, Optional[str]]:
+        """Evaluate ExitPolicy against every open position for ``symbol``.
+
+        Returns ``(closed_count, last_reason)``. The caller uses
+        ``closed_count > 0`` to short-circuit entry consideration on the
+        SAME tick — the supervisor never opens a new position on a tick
+        that just closed one (capital-preservation invariant).
+
+        For each surviving open position we:
+
+        1. Call ``policy.update_high_water_mark`` with the current tick.
+        2. Persist the new HWM via ``store.update_runtime_fields`` so the
+           trailing-stop branch has fresh state on the next tick / process.
+        3. Call ``policy.evaluate`` — on close=True, dispatch through the
+           same per-tag close path used by ``_force_flat_all`` (paper
+           positions stay local; live-tagged positions go through the
+           exchange). On ``ExchangeError`` we fall through to the paper
+           close for paper-tagged positions only — live errors must
+           surface so the kill-switch / breaker logic can react.
+        4. Otherwise: bump ``bars_held`` by 1 and persist.
+
+        Master-switch: with ``self.exit_policy_enabled`` False (or
+        ``self.exit_policy`` None) this is a no-op returning ``(0, None)``.
+        """
+        if not self.exit_policy_enabled or self.exit_policy is None:
+            return 0, None
+
+        try:
+            open_positions = self.position_store.list_open()
+        except Exception as exc:  # noqa: BLE001 - state read is best-effort
+            LOGGER.warning(
+                "exit policy: list_open failed for %s: %s; skipping exits",
+                symbol,
+                exc,
+            )
+            return 0, None
+
+        closed = 0
+        last_reason: Optional[str] = None
+        # Adapt the exchange ``Ticker`` to the duck-typed contract once per
+        # tick — every position evaluation reuses the same exit-tick view.
+        exit_tick = self._ticker_to_exit_tick(ticker)
+        for position in open_positions:
+            if position.symbol != symbol:
+                continue
+            # Closing / closed positions should never appear in
+            # ``list_open`` (the store filters them) but guard defensively
+            # so the policy never evaluates a half-closed blob.
+            if position.status not in ("open", "pending"):
+                continue
+
+            # Seed high_water_mark if it's missing — the legacy schema
+            # didn't carry one, and the policy needs SOMETHING to compare
+            # against on the first tick. Treat None as "use entry price".
+            if getattr(position, "high_water_mark", None) is None:
+                seed_hwm = float(position.entry_price)
+                # Update the in-memory object so the policy reads the seed.
+                # Persistence happens below alongside the post-tick update.
+                try:
+                    position.high_water_mark = seed_hwm  # pydantic v2 allows mutation
+                except (AttributeError, TypeError):
+                    # Frozen model — fall back to model_copy. The local
+                    # binding is updated; the persisted blob is written
+                    # below.
+                    position = position.model_copy(
+                        update={"high_water_mark": seed_hwm}
+                    )
+
+            self.exit_policy.update_high_water_mark(position, exit_tick)
+
+            decision: ExitDecision = self.exit_policy.evaluate(position, exit_tick)
+            if decision.close:
+                reason = decision.reason or "unknown"
+                last_reason = reason
+                self._exits_by_reason[reason] = (
+                    self._exits_by_reason.get(reason, 0) + 1
+                )
+                close_side: Literal["buy", "sell"] = (
+                    "sell" if position.side == "long" else "buy"
+                )
+                try:
+                    self._submit_exit_close(
+                        position=position,
+                        close_side=close_side,
+                        reason=reason,
+                    )
+                    closed += 1
+                except ExchangeError as exc:
+                    # Live-tagged positions surface the error so the
+                    # consecutive-error breaker / kill switch can react.
+                    # Paper-tagged positions fall through to the local
+                    # paper force-flat (matches the 2026-05-14 incident
+                    # fix in commit 2b62a7d).
+                    if position.exchange == "coinbase-paper":
+                        LOGGER.warning(
+                            "exit close ExchangeError on paper position %s; "
+                            "falling back to _paper_force_flat: %s",
+                            position.position_id,
+                            exc,
+                        )
+                        try:
+                            self._paper_force_flat(position, close_side)
+                            closed += 1
+                        except Exception as inner:  # noqa: BLE001 - log only
+                            LOGGER.warning(
+                                "paper force-flat fallback failed for %s: %s",
+                                position.position_id,
+                                inner,
+                            )
+                            self._exits_by_reason["error"] = (
+                                self._exits_by_reason.get("error", 0) + 1
+                            )
+                    else:
+                        self._exits_by_reason["error"] = (
+                            self._exits_by_reason.get("error", 0) + 1
+                        )
+                        raise
+            else:
+                # Position survives this tick — bump bars_held and persist
+                # the (possibly updated) high_water_mark in one round-trip.
+                new_bars = int(getattr(position, "bars_held", 0) or 0) + 1
+                try:
+                    self.position_store.update_runtime_fields(
+                        position.position_id,
+                        bars_held=new_bars,
+                        high_water_mark=float(
+                            getattr(position, "high_water_mark", position.entry_price)
+                        ),
+                    )
+                except AttributeError:
+                    # Stub stores from older test fixtures may not have
+                    # update_runtime_fields. Log once + continue; the exit
+                    # policy still works for SL/TP/reversal (which don't
+                    # need persistence), and the trail/time branches just
+                    # see stale state for that tick.
+                    if not getattr(self, "_warned_no_update_runtime", False):
+                        LOGGER.warning(
+                            "position_store has no update_runtime_fields; "
+                            "trailing-stop / time-stop will not persist "
+                            "across ticks until upgraded"
+                        )
+                        self._warned_no_update_runtime = True
+                except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+                    LOGGER.warning(
+                        "update_runtime_fields failed for %s: %s",
+                        position.position_id,
+                        exc,
+                    )
+
+        return closed, last_reason
+
+    def _submit_exit_close(
+        self,
+        *,
+        position: Position,
+        close_side: Literal["buy", "sell"],
+        reason: str,
+    ) -> None:
+        """Dispatch an exit-policy close to the right close path.
+
+        Per-tag dispatch matches ``_force_flat_all``: paper positions stay
+        local, live positions route through the exchange. The reason is
+        echoed into the exchange's order metadata via the LOGGER only —
+        ccxt market orders don't carry custom tags, but our paper close
+        records the reason in the position notes for forensics.
+        """
+        if position.exchange == "coinbase-paper":
+            self._paper_force_flat(position, close_side)
+            return
+        # Live close: a real market order. ExchangeError is raised by the
+        # exchange wrapper; the caller decides whether to rethrow (live)
+        # or fall back to paper close (paper-tagged). We do NOT swallow
+        # here.
+        self.exchange.place_market_order(
+            position.symbol, close_side, base_size=position.base_size
+        )
+        LOGGER.info(
+            "exit close: live %s side=%s reason=%s base=%.6f",
+            position.position_id,
+            close_side,
+            reason,
+            float(position.base_size),
+        )
+
+    def _oldest_open_position_age_s(self) -> float:
+        """Seconds since the oldest currently-open position was opened."""
+        try:
+            opens = self.position_store.list_open()
+        except Exception:  # noqa: BLE001 - telemetry must never raise
+            return 0.0
+        if not opens:
+            return 0.0
+        now = self._now().astimezone(timezone.utc)
+        oldest_s = 0.0
+        for position in opens:
+            opened_raw = getattr(position, "opened_at_utc", None)
+            if not opened_raw:
+                continue
+            try:
+                opened = datetime.fromisoformat(str(opened_raw))
+            except (TypeError, ValueError):
+                continue
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            age_s = (now - opened.astimezone(timezone.utc)).total_seconds()
+            if age_s > oldest_s:
+                oldest_s = age_s
+        return float(max(oldest_s, 0.0))
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -2440,6 +2901,26 @@ class Supervisor:
             self.metrics_pusher.gauge("orphan_positions", orphans)
         except (AttributeError, Exception):  # noqa: BLE001 - tolerate stub stores
             pass
+
+        # Sprint 1 Wave 2: exit-policy observability.
+        # ``exits_by_reason`` is the cumulative count per reason since
+        # process boot (the supervisor doesn't reset these — Prometheus
+        # rate() handles intervals). ``open_positions_count`` is already
+        # gauged above; we add the per-symbol oldest-age gauge so the
+        # operator can spot stuck positions before the breaker fires.
+        for reason, count in self._exits_by_reason.items():
+            self.metrics_pusher.counter(
+                "exits_by_reason_total",
+                float(count),
+                labels={"reason": reason},
+            )
+        try:
+            self.metrics_pusher.gauge(
+                "oldest_open_position_age_s",
+                float(self._oldest_open_position_age_s()),
+            )
+        except Exception as exc:  # noqa: BLE001 - telemetry must not crash
+            LOGGER.debug("oldest_open_position_age_s emit failed: %r", exc)
 
     def _emit_daily_close_metrics(
         self,

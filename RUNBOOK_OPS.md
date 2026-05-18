@@ -1,6 +1,6 @@
 # Autopilot Crypto Bot — Operations Runbook
 
-Last updated: 2026-05-18 (Sprint 1 Wave 1A).
+Last updated: 2026-05-18 (Sprint 1 Wave 2).
 
 This runbook is the single-page reference an operator uses when something
 goes wrong with the live or paper supervisor. It assumes you already have
@@ -259,7 +259,35 @@ For real-time tailing of the current supervisor run, prefer
 it parses the structured log lines and prints rolling per-symbol stats
 rather than raw log spam.
 
-## 8. Quick triage flowchart
+## 8. Sprint 1 exit policy
+
+Sprint 1 Wave 2 wires `src/exit_policy.py` into the supervisor's tick loop
+so every open position gets evaluated for stop-loss, take-profit,
+trailing-stop, time-stop, and (optionally) signal-reversal **before** any
+new entry is considered on the same tick. The supervisor's
+``never-reopens-on-same-tick`` invariant guarantees a position closed on
+tick N cannot be reopened by an entry signal on tick N — capital
+preservation first. Per-tag close dispatch matches commit ``2b62a7d``:
+paper-tagged positions fall back to ``_paper_force_flat`` on a transient
+``ExchangeError``; live-tagged positions surface the error so the
+consecutive-error / kill-switch breakers can react.
+
+Master switches live in ``src/config.py`` and are env-overridable:
+``EXIT_POLICY_ENABLED`` (default True, set to ``0`` to reproduce the
+legacy "no exit policy" path — see the
+``autopilot-no-exit-policy-blocker-2026-05-16`` memory for the symptoms),
+``KELLY_SIZING_ENABLED`` (default True; pairs Kelly-fraction-from-regime
+with ``KELLY_FLOOR_PCT`` / ``KELLY_CAP_PCT`` to clip the predictor's
+resolved sizing), plus the per-reason thresholds ``STOP_LOSS_PCT``,
+``TAKE_PROFIT_PCT``, ``TIME_STOP_BARS``, ``TRAILING_STOP_PCT``, and
+``EXIT_SIGNAL_REVERSAL``. The supervisor exposes
+``exits_by_reason_total{reason=...}`` counters,
+``open_positions_count``, and ``oldest_open_position_age_s`` gauges
+alongside the existing tick metrics — operators can plot these via the
+Prometheus dashboard to see which exit reasons are firing and to spot
+positions stuck open before the breaker cap intervenes.
+
+## 9. Quick triage flowchart
 
 ```
 supervisor not placing trades?
