@@ -287,7 +287,112 @@ alongside the existing tick metrics — operators can plot these via the
 Prometheus dashboard to see which exit reasons are firing and to spot
 positions stuck open before the breaker cap intervenes.
 
-## 9. Quick triage flowchart
+## 9. Lane E nightly digest (Sprint 2)
+
+`scripts/run_postmortem.py` runs the five Lane E forensic specialists
+(Signal / Execution / Sizing / Context / Process) over every position
+closed during a given UTC day, lets `LossPostmortemSynthesizer` classify
+each trade's root cause + write the per-trade JSON+MD under
+`runs/postmortems/`, and rolls everything into a single daily digest at
+`docs/digests/YYYY-MM-DD.md`. A one-line summary is posted to Discord +
+Telegram (whichever channels are configured via `DISCORD_WEBHOOK_URL` /
+`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`).
+
+The launchd plist `launchd/com.autopilot.loss-postmortem.plist` schedules
+this to run at **00:05 UTC** daily. The default `--date` is the previous
+UTC day, so the 00:05 wake-up lines up with the just-closed UTC day.
+
+### Install / start the job
+
+```bash
+# Load the plist (the -w flag enables it across reboots).
+launchctl load -w /Users/mawad/Desktop/autopilot/launchd/com.autopilot.loss-postmortem.plist
+
+# Verify it's registered. Should show the label and an exit status column.
+launchctl list | grep loss-postmortem
+
+# Fire it manually (handy after installing, or for a one-off ad-hoc run).
+launchctl start com.autopilot.loss-postmortem
+
+# Unload (e.g. to update the plist).
+launchctl unload -w /Users/mawad/Desktop/autopilot/launchd/com.autopilot.loss-postmortem.plist
+```
+
+### Ad-hoc invocation
+
+The launchd job hides flags from operators on purpose; for manual runs
+the script accepts the full CLI surface:
+
+```bash
+# Default: yesterday in UTC, posts to configured channels.
+env PYTHONPATH=src ./.venv/bin/python scripts/run_postmortem.py
+
+# Specific date, no notifier dispatch (write the digest only).
+env PYTHONPATH=src ./.venv/bin/python scripts/run_postmortem.py \
+    --date 2026-05-18 --no-publish
+
+# Dry-run (print to stdout, write nothing, post nothing). Use this when
+# validating the digest format before letting launchd post anything.
+env PYTHONPATH=src ./.venv/bin/python scripts/run_postmortem.py \
+    --date 2026-05-18 --dry-run
+```
+
+### Where to look
+
+| artefact | path |
+|----------|------|
+| Daily digest markdown | `docs/digests/YYYY-MM-DD.md` |
+| Per-trade postmortem JSON + MD | `runs/postmortems/{trade_id}.{json,md}` |
+| launchd stdout + stderr | `logs/postmortem.log` |
+| Retrain queue (Signal-cluster feedback) | `runs/retrain_queue.jsonl` |
+| Risk recommendations (Sizing-cluster feedback) | `runs/risk_recommendations.jsonl` |
+
+If Redis is unreachable when the job fires, the digest is still written
+with a "Redis unreachable, no data analyzed today" header and the
+process exits 0 — launchd does NOT retry. Re-run manually via
+`launchctl start com.autopilot.loss-postmortem` once Redis is back.
+
+## 10. Calibration drift monitor (Sprint 2)
+
+`scripts/diagnose_calibration_drift.py` is the daily reliability check
+for closed trades. It buckets each closed position by its entry-time
+model confidence, compares the realised winrate in each bucket against
+the bucket midpoint, fits a weighted least-squares line, and alerts
+when the slope drifts more than ±10% from 1.0. Sibling to
+`scripts/diagnose_live_features.py`; intended to run on the same cron,
+right after it.
+
+Recommended cadence: daily at 00:10 UTC (5 minutes after the Lane E
+nightly digest, so the just-closed UTC day's data is settled).
+
+```bash
+# Today (UTC) only, with Telegram + Discord alert on verdict=ALERT.
+./.venv/bin/python scripts/diagnose_calibration_drift.py \
+    --date $(date -u +%F) --alert
+
+# Past week, all symbols, stdout only.
+./.venv/bin/python scripts/diagnose_calibration_drift.py --window-days 7
+
+# Single symbol + JSON sidecar for downstream consumption.
+./.venv/bin/python scripts/diagnose_calibration_drift.py \
+    --date 2026-05-18 --symbol ETH/USD \
+    --out runs/calibration/2026-05-18.json
+```
+
+### Verdict states
+
+| verdict | meaning | exit |
+|---------|---------|------|
+| `OK` | slope ∈ [0.90, 1.10] -- model is well-calibrated within tolerance | 0 |
+| `ALERT` | slope outside the tolerance band -- entry-conf calibration has drifted | 1 only when `--alert` set, else 0 |
+| `NO_DATA` | empty window, or no bucket meets `--min-n-per-bucket` (default 5) -- too few trades to assess | 0 |
+
+If Redis is unreachable when the job fires, the script prints
+`Redis unreachable, skipping today's calibration check` and exits 0 --
+the cron does not need to retry. Non-connection `RedisError`s exit 2
+and log a traceback for operator triage.
+
+## 11. Quick triage flowchart
 
 ```
 supervisor not placing trades?
