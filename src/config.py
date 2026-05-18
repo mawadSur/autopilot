@@ -99,6 +99,18 @@ class TradingConfig(BaseSettings):
     gemini_timeout_s: int = Field(30, env="GEMINI_TIMEOUT_S")
     gemini_use_search_grounding: bool = Field(True, env="GEMINI_USE_SEARCH_GROUNDING")
 
+    # Exit policy (Sprint 1 Wave 1B). All knobs are independently togglable —
+    # the float / int thresholds use None to disable, the master switch uses
+    # False. EXIT_POLICY_ENABLED is OFF by default so this PR is non-breaking;
+    # Wave 2 supervisor wiring flips it on once the high-water-mark plumbing
+    # and reason-tagged force-flat paths have landed.
+    STOP_LOSS_PCT: Optional[float] = Field(-0.004, env="STOP_LOSS_PCT")
+    TAKE_PROFIT_PCT: Optional[float] = Field(0.008, env="TAKE_PROFIT_PCT")
+    TIME_STOP_BARS: Optional[int] = Field(20, env="TIME_STOP_BARS")
+    TRAILING_STOP_PCT: Optional[float] = Field(None, env="TRAILING_STOP_PCT")
+    EXIT_SIGNAL_REVERSAL: bool = Field(False, env="EXIT_SIGNAL_REVERSAL")
+    EXIT_POLICY_ENABLED: bool = Field(False, env="EXIT_POLICY_ENABLED")
+
     if _USE_PYDANTIC_SETTINGS and SettingsConfigDict is not None:
         model_config = SettingsConfigDict(
             env_file=_ENV_FILES,
