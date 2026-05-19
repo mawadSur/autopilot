@@ -404,3 +404,68 @@ supervisor not placing trades?
 ├── are tickers timing out / DNS flaky?      → § 5
 └── otherwise                                → check runs/<ts>/supervisor.log
 ```
+
+## 12. OutcomeAdjuster daily (Sprint 2 #6)
+
+`scripts/run_outcome_adjuster.py` walks the previous UTC day's closed
+positions, recomputes per-regime streaks, and nudges the
+`optimal_threshold` returned by `RegimeLookup` on a per-regime basis.
+The adjustment is BOUNDED (default ±0.05) so a bad streak cannot
+silently muzzle the bot — and it RELAXES toward zero on consecutive
+winning trades.
+
+State lives in a single Redis hash:
+
+```bash
+# Inspect current adjustments (no TTL — slow-moving operator state).
+redis-cli HGETALL autopilot:regime_outcome_adjustment
+# 1) "trend_down"
+# 2) "+0.020000"
+# 3) "chop"
+# 4) "-0.010000"
+```
+
+Manual reset (e.g. after a model retrain invalidates prior streaks):
+
+```bash
+# Clear ONE label.
+./.venv/bin/python scripts/run_outcome_adjuster.py --reset chop
+
+# Clear the entire hash.
+./.venv/bin/python scripts/run_outcome_adjuster.py --reset all
+
+# Equivalent raw Redis:
+redis-cli HDEL autopilot:regime_outcome_adjustment chop
+redis-cli DEL  autopilot:regime_outcome_adjustment
+```
+
+Ad-hoc dry-run (no writes — useful before a manual operator decision):
+
+```bash
+env PYTHONPATH=src ./.venv/bin/python \
+    scripts/run_outcome_adjuster.py --date 2026-05-18 --dry-run
+```
+
+### Install / start the job
+
+```bash
+cp launchd/com.autopilot.outcome-adjuster.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.autopilot.outcome-adjuster.plist
+launchctl start com.autopilot.outcome-adjuster
+```
+
+Runs at 00:10 UTC daily (5 minutes after the Lane E digest at 00:05).
+Logs to `logs/outcome_adjuster.log`. Exit code 0 even on Redis-down so
+launchd does not retry — re-run manually via `launchctl start
+com.autopilot.outcome-adjuster` once Redis is back.
+
+### How the adjustments influence live trading
+
+Each tick the live predictor calls `RegimeLookup.resolve_params(...)`.
+When an `OutcomeAdjuster` is wired (the predictor wires one automatically
+when `REDIS_URL` is set), the lookup adds the current adjustment for the
+closest neighbor's regime label to the resolved `optimal_threshold`,
+clipped to `[0, 1]`. The resolved dict gains two observable fields
+(`_outcome_adjustment_delta`, `_regime_label`) so the supervisor and
+diagnostic scripts can see exactly which regime + delta steered the
+threshold. With no adjuster wired, behavior is identical to today.

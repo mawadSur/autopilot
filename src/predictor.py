@@ -567,13 +567,24 @@ class XGBoostPredictor:
                 "optimal_threshold": float(self.thr_long),
                 "kelly_size_pct": 0.0,
             }
+            # Sprint 2 #6: best-effort OutcomeAdjuster wiring. When
+            # REDIS_URL is set we construct a Redis client + adjuster and
+            # pass it to the lookup; on any failure (no env var, redis
+            # unreachable, import error) we skip wiring and the lookup
+            # behaves identically to today (no new keys in resolve_params,
+            # no threshold nudges). Keeps the zero-redis dev path working.
+            adjuster = self._maybe_init_outcome_adjuster()
             self.regime_lookup = RegimeLookup(
-                store=store, encoder=encoder, defaults=defaults
+                store=store,
+                encoder=encoder,
+                defaults=defaults,
+                outcome_adjuster=adjuster,
             )
             LOGGER.info(
-                "regime_lookup initialised from %s (size=%d)",
+                "regime_lookup initialised from %s (size=%d, outcome_adjuster=%s)",
                 store_path,
                 len(store),
+                "on" if adjuster is not None else "off",
             )
         except Exception as exc:  # noqa: BLE001 - never crash on regime store issues
             LOGGER.warning(
@@ -582,6 +593,44 @@ class XGBoostPredictor:
                 exc,
             )
             self.regime_lookup = None
+
+    def _maybe_init_outcome_adjuster(self) -> Optional[Any]:
+        """Construct an :class:`OutcomeAdjuster` from ``REDIS_URL``, or None.
+
+        Returns ``None`` (no adjuster wired) when:
+        * ``REDIS_URL`` is unset / empty,
+        * ``redis``/``OutcomeAdjuster`` cannot be imported,
+        * the client cannot connect.
+
+        Never raises — a missing adjuster degrades the lookup to its
+        un-adjusted behavior, which is the same as today's runtime.
+        """
+        redis_url = os.getenv("REDIS_URL", "").strip()
+        if not redis_url:
+            return None
+        try:
+            import redis  # type: ignore[import-not-found]
+
+            from regime_memory.outcome_adjuster import OutcomeAdjuster
+        except ImportError as exc:
+            LOGGER.warning(
+                "outcome_adjuster: import failed (%r); skipping wiring",
+                exc,
+            )
+            return None
+        try:
+            client = redis.Redis.from_url(redis_url, decode_responses=True)
+            # Cheap connectivity probe; if redis is down we don't wire so
+            # the lookup's hot path stays exception-free.
+            client.ping()
+        except Exception as exc:  # noqa: BLE001 - any transport hiccup
+            LOGGER.warning(
+                "outcome_adjuster: redis connect/ping failed (%r); skipping wiring",
+                exc,
+            )
+            return None
+        namespace = os.getenv("REDIS_NAMESPACE", "autopilot").strip() or "autopilot"
+        return OutcomeAdjuster(client, namespace=namespace)
 
     def __call__(
         self, symbol: str, ticker: Any

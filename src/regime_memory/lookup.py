@@ -39,12 +39,21 @@ the resolved threshold one way or the other — it should just be ignored.
 
 from __future__ import annotations
 
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
+import logging
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 
 from regime_memory.encoder import RegimeEncoder
 from regime_memory.store import NaiveRegimeStore, RegimeStore
+
+LOGGER = logging.getLogger(__name__)
+
+try:  # pragma: no cover - import-time guard, tests stub the redis client
+    import redis  # type: ignore[import-not-found]
+    import redis.exceptions  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    redis = None  # type: ignore[assignment]
 
 
 # Fields whose similarity-weighted average we always compute (when present).
@@ -87,12 +96,20 @@ class RegimeLookup:
         store: _StoreT,
         encoder: RegimeEncoder,
         defaults: Mapping[str, float],
+        *,
+        outcome_adjuster: Optional[Any] = None,
     ) -> None:
         self.store = store
         self.encoder = encoder
         # Copy so callers can mutate their own dict later without affecting
         # the lookup's fallback values.
         self.defaults: Dict[str, float] = dict(defaults)
+        # Sprint 2 #6: optional regime-scoped threshold adjuster. When
+        # wired, ``resolve_params`` looks up the current adjustment for the
+        # CLOSEST neighbor's regime label and adds it to the resolved
+        # ``optimal_threshold`` (clipped to [0, 1]). When None, behavior
+        # is exactly as before (no new keys, no new lookups).
+        self.outcome_adjuster = outcome_adjuster
 
     # -- public API ----------------------------------------------------------
 
@@ -169,7 +186,82 @@ class RegimeLookup:
                 resolved[key] = float(self.defaults.get(key, 0.0))
 
         resolved["_regime_confidence"] = float(confidence)
+
+        # Sprint 2 #6: apply the per-regime outcome adjustment to the
+        # resolved threshold when an adjuster is wired AND we have an
+        # ``optimal_threshold`` in the resolved dict AND the closest
+        # neighbor has a regime label we can name. Backward-compat: if
+        # the adjuster is None we add no new keys (existing behavior).
+        if self.outcome_adjuster is not None and "optimal_threshold" in resolved:
+            self._apply_outcome_adjustment(resolved, usable)
+
         return resolved
+
+    def _apply_outcome_adjustment(
+        self,
+        resolved: Dict[str, float],
+        usable: Sequence[Tuple[Any, float]],
+    ) -> None:
+        """Mutate ``resolved`` in-place to apply the adjuster's current delta.
+
+        Picks the regime label of the CLOSEST neighbor (highest cosine
+        similarity, index 0 in ``usable`` since the stores return ranked
+        results). If that label is unresolvable, or the adjuster raises a
+        ``redis.exceptions.RedisError``, we log a WARN and leave the
+        resolved threshold untouched.
+        """
+        # Lazy import — keeps the module importable when ``regime_memory``
+        # is consumed by something that doesn't have ``outcome_adjuster``
+        # on the path (only happens in test rigs that monkey-patch).
+        try:
+            from regime_memory.outcome_adjuster import normalize_label
+        except ImportError:  # pragma: no cover - defensive
+            return
+
+        if not usable:
+            return
+
+        closest_window, _closest_sim = usable[0]
+        closest_meta = getattr(closest_window, "metadata", {}) or {}
+        raw_label = closest_meta.get("regime_label")
+        label = normalize_label(raw_label)
+        if label is None:
+            return
+
+        # Best-effort read. Redis transport errors are caught here so a
+        # flaky network doesn't take down a per-tick prediction. Programmer
+        # errors (TypeError, ValueError from a corrupted adjuster impl)
+        # propagate — they're never the normal failure mode.
+        try:
+            delta = float(self.outcome_adjuster.current_adjustment(label))
+        except Exception as exc:  # noqa: BLE001
+            # Only treat redis-flavored errors as recoverable. Everything
+            # else is a logic bug we want to surface.
+            if redis is not None and isinstance(exc, redis.exceptions.RedisError):
+                LOGGER.warning(
+                    "regime_lookup: outcome_adjuster read failed for label=%r: %r; "
+                    "applying delta=0.0",
+                    label,
+                    exc,
+                )
+                delta = 0.0
+            else:
+                LOGGER.warning(
+                    "regime_lookup: outcome_adjuster raised non-redis error for "
+                    "label=%r: %r; applying delta=0.0",
+                    label,
+                    exc,
+                )
+                delta = 0.0
+
+        try:
+            base_thr = float(resolved["optimal_threshold"])
+        except (TypeError, ValueError, KeyError):
+            return
+        new_thr = max(0.0, min(1.0, base_thr + delta))
+        resolved["optimal_threshold"] = new_thr
+        resolved["_outcome_adjustment_delta"] = float(delta)
+        resolved["_regime_label"] = label
 
     # -- helpers -------------------------------------------------------------
 
