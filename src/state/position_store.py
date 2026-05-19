@@ -49,11 +49,12 @@ and never want to count it as exposure.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -85,6 +86,17 @@ DEFAULT_NAMESPACE = "autopilot"
 # Pending positions older than this with no exchange-side record are dropped
 # by :meth:`PositionStore.reconcile`.
 PENDING_ORPHAN_AGE = timedelta(hours=1)
+
+# Sprint 2.5 — write-side seam for the Lane E swarm's trade-context snapshots.
+# The reader (``state.trade_context_store.TradeContextStore``) keys snapshots
+# at ``{ns}:trade_ctx:{trade_id}:{phase}`` with a 30-day TTL. ``PositionStore``
+# offers the three ``record_*_snapshot`` writers below so callers that already
+# hold a ``PositionStore`` handle (e.g. the live supervisor) can persist
+# snapshots without taking a second store dependency. Keys + TTL are kept in
+# sync with TradeContextStore so either side can read what either side wrote.
+_TRADE_CTX_KEY_PREFIX = "trade_ctx"
+_TRADE_CTX_TTL_SECONDS = 30 * 24 * 3600  # 30 days, matches TradeContextStore
+_VALID_SNAPSHOT_PHASES: tuple[str, ...] = ("signal", "fill", "breaker", "close")
 
 
 PositionStatus = Literal["pending", "open", "closing", "closed"]
@@ -157,6 +169,17 @@ class Position(BaseModel):
     # ``high_water_mark`` from ``entry_price`` on the first tick when None.
     bars_held: int = 0
     high_water_mark: Optional[float] = None
+    # Sprint 2.5 — entry attribution. ``entry_confidence`` is the predictor's
+    # confidence on the signal that produced this entry; ``resolved_kelly_pct``
+    # is the Kelly fraction the predictor surfaced when Kelly sizing was
+    # active (or None when the flat sizing path took it). Both default to
+    # None so legacy positions written before this commit round-trip cleanly
+    # via the pydantic v2 default. Calibration drift (``diagnose_calibration
+    # _drift.py``) reads ``entry_confidence`` first, so populating it here
+    # short-circuits the snapshot fallback and works even when the
+    # ``TradeContextStore`` is offline.
+    entry_confidence: Optional[float] = None
+    resolved_kelly_pct: Optional[float] = None
 
 
 class PositionStore:
@@ -341,6 +364,140 @@ class PositionStore:
             pipe.set(self._position_key(position_id), self._dump(updated))
             pipe.execute()
         return updated
+
+    def record_entry_attribution(
+        self,
+        position_id: str,
+        *,
+        entry_confidence: Optional[float] = None,
+        resolved_kelly_pct: Optional[float] = None,
+    ) -> Optional[Position]:
+        """Atomically patch the two entry-attribution fields onto a position.
+
+        Sprint 2.5: ``entry_confidence`` is what
+        :func:`scripts.diagnose_calibration_drift.resolve_confidence` reads
+        first; persisting it here means the calibration check works even
+        when the ``TradeContextStore`` snapshot path is offline. The supervisor
+        calls this immediately after ``record_open`` / paper drain so the
+        position blob in Redis has the confidence the model fired at.
+
+        Returns the updated :class:`Position` on success, ``None`` when the
+        position doesn't exist (caller may log — this isn't a control-flow
+        event). Best-effort: a Redis hiccup during this write must not
+        wreck the trade path, so the supervisor wraps the call in a
+        ``redis.exceptions.RedisError`` try/except.
+        """
+        existing = self.get(position_id)
+        if existing is None:
+            return None
+        updates: Dict[str, Any] = {}
+        if entry_confidence is not None:
+            try:
+                updates["entry_confidence"] = float(entry_confidence)
+            except (TypeError, ValueError):
+                pass
+        if resolved_kelly_pct is not None:
+            try:
+                updates["resolved_kelly_pct"] = float(resolved_kelly_pct)
+            except (TypeError, ValueError):
+                pass
+        if not updates:
+            return existing
+        updated = existing.model_copy(update=updates)
+        with self._lock:
+            pipe = self._redis.pipeline()
+            pipe.multi()
+            pipe.set(self._position_key(position_id), self._dump(updated))
+            pipe.execute()
+        return updated
+
+    # ------------------------------------------------------------------
+    # Sprint 2.5 — trade-context snapshot writers
+    # ------------------------------------------------------------------
+    def _trade_ctx_key(self, trade_id: str, phase: str) -> str:
+        return f"{self.namespace}:{_TRADE_CTX_KEY_PREFIX}:{trade_id}:{phase}"
+
+    def _record_trade_ctx_snapshot(
+        self,
+        *,
+        trade_id: str,
+        phase: str,
+        snapshot: Mapping[str, Any],
+    ) -> None:
+        """Shared writer for the three ``record_*_snapshot`` methods.
+
+        Keys + TTL match :class:`state.trade_context_store.TradeContextStore`
+        so the Lane E specialists' existing ``get_signal_snapshot`` /
+        ``get_fill_snapshot`` / ``get_snapshots`` calls find what's written
+        here without any reader-side change. ``snapshot`` is a dict shaped
+        like :class:`TradeContextSnapshot.to_dict()` (the canonical shape).
+        Writers MUST pre-include ``trade_id``, ``symbol``, ``captured_at_utc``,
+        and ``phase`` so the reader can rehydrate via ``from_json``.
+        """
+        if not trade_id:
+            raise ValueError("trade_id must be a non-empty string")
+        if phase not in _VALID_SNAPSHOT_PHASES:
+            raise ValueError(
+                f"phase must be one of {_VALID_SNAPSHOT_PHASES!r}, got {phase!r}"
+            )
+        blob = json.dumps(dict(snapshot), allow_nan=False, sort_keys=True)
+        key = self._trade_ctx_key(trade_id, phase)
+        with self._lock:
+            pipe = self._redis.pipeline()
+            pipe.multi()
+            pipe.set(key, blob)
+            pipe.expire(key, _TRADE_CTX_TTL_SECONDS)
+            pipe.execute()
+
+    def record_signal_snapshot(
+        self, trade_id: str, snapshot: Mapping[str, Any]
+    ) -> None:
+        """Persist the signal-time snapshot for ``trade_id``.
+
+        ``snapshot`` is a dict matching :class:`TradeContextSnapshot.to_dict`
+        with ``phase="signal"``. Caller is responsible for sanitising NaN/Inf
+        before passing (the dict is JSON-dumped with ``allow_nan=False``).
+        """
+        self._record_trade_ctx_snapshot(
+            trade_id=trade_id, phase="signal", snapshot=snapshot
+        )
+
+    def record_fill_snapshot(
+        self, trade_id: str, snapshot: Mapping[str, Any]
+    ) -> None:
+        """Persist the fill-time snapshot for ``trade_id``."""
+        self._record_trade_ctx_snapshot(
+            trade_id=trade_id, phase="fill", snapshot=snapshot
+        )
+
+    def record_breaker_snapshot(
+        self, trade_id: str, snapshot: Mapping[str, Any]
+    ) -> None:
+        """Persist the breaker-time snapshot for ``trade_id`` (forced-flat path)."""
+        self._record_trade_ctx_snapshot(
+            trade_id=trade_id, phase="breaker", snapshot=snapshot
+        )
+
+    def get_trade_ctx_snapshot(
+        self, trade_id: str, phase: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read back a snapshot blob as a dict; ``None`` when missing.
+
+        Symmetric with the three ``record_*_snapshot`` writers so tests can
+        round-trip without taking a second store dependency. Production
+        readers continue to use ``TradeContextStore.get_snapshot(...)``.
+        """
+        if phase not in _VALID_SNAPSHOT_PHASES:
+            raise ValueError(
+                f"phase must be one of {_VALID_SNAPSHOT_PHASES!r}, got {phase!r}"
+            )
+        blob = self._redis.get(self._trade_ctx_key(trade_id, phase))
+        if blob is None:
+            return None
+        try:
+            return json.loads(blob)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return None
 
     def record_close(
         self,
@@ -827,4 +984,10 @@ __all__ = [
     "REDIS_URL_ENV_VAR",
     "get_default_store",
     "reset_default_store",
+    # Sprint 2.5 — trade-context snapshot writer constants. The reader keys
+    # are owned by ``state.trade_context_store``; these are exported for
+    # callers (the supervisor, tests) that want the same constants without
+    # also importing TradeContextStore.
+    "_TRADE_CTX_KEY_PREFIX",
+    "_TRADE_CTX_TTL_SECONDS",
 ]

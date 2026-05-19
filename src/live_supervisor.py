@@ -75,6 +75,7 @@ _SRC_DIR = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+import redis.exceptions
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 if TYPE_CHECKING:  # pragma: no cover - type hints only
@@ -291,6 +292,12 @@ class PendingPaperFill:
     # signal + fill snapshots share a key. None when no snapshot store is
     # wired (snapshot capture is a no-op anyway).
     trade_id: Optional[str] = None
+    # Sprint 2.5: entry attribution — predictor's confidence + resolved
+    # Kelly fraction at signal time. The paper drain stamps these onto the
+    # synthesized Position so ``diagnose_calibration_drift`` finds the
+    # confidence on the position blob without needing the snapshot store.
+    entry_confidence: Optional[float] = None
+    resolved_kelly_pct: Optional[float] = None
 
 
 _ActionTaken = Literal[
@@ -1585,7 +1592,9 @@ class Supervisor:
         # path computed in step 3 if Kelly is disabled or the predictor
         # didn't surface a value. The breaker context above used the flat
         # number — Kelly resizing only affects what hits the exchange.
-        proposed, _sizing_source = self._resolve_proposed_notional(symbol=symbol)
+        proposed, _sizing_source, resolved_kelly_pct = (
+            self._resolve_proposed_notional(symbol=symbol)
+        )
 
         # 5b. Lane E E1: capture the signal snapshot BEFORE the mode gate
         # AND before order placement so a forensics agent can reconstruct
@@ -1600,6 +1609,7 @@ class Supervisor:
             confidence=confidence,
             ticker=ticker,
             ctx=ctx,
+            resolved_kelly_pct=resolved_kelly_pct,
         )
 
         # 6. Mode gate -- live falls back to paper if THIS symbol's shakedown
@@ -1628,6 +1638,8 @@ class Supervisor:
                     side=side,
                     ticker=ticker,
                     proposed_usd=proposed,
+                    entry_confidence=confidence,
+                    resolved_kelly_pct=resolved_kelly_pct,
                 )
                 return SupervisorTick(
                     tick_at_utc=now.isoformat(),
@@ -1648,6 +1660,8 @@ class Supervisor:
                     side=side,
                     ticker=ticker,
                     proposed_usd=proposed,
+                    entry_confidence=confidence,
+                    resolved_kelly_pct=resolved_kelly_pct,
                 )
                 notes_extra = f"live sizing={_sizing_source} usd={proposed:.2f}"
             else:
@@ -1656,6 +1670,8 @@ class Supervisor:
                     side=side,
                     ticker=ticker,
                     proposed_usd=proposed,
+                    entry_confidence=confidence,
+                    resolved_kelly_pct=resolved_kelly_pct,
                 )
                 notes_extra = f"paper sizing={_sizing_source} usd={proposed:.2f}"
         except ExchangeError as exc:
@@ -1713,6 +1729,8 @@ class Supervisor:
         side: Literal["buy", "sell"],
         ticker: Ticker,
         proposed_usd: float,
+        entry_confidence: Optional[float] = None,
+        resolved_kelly_pct: Optional[float] = None,
     ) -> None:
         """Place a real market order. Raises ExchangeError on failure."""
         order_start = time.monotonic()
@@ -1741,6 +1759,25 @@ class Supervisor:
             position = position.model_copy(
                 update={"position_id": pending_trade_id}
             )
+        # Sprint 2.5: stamp the entry attribution onto the position BEFORE
+        # the store write so the persisted blob carries entry_confidence
+        # (what diagnose_calibration_drift's resolve_confidence reads first)
+        # and resolved_kelly_pct (sizing forensics seam) without a second
+        # round-trip. Both fields default to None on legacy reads.
+        position = position.model_copy(
+            update={
+                "entry_confidence": (
+                    float(entry_confidence)
+                    if entry_confidence is not None
+                    else None
+                ),
+                "resolved_kelly_pct": (
+                    float(resolved_kelly_pct)
+                    if resolved_kelly_pct is not None
+                    else None
+                ),
+            }
+        )
         if order.status == "filled":
             self.position_store.record_open(position)
         else:
@@ -1786,6 +1823,8 @@ class Supervisor:
         side: Literal["buy", "sell"],
         ticker: Ticker,
         proposed_usd: float,
+        entry_confidence: Optional[float] = None,
+        resolved_kelly_pct: Optional[float] = None,
     ) -> None:
         """Queue a paper-trade signal for next-tick fill (P0 #4).
 
@@ -1823,6 +1862,16 @@ class Supervisor:
             slippage_bps=PAPER_SLIPPAGE_BPS,
             enqueued_tick_index=self._symbol_tick_index.get(symbol, 0),
             trade_id=pending_trade_id,
+            entry_confidence=(
+                float(entry_confidence)
+                if entry_confidence is not None
+                else None
+            ),
+            resolved_kelly_pct=(
+                float(resolved_kelly_pct)
+                if resolved_kelly_pct is not None
+                else None
+            ),
         )
         LOGGER.info(
             "paper signal queued for next-tick fill: %s side=%s notional=%.2f USD "
@@ -1888,6 +1937,11 @@ class Supervisor:
             opened_at_utc=self._now().isoformat(),
             fees_usd=0.0,
             notes="paper-deferred-fill",
+            # Sprint 2.5: paper-fill drains carry entry_confidence +
+            # resolved_kelly_pct off the PendingPaperFill so the stored
+            # position blob has the same attribution as a live fill.
+            entry_confidence=pending.entry_confidence,
+            resolved_kelly_pct=pending.resolved_kelly_pct,
         )
         self.position_store.record_open(position)
 
@@ -2114,15 +2168,21 @@ class Supervisor:
             "kelly_cap_pct": float(kelly_cap_pct),
         }
 
-    def _resolve_proposed_notional(self, *, symbol: str) -> Tuple[float, str]:
+    def _resolve_proposed_notional(
+        self, *, symbol: str
+    ) -> Tuple[float, str, Optional[float]]:
         """Pick the per-trade notional in USD for ``symbol``.
 
-        Returns ``(usd, source)`` where ``source`` is ``"kelly"`` when the
-        predictor's resolved Kelly fraction was used (clipped to the
-        floor/cap), and ``"flat"`` when we fell back to the legacy
-        ``bankroll * risk_pct_per_trade`` path. ``source`` is surfaced to
-        ``SupervisorTick.notes`` so operators can see *which* sizing the
-        tick used without reading metrics.
+        Returns ``(usd, source, resolved_kelly_pct)`` where ``source`` is
+        ``"kelly"`` when the predictor's resolved Kelly fraction was used
+        (clipped to the floor/cap), and ``"flat"`` when we fell back to
+        the legacy ``bankroll * risk_pct_per_trade`` path. ``source`` is
+        surfaced to ``SupervisorTick.notes`` so operators can see *which*
+        sizing the tick used without reading metrics.
+        ``resolved_kelly_pct`` is the (post-clip) Kelly fraction when
+        Kelly fired, else ``None`` — Sprint 2.5 forwards this onto the
+        opened :class:`Position` as ``resolved_kelly_pct`` so the Lane E
+        sizing forensics can pull it without re-resolving the regime.
 
         The Kelly read is via ``getattr(self.model_predict_fn,
         '_last_resolved_kelly_pct', None)``: the predictor itself decides
@@ -2133,23 +2193,23 @@ class Supervisor:
         flat_pct = float(self.config.risk_pct_per_trade)
         flat_usd = float(self.config.bankroll_usd) * flat_pct
         if not self.kelly_sizing_enabled:
-            return flat_usd, "flat"
+            return flat_usd, "flat", None
         kelly_pct = getattr(
             self.model_predict_fn, "_last_resolved_kelly_pct", None
         )
         if kelly_pct is None:
-            return flat_usd, "flat"
+            return flat_usd, "flat", None
         try:
             kelly_pct_f = float(kelly_pct)
         except (TypeError, ValueError):
-            return flat_usd, "flat"
+            return flat_usd, "flat", None
         if not math.isfinite(kelly_pct_f) or kelly_pct_f <= 0:
-            return flat_usd, "flat"
+            return flat_usd, "flat", None
         clipped = min(
             max(kelly_pct_f, float(self.kelly_floor_pct)),
             float(self.kelly_cap_pct),
         )
-        return float(self.config.bankroll_usd) * clipped, "kelly"
+        return float(self.config.bankroll_usd) * clipped, "kelly", clipped
 
     @staticmethod
     def _ticker_to_exit_tick(
@@ -2455,11 +2515,33 @@ class Supervisor:
         confidence: float,
         ticker: Ticker,
         ctx: DecisionContext,
+        resolved_kelly_pct: Optional[float] = None,
     ) -> None:
         """Capture the signal-time snapshot. No-op if no store is wired."""
         if self.trade_context_store is None:
             return
         try:
+            risk_in: Dict[str, Any] = {
+                "side": str(side),
+                "proposed_notional_usd": float(ctx.proposed_notional_usd),
+                "current_open_notional_usd": float(
+                    ctx.current_open_notional_usd
+                ),
+                "current_per_symbol_notional_usd": float(
+                    ctx.current_per_symbol_notional_usd
+                ),
+                "daily_realized_pnl_usd": float(ctx.daily_realized_pnl_usd),
+                "equity_peak_usd": float(ctx.equity_peak_usd),
+                "equity_current_usd": float(ctx.equity_current_usd),
+                "bankroll": float(self.config.bankroll_usd),
+            }
+            # Sprint 2.5: the sizing forensics agent (A3) prefers a
+            # ``resolved_kelly_pct`` key on risk_metrics_input over
+            # re-resolving from the predictor. None means "Kelly didn't
+            # fire on this tick" — distinct from key-missing which would
+            # imply the field was never written.
+            if resolved_kelly_pct is not None:
+                risk_in["resolved_kelly_pct"] = float(resolved_kelly_pct)
             snap = TradeContextSnapshot(
                 trade_id=trade_id,
                 symbol=symbol,
@@ -2469,19 +2551,7 @@ class Supervisor:
                 feature_window=None,
                 model_probs={},
                 model_confidence=float(confidence),
-                risk_metrics_input={
-                    "side": str(side),
-                    "proposed_notional_usd": float(ctx.proposed_notional_usd),
-                    "current_open_notional_usd": float(
-                        ctx.current_open_notional_usd
-                    ),
-                    "current_per_symbol_notional_usd": float(
-                        ctx.current_per_symbol_notional_usd
-                    ),
-                    "daily_realized_pnl_usd": float(ctx.daily_realized_pnl_usd),
-                    "equity_peak_usd": float(ctx.equity_peak_usd),
-                    "equity_current_usd": float(ctx.equity_current_usd),
-                },
+                risk_metrics_input=risk_in,
                 risk_metrics_output={},
                 breaker_context={},
                 ticker_buffer=[
@@ -2495,6 +2565,14 @@ class Supervisor:
                 notes=None,
             )
             self.trade_context_store.record_snapshot(snap)
+        except redis.exceptions.RedisError as exc:
+            # Best-effort persistence: a Redis hiccup must not crash the
+            # tick. Logged with the symbol so operators can find the gap.
+            LOGGER.warning(
+                "trade_context_store signal snapshot redis error for %s: %r",
+                symbol,
+                exc,
+            )
         except Exception as exc:  # noqa: BLE001 - never crash the tick
             LOGGER.warning(
                 "trade_context_store signal snapshot failed for %s: %r",
@@ -2565,6 +2643,12 @@ class Supervisor:
                 notes=notes,
             )
             self.trade_context_store.record_snapshot(snap)
+        except redis.exceptions.RedisError as exc:
+            LOGGER.warning(
+                "trade_context_store fill snapshot redis error for %s: %r",
+                symbol,
+                exc,
+            )
         except Exception as exc:  # noqa: BLE001 - never crash the tick
             LOGGER.warning(
                 "trade_context_store fill snapshot failed for %s: %r",
@@ -2671,6 +2755,12 @@ class Supervisor:
                 breaker_decision=breaker_decision,
             )
             self.trade_context_store.record_snapshot(snap)
+        except redis.exceptions.RedisError as exc:
+            LOGGER.warning(
+                "trade_context_store breaker snapshot redis error for %s: %r",
+                position.position_id,
+                exc,
+            )
         except Exception as exc:  # noqa: BLE001 - never crash the tick
             LOGGER.warning(
                 "trade_context_store breaker snapshot failed for %s: %r",
@@ -3996,6 +4086,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     circuit_breakers = CircuitBreakerSet()
     notifier = Notifier()
 
+    # Sprint 2.5: wire the Lane E trade-context snapshot store onto the
+    # same Redis client the position store already uses. Best-effort —
+    # a TradeContextStore construction failure logs and proceeds with
+    # ``trade_context_store=None``, which makes the three snapshot helpers
+    # no-op (same as pre-2.5 behaviour). Without this wiring the run_postmortem
+    # specialists return verdict=unknown for every trade and the calibration
+    # drift script's snapshot-fallback path is dead — they need this store
+    # to read from, and only the supervisor writes to it during a tick.
+    trade_context_store: Optional[TradeContextStore] = None
+    try:
+        # Share the position store's Redis client so we don't open a second
+        # connection per process. Falls through to a URL-based construction
+        # when the position store's internal client isn't exposed.
+        ps_redis = getattr(position_store, "_redis", None)
+        if ps_redis is not None:
+            trade_context_store = TradeContextStore(redis_client=ps_redis)
+        else:
+            trade_context_store = TradeContextStore()
+    except Exception as exc:  # noqa: BLE001 - never crash boot on snapshot store
+        LOGGER.warning(
+            "trade_context_store bootstrap failed (%s); snapshot capture disabled",
+            exc,
+        )
+        trade_context_store = None
+
     # Try the legacy transformer; fall back to neutral placeholder if anything
     # goes wrong (missing artifacts, torch import error, etc.). The supervisor
     # must never crash on model boot.
@@ -4067,6 +4182,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         metrics_pusher=metrics_pusher,
         auto_pause_gate=auto_pause_gate,
         confidence_history=confidence_history,
+        trade_context_store=trade_context_store,
     )
 
     # Include polymarket market ids in the run-dir name when set so the
