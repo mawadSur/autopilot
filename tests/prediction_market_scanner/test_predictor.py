@@ -430,6 +430,67 @@ class MultiSymbolPredictorRoutingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MultiSymbolXGBoostPredictor(model_map={})
 
+    def test_call_mirrors_child_kelly_and_regime_caches(self) -> None:
+        """The supervisor reads ``model_predict_fn._last_resolved_kelly_pct``
+        + ``..._last_resolved_regime_label`` directly. With multi-symbol mode
+        those caches live on the per-symbol child predictor. ``__call__``
+        must mirror them onto self after each predict so the supervisor's
+        getattr resolves to a real value, not the always-None default.
+        """
+        from predictor import MultiSymbolXGBoostPredictor
+
+        class _StubWithCache:
+            def __init__(self, kelly: Optional[float], label: Optional[str]) -> None:
+                self._last_resolved_kelly_pct = kelly
+                self._last_resolved_regime_label = label
+
+            def __call__(self, symbol, ticker):
+                return ("buy", 0.7)
+
+        eth_stub = _StubWithCache(kelly=0.08, label="trend_up")
+        btc_stub = _StubWithCache(kelly=None, label=None)
+        multi = MultiSymbolXGBoostPredictor(
+            model_map={"ETH/USD": eth_stub, "BTC/USD": btc_stub}
+        )
+        # Pre-call: caches are the safe sentinel.
+        self.assertIsNone(multi._last_resolved_kelly_pct)
+        self.assertIsNone(multi._last_resolved_regime_label)
+        # After predicting ETH, multi mirrors the ETH child's values.
+        multi("ETH/USD", None)
+        self.assertEqual(multi._last_resolved_kelly_pct, 0.08)
+        self.assertEqual(multi._last_resolved_regime_label, "trend_up")
+        # After predicting BTC (which has None caches), multi mirrors None.
+        # This is the "supervisor reads after the most recent predict"
+        # semantics — per-symbol state isolation.
+        multi("BTC/USD", None)
+        self.assertIsNone(multi._last_resolved_kelly_pct)
+        self.assertIsNone(multi._last_resolved_regime_label)
+
+    def test_unknown_symbol_resets_caches(self) -> None:
+        """An unknown symbol call returns the neutral result; it should also
+        clear the caches so the supervisor doesn't reuse a stale value from
+        the previously-called symbol.
+        """
+        from predictor import MultiSymbolXGBoostPredictor
+
+        class _StubWithCache:
+            def __init__(self, kelly: Optional[float]) -> None:
+                self._last_resolved_kelly_pct = kelly
+                self._last_resolved_regime_label = "chop"
+
+            def __call__(self, symbol, ticker):
+                return ("buy", 0.6)
+
+        eth_stub = _StubWithCache(kelly=0.04)
+        multi = MultiSymbolXGBoostPredictor(model_map={"ETH/USD": eth_stub})
+        # Prime the multi caches with ETH's values.
+        multi("ETH/USD", None)
+        self.assertEqual(multi._last_resolved_kelly_pct, 0.04)
+        # Unknown symbol — must clear, not leave ETH's stale cache visible.
+        multi("DOGE/USD", None)
+        self.assertIsNone(multi._last_resolved_kelly_pct)
+        self.assertIsNone(multi._last_resolved_regime_label)
+
 
 class PredictorResultDataclassTests(unittest.TestCase):
     """``PredictorResult`` shape + defaults (Lane B / A1 gap closure)."""

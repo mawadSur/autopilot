@@ -941,6 +941,16 @@ class MultiSymbolXGBoostPredictor:
                         f"is missing required attribute {attr!r}"
                     )
         self.model_map = model_map
+        # The supervisor reads ``self._last_resolved_kelly_pct`` and
+        # ``self._last_resolved_regime_label`` directly off the predict_fn
+        # to size positions and stamp regime labels. The per-symbol child
+        # predictors set those caches on themselves during ``__call__`` /
+        # ``predict_full``; we mirror the most-recently-called child's
+        # values onto self so the supervisor's getattr lookups resolve to
+        # real values instead of None. Initialise to None so a read
+        # before the first predict still gets the safe sentinel.
+        self._last_resolved_kelly_pct: Optional[float] = None
+        self._last_resolved_regime_label: Optional[str] = None
         # Optional per-symbol regime-store override. The global
         # ``REGIME_STORE_PATH`` was applied during each per-symbol predictor's
         # __init__; here we honour the per-symbol form
@@ -1002,8 +1012,22 @@ class MultiSymbolXGBoostPredictor:
                 "multi-symbol predictor: no model wired for %s; returning neutral",
                 symbol,
             )
+            self._last_resolved_kelly_pct = None
+            self._last_resolved_regime_label = None
             return _NEUTRAL_RESULT
-        return predictor(symbol, ticker)
+        result = predictor(symbol, ticker)
+        # Mirror per-symbol child caches onto self so the supervisor's
+        # ``getattr(self.model_predict_fn, "_last_resolved_kelly_pct", None)``
+        # and ``..._last_resolved_regime_label`` reads resolve to the value
+        # the child just set during this predict, not the always-None
+        # default on the Multi wrapper.
+        self._last_resolved_kelly_pct = getattr(
+            predictor, "_last_resolved_kelly_pct", None
+        )
+        self._last_resolved_regime_label = getattr(
+            predictor, "_last_resolved_regime_label", None
+        )
+        return result
 
     def predict_full(
         self, symbol: str, ticker: Any
@@ -1027,9 +1051,21 @@ class MultiSymbolXGBoostPredictor:
         # may only expose __call__. Route accordingly.
         rich = getattr(predictor, "predict_full", None)
         if callable(rich):
-            return rich(symbol, ticker)
-        side, conf = predictor(symbol, ticker)
-        return PredictorResult(side=side, confidence=conf)
+            result = rich(symbol, ticker)
+        else:
+            side, conf = predictor(symbol, ticker)
+            result = PredictorResult(side=side, confidence=conf)
+        # Mirror per-symbol child caches onto self (see __call__ above
+        # for rationale). predict_full is the rich path used by Lane E
+        # signal forensics; the supervisor's sizing path uses __call__
+        # but mirroring here too keeps the two seams symmetric.
+        self._last_resolved_kelly_pct = getattr(
+            predictor, "_last_resolved_kelly_pct", None
+        )
+        self._last_resolved_regime_label = getattr(
+            predictor, "_last_resolved_regime_label", None
+        )
+        return result
 
     def model_meta_for(self, symbol: str) -> Dict[str, Any]:
         """Return the per-symbol meta blob for the given symbol or ``{}``.
