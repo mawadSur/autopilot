@@ -121,6 +121,14 @@ class TradeContextSnapshot:
     kill_switch_reason: Optional[str] = None
     stop_loss_trigger_price: Optional[float] = None
     breaker_decision: Optional[str] = None
+    # Sprint 2.6: regime label resolved by the predictor's regime_lookup at
+    # signal time. The ``OutcomeAdjuster`` resolver (per
+    # ``scripts/run_outcome_adjuster.py`` doc lines 15-22) treats this
+    # top-level key as the canonical seam; today its concrete impl also
+    # probes ``risk_metrics_input["regime_label"]`` (belt-and-suspenders the
+    # supervisor mirrors). Defaults to None so legacy snapshots round-trip
+    # cleanly through ``cls(**data)``.
+    regime_label: Optional[str] = None
 
     # ------------------------------------------------------------------
     # serialization

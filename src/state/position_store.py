@@ -180,6 +180,17 @@ class Position(BaseModel):
     # ``TradeContextStore`` is offline.
     entry_confidence: Optional[float] = None
     resolved_kelly_pct: Optional[float] = None
+    # Sprint 2.6 — regime label the predictor's regime_lookup resolved at
+    # entry time, when ``regime_lookup`` was wired AND the lookup landed at
+    # confidence >= 0.5 (otherwise the predictor leaves the cache None and
+    # this stays None too). Mirrors the entry_confidence / resolved_kelly_pct
+    # pattern above: pydantic v2 default fills in on load so legacy Redis
+    # blobs that pre-date this field round-trip cleanly. Lit by the
+    # ``OutcomeAdjuster`` resolver (priority 1 reads ``model_meta`` but the
+    # signal-snapshot seam reads this field's writer at
+    # ``signal_snapshot["regime_label"]`` and
+    # ``signal_snapshot["risk_metrics_input"]["regime_label"]``).
+    regime_label: Optional[str] = None
 
 
 class PositionStore:
@@ -371,6 +382,7 @@ class PositionStore:
         *,
         entry_confidence: Optional[float] = None,
         resolved_kelly_pct: Optional[float] = None,
+        regime_label: Optional[str] = None,
     ) -> Optional[Position]:
         """Atomically patch the two entry-attribution fields onto a position.
 
@@ -401,6 +413,15 @@ class PositionStore:
                 updates["resolved_kelly_pct"] = float(resolved_kelly_pct)
             except (TypeError, ValueError):
                 pass
+        if regime_label is not None:
+            # Strings only — coerce non-empty repr defensively. ``None`` keeps
+            # the existing field (no overwrite).
+            try:
+                label_str = str(regime_label).strip()
+            except (TypeError, ValueError):
+                label_str = ""
+            if label_str:
+                updates["regime_label"] = label_str
         if not updates:
             return existing
         updated = existing.model_copy(update=updates)

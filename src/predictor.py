@@ -525,6 +525,12 @@ class XGBoostPredictor:
         # ``src/regime_memory/INTEGRATION.md``.
         self.regime_lookup: Optional[Any] = None
         self._last_resolved_kelly_pct: Optional[float] = None
+        # Sprint 2.6: mirror the kelly cache for the resolved regime label so
+        # the supervisor can forward it onto the synthesized Position
+        # (``regime_label``) without re-running the regime lookup. None when
+        # the lookup is off, confidence < 0.5, or the resolver didn't surface
+        # a label — matches the Kelly contract exactly.
+        self._last_resolved_regime_label: Optional[str] = None
         self._maybe_init_regime_lookup()
 
         LOGGER.info(
@@ -706,6 +712,7 @@ class XGBoostPredictor:
         lookup = self.regime_lookup
         if lookup is None or feature_window is None:
             self._last_resolved_kelly_pct = None
+            self._last_resolved_regime_label = None
             return self.thr_long
         try:
             resolved = lookup.resolve_params(feature_window, k=10)
@@ -716,15 +723,18 @@ class XGBoostPredictor:
                 exc,
             )
             self._last_resolved_kelly_pct = None
+            self._last_resolved_regime_label = None
             return self.thr_long
         try:
             confidence = float(resolved.get("_regime_confidence", 0.0))
         except (TypeError, ValueError):
             self._last_resolved_kelly_pct = None
+            self._last_resolved_regime_label = None
             return self.thr_long
         if confidence < 0.5:
             # Low-match → soft prior at most. Static path stays in charge.
             self._last_resolved_kelly_pct = None
+            self._last_resolved_regime_label = None
             return self.thr_long
         try:
             new_thr = float(resolved.get("optimal_threshold", self.thr_long))
@@ -739,13 +749,27 @@ class XGBoostPredictor:
             )
         except (TypeError, ValueError):
             self._last_resolved_kelly_pct = None
+        # Sprint 2.6: cache the resolved regime label next to the kelly
+        # fraction. ``resolve_params`` adds ``_regime_label`` (per
+        # ``regime_memory/lookup.py``) when the OutcomeAdjuster is wired; it
+        # may be absent when an older lookup is in play, so default to None.
+        raw_label = resolved.get("_regime_label")
+        if raw_label is None:
+            self._last_resolved_regime_label = None
+        else:
+            try:
+                label_str = str(raw_label).strip()
+            except (TypeError, ValueError):
+                label_str = ""
+            self._last_resolved_regime_label = label_str or None
         LOGGER.info(
-            "regime_lookup: confidence=%.3f -> thr=%.4f kelly=%s",
+            "regime_lookup: confidence=%.3f -> thr=%.4f kelly=%s label=%s",
             confidence,
             new_thr,
             f"{self._last_resolved_kelly_pct:.4f}"
             if self._last_resolved_kelly_pct is not None
             else "n/a",
+            self._last_resolved_regime_label or "n/a",
         )
         return new_thr
 

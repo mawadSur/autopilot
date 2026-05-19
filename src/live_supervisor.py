@@ -298,6 +298,13 @@ class PendingPaperFill:
     # confidence on the position blob without needing the snapshot store.
     entry_confidence: Optional[float] = None
     resolved_kelly_pct: Optional[float] = None
+    # Sprint 2.6: regime label resolved by the predictor's regime_lookup at
+    # signal time (or None when the lookup was off / low-confidence). The
+    # paper drain mirrors entry_confidence/resolved_kelly_pct and forwards
+    # this onto the synthesized Position so ``OutcomeAdjuster`` can probe
+    # the model_meta path on the Position blob without re-reading the
+    # snapshot store.
+    regime_label: Optional[str] = None
 
 
 _ActionTaken = Literal[
@@ -1595,6 +1602,14 @@ class Supervisor:
         proposed, _sizing_source, resolved_kelly_pct = (
             self._resolve_proposed_notional(symbol=symbol)
         )
+        # Sprint 2.6: mirror the kelly-cache read so we forward the resolved
+        # regime label (when the predictor's regime_lookup fired with
+        # confidence >= 0.5) through the same path Sprint 2.5 used for the
+        # Kelly fraction. ``None`` when the lookup didn't fire — the
+        # downstream snapshot writer drops the key in that case.
+        resolved_regime_label = getattr(
+            self.model_predict_fn, "_last_resolved_regime_label", None
+        )
 
         # 5b. Lane E E1: capture the signal snapshot BEFORE the mode gate
         # AND before order placement so a forensics agent can reconstruct
@@ -1610,6 +1625,7 @@ class Supervisor:
             ticker=ticker,
             ctx=ctx,
             resolved_kelly_pct=resolved_kelly_pct,
+            regime_label=resolved_regime_label,
         )
 
         # 6. Mode gate -- live falls back to paper if THIS symbol's shakedown
@@ -1640,6 +1656,7 @@ class Supervisor:
                     proposed_usd=proposed,
                     entry_confidence=confidence,
                     resolved_kelly_pct=resolved_kelly_pct,
+                    regime_label=resolved_regime_label,
                 )
                 return SupervisorTick(
                     tick_at_utc=now.isoformat(),
@@ -1662,6 +1679,7 @@ class Supervisor:
                     proposed_usd=proposed,
                     entry_confidence=confidence,
                     resolved_kelly_pct=resolved_kelly_pct,
+                    regime_label=resolved_regime_label,
                 )
                 notes_extra = f"live sizing={_sizing_source} usd={proposed:.2f}"
             else:
@@ -1672,6 +1690,7 @@ class Supervisor:
                     proposed_usd=proposed,
                     entry_confidence=confidence,
                     resolved_kelly_pct=resolved_kelly_pct,
+                    regime_label=resolved_regime_label,
                 )
                 notes_extra = f"paper sizing={_sizing_source} usd={proposed:.2f}"
         except ExchangeError as exc:
@@ -1731,6 +1750,7 @@ class Supervisor:
         proposed_usd: float,
         entry_confidence: Optional[float] = None,
         resolved_kelly_pct: Optional[float] = None,
+        regime_label: Optional[str] = None,
     ) -> None:
         """Place a real market order. Raises ExchangeError on failure."""
         order_start = time.monotonic()
@@ -1774,6 +1794,14 @@ class Supervisor:
                 "resolved_kelly_pct": (
                     float(resolved_kelly_pct)
                     if resolved_kelly_pct is not None
+                    else None
+                ),
+                # Sprint 2.6: mirror the kelly stamp pattern. Empty strings
+                # collapse to None so the Position blob's regime_label stays
+                # absent when the predictor didn't surface a label.
+                "regime_label": (
+                    (str(regime_label).strip() or None)
+                    if regime_label is not None
                     else None
                 ),
             }
@@ -1825,6 +1853,7 @@ class Supervisor:
         proposed_usd: float,
         entry_confidence: Optional[float] = None,
         resolved_kelly_pct: Optional[float] = None,
+        regime_label: Optional[str] = None,
     ) -> None:
         """Queue a paper-trade signal for next-tick fill (P0 #4).
 
@@ -1870,6 +1899,14 @@ class Supervisor:
             resolved_kelly_pct=(
                 float(resolved_kelly_pct)
                 if resolved_kelly_pct is not None
+                else None
+            ),
+            # Sprint 2.6: carry the resolved regime label through the
+            # deferred-fill state machine so the next-tick paper drain
+            # stamps it onto the synthesized Position.
+            regime_label=(
+                (str(regime_label).strip() or None)
+                if regime_label is not None
                 else None
             ),
         )
@@ -1942,6 +1979,9 @@ class Supervisor:
             # position blob has the same attribution as a live fill.
             entry_confidence=pending.entry_confidence,
             resolved_kelly_pct=pending.resolved_kelly_pct,
+            # Sprint 2.6: carry the regime label across the deferred-fill
+            # boundary too, mirroring the kelly stamp pattern.
+            regime_label=pending.regime_label,
         )
         self.position_store.record_open(position)
 
@@ -2516,6 +2556,7 @@ class Supervisor:
         ticker: Ticker,
         ctx: DecisionContext,
         resolved_kelly_pct: Optional[float] = None,
+        regime_label: Optional[str] = None,
     ) -> None:
         """Capture the signal-time snapshot. No-op if no store is wired."""
         if self.trade_context_store is None:
@@ -2542,6 +2583,25 @@ class Supervisor:
             # imply the field was never written.
             if resolved_kelly_pct is not None:
                 risk_in["resolved_kelly_pct"] = float(resolved_kelly_pct)
+            # Sprint 2.6: belt-and-suspenders write of the regime label.
+            # ``scripts/run_outcome_adjuster.py``'s
+            # ``_try_label_from_signal_snapshot`` iterates over
+            # ``risk_metrics_input`` (today's concrete probe), and the
+            # script docstring (lines 15-22) names ``signal_snapshot
+            # ["regime_label"]`` the canonical top-level seam. We write
+            # both so the resolver finds the label regardless of which
+            # seam ends up canonical. Empty / blank labels collapse to
+            # ``None`` so the key only appears when there's a real label.
+            normalized_label: Optional[str] = None
+            if regime_label is not None:
+                try:
+                    candidate = str(regime_label).strip()
+                except (TypeError, ValueError):
+                    candidate = ""
+                if candidate:
+                    normalized_label = candidate
+            if normalized_label is not None:
+                risk_in["regime_label"] = normalized_label
             snap = TradeContextSnapshot(
                 trade_id=trade_id,
                 symbol=symbol,
@@ -2563,6 +2623,7 @@ class Supervisor:
                     }
                 ],
                 notes=None,
+                regime_label=normalized_label,
             )
             self.trade_context_store.record_snapshot(snap)
         except redis.exceptions.RedisError as exc:

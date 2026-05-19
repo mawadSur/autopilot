@@ -26,7 +26,7 @@ import unittest
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 import fakeredis
 
@@ -242,6 +242,60 @@ class TestEntryAttributionPlumbedToPosition(_Sprint25IntegrationFixture):
         conf = resolve_confidence(opens[0], trade_ctx_store=self.tcs)
         self.assertIsNotNone(conf)
         self.assertAlmostEqual(float(conf), 0.83)
+
+
+class _RegimeAwarePredictor:
+    """A callable predictor stub that also exposes the Sprint 2.6 cache
+    attribute (lambdas can't hold attrs, so we use a small class)."""
+
+    def __init__(
+        self,
+        *,
+        regime_label: str = "high_vol_chop",
+        kelly_pct: Optional[float] = None,
+    ) -> None:
+        self._last_resolved_regime_label = regime_label
+        self._last_resolved_kelly_pct = kelly_pct
+
+    def __call__(self, _symbol: str, _ticker: Any) -> Any:
+        return ("buy", 0.83)
+
+
+class TestRegimeLabelPlumbedToSnapshotAndPosition(_Sprint25IntegrationFixture):
+    """Sprint 2.6: predictor._last_resolved_regime_label must reach BOTH
+    the signal snapshot (top-level + risk_metrics_input) AND the Position
+    blob's regime_label field. Mirrors the Sprint 2.5 plumbing tests."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Swap the lambda for a class-based stub with the regime-label cache
+        # attribute the supervisor reads via getattr.
+        self.sup.model_predict_fn = _RegimeAwarePredictor(
+            regime_label="high_vol_chop"
+        )
+
+    def test_regime_label_round_trips_predictor_cache_to_snapshot_and_position(
+        self,
+    ) -> None:
+        # Tick 1 queues the paper signal (snapshot is written, no Position
+        # yet). Tick 2 drains the pending fill → Position has regime_label.
+        self.sup.run_once()
+        self.sup.run_once()
+        opens = self.ps.list_open()
+        self.assertEqual(len(opens), 1)
+        position = opens[0]
+        # Position blob stamps the label off the PendingPaperFill carry.
+        self.assertEqual(position.regime_label, "high_vol_chop")
+
+        # Signal snapshot in Redis: top-level regime_label AND
+        # risk_metrics_input["regime_label"] both populated (the supervisor
+        # writes both for the OutcomeAdjuster's belt-and-suspenders probe).
+        signal = self.tcs.get_signal_snapshot(position.position_id)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.regime_label, "high_vol_chop")
+        self.assertEqual(
+            signal.risk_metrics_input.get("regime_label"), "high_vol_chop"
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -837,6 +837,42 @@ class PositionSprint25AttributionTests(unittest.TestCase):
         self.assertAlmostEqual(float(updated.entry_confidence), 0.71)
         self.assertIsNone(updated.resolved_kelly_pct)
 
+    def test_position_regime_label_round_trips(self) -> None:
+        # Sprint 2.6: Position.regime_label defaults None and survives a
+        # Redis save+load round-trip + a record_entry_attribution patch.
+        # Mirrors the Sprint 2.5 entry_confidence/resolved_kelly_pct
+        # pattern: backward-compatible default so legacy blobs round-trip.
+        position = _new_position()
+        self.assertIsNone(position.regime_label)
+        # JSON round-trip preserves None.
+        roundtrip = Position.model_validate_json(position.model_dump_json())
+        self.assertIsNone(roundtrip.regime_label)
+        # Legacy blob without the field (pre-Sprint-2.6) still deserializes.
+        legacy_blob = (
+            '{"position_id":"legacy-regime","exchange":"coinbase",'
+            '"symbol":"ETH/USDT","side":"long","status":"open",'
+            '"entry_price":100.0,"entry_quote_usd":100.0,"base_size":1.0,'
+            '"opened_at_utc":"2026-04-01T00:00:00+00:00","fees_usd":0.0,'
+            '"model_meta":{},"notes":null}'
+        )
+        revived = Position.model_validate_json(legacy_blob)
+        self.assertIsNone(revived.regime_label)
+        # record_entry_attribution can stamp the new field; Redis blob
+        # carries it back on a fresh get().
+        pos = self.store.record_open(_new_position())
+        self.assertIsNone(pos.regime_label)
+        updated = self.store.record_entry_attribution(
+            pos.position_id,
+            entry_confidence=0.83,
+            resolved_kelly_pct=0.04,
+            regime_label="high_vol_chop",
+        )
+        assert updated is not None
+        self.assertEqual(updated.regime_label, "high_vol_chop")
+        rehydrated = self.store.get(pos.position_id)
+        assert rehydrated is not None
+        self.assertEqual(rehydrated.regime_label, "high_vol_chop")
+
 
 class PositionStoreSnapshotWriterTests(unittest.TestCase):
     """Sprint 2.5: trade-context snapshot writers round-trip with the reader.
