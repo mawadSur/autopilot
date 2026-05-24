@@ -222,6 +222,24 @@ class SchemaTests(unittest.TestCase):
                 extra=True,
             )
 
+    def test_ticker_mid_falls_back_to_last_when_bidask_missing(self) -> None:
+        # Coinbase /products endpoint returns price reliably but omits
+        # best_bid/best_ask. Without this fallback every paper-mode fill
+        # records entry_price=1.0 (the supervisor's hard fallback) so any
+        # Redis-based PnL audit is junk.
+        t = Ticker(
+            symbol="ETH/USD", bid=0.0, ask=0.0, last=2119.3,
+            volume_24h_base=0.0, as_of_utc="2024-01-01T00:00:00+00:00",
+        )
+        self.assertEqual(t.mid, 2119.3)
+        self.assertEqual(t.spread_bps, 0.0)
+        # All-zero ticker (truly unavailable) still degrades to 0.
+        t0 = Ticker(
+            symbol="ETH/USD", bid=0.0, ask=0.0, last=0.0,
+            volume_24h_base=0.0, as_of_utc="2024-01-01T00:00:00+00:00",
+        )
+        self.assertEqual(t0.mid, 0.0)
+
 
 # ---------------------------------------------------------------------------
 # Init tests

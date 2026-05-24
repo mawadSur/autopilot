@@ -34,7 +34,7 @@ import numpy as np
 
 LOGGER = logging.getLogger(__name__)
 
-_NEUTRAL_RESULT: Tuple[Literal["buy", "sell"], float] = ("buy", 0.5)
+_NEUTRAL_RESULT: Tuple[Literal["buy", "sell"], float] = ("buy", 0.0)
 
 
 # ---------------------------------------------------------------------------

@@ -107,8 +107,12 @@ class DecisionMappingTests(unittest.TestCase):
         p = self._make_predictor()
         side, conf = p._probs_to_decision(np.array([0.40, 0.30, 0.30]))
         # Neutral: long not above 0.55 and short not above 0.60.
+        # Confidence must be 0.0 (not 0.5) so any reasonable supervisor
+        # --min-confidence filters neutrals. With the old 0.5 sentinel,
+        # lowering --min-confidence below 0.5 to let real low-prob triggers
+        # through caused every neutral tick to fire a trade.
         self.assertEqual(side, "buy")
-        self.assertAlmostEqual(conf, 0.5, places=6)
+        self.assertAlmostEqual(conf, 0.0, places=6)
 
     def test_dominant_long_breaks_tie_against_short(self) -> None:
         # p_long == p_short, both above threshold -> long-dominant rule wins.
@@ -129,11 +133,21 @@ class DecisionMappingTests(unittest.TestCase):
         self.assertEqual(side, "buy")
         self.assertAlmostEqual(conf, 0.70, places=6)
 
+    def test_neutral_sentinel_is_below_any_sensible_min_confidence(self) -> None:
+        # Regression contract: the predictor's neutral signal must be lower
+        # than any --min-confidence an operator would reasonably pass to the
+        # supervisor. 0.0 ensures the supervisor filters neutrals regardless
+        # of the chosen entry threshold.
+        from predictor import _NEUTRAL_RESULT
+        side, conf = _NEUTRAL_RESULT
+        self.assertEqual(side, "buy")
+        self.assertEqual(conf, 0.0)
+
     def test_empty_input_returns_neutral(self) -> None:
         p = self._make_predictor()
         side, conf = p._probs_to_decision(np.array([]))
         self.assertEqual(side, "buy")
-        self.assertAlmostEqual(conf, 0.5, places=6)
+        self.assertAlmostEqual(conf, 0.0, places=6)
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +436,7 @@ class MultiSymbolPredictorRoutingTests(unittest.TestCase):
 
         multi = MultiSymbolXGBoostPredictor(model_map={"ETH/USD": object()})
         side, conf = multi("DOGE/USD", None)
-        self.assertEqual((side, conf), ("buy", 0.5))
+        self.assertEqual((side, conf), ("buy", 0.0))
 
     def test_empty_map_raises(self) -> None:
         from predictor import MultiSymbolXGBoostPredictor
