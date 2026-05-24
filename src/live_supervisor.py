@@ -49,12 +49,13 @@ import logging
 import math
 import multiprocessing as mp
 import os
+import re
 import signal
 import sys
 import time
 import traceback
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -292,6 +293,54 @@ class PendingPaperFill:
     trade_id: Optional[str] = None
 
 
+_TIME_RE = re.compile(r"^time:(\d+)([smh])$", re.IGNORECASE)
+_TP_SL_RE = re.compile(
+    r"^tp_sl:(\d+(?:\.\d+)?)bps/(\d+(?:\.\d+)?)bps$", re.IGNORECASE
+)
+
+
+def _parse_exit_rule(rule: str) -> Dict[str, Optional[float]]:
+    """Parse an ``--exit-rule`` string into a normalised dict.
+
+    Accepted forms (comma-separated to combine):
+      * ``"none"`` -> ``{}`` (no exits ever)
+      * ``"time:5m"`` / ``"time:300s"`` / ``"time:2h"``
+      * ``"tp_sl:30bps/50bps"``
+      * ``"tp_sl:30bps/50bps,time:10m"``
+
+    Returns a dict with optional keys ``time_seconds``, ``tp_bps``,
+    ``sl_bps``. Missing keys mean that sub-rule is disabled. An empty
+    dict means "never close".
+
+    Raises ``ValueError`` on unrecognised input so the operator hears
+    about typos at boot, not silently at exit time.
+    """
+    rule = (rule or "").strip()
+    if not rule or rule.lower() == "none":
+        return {}
+    out: Dict[str, Optional[float]] = {}
+    parts = [p.strip() for p in rule.split(",") if p.strip()]
+    for part in parts:
+        lower = part.lower()
+        m_time = _TIME_RE.match(lower)
+        if m_time:
+            value = int(m_time.group(1))
+            unit = m_time.group(2).lower()
+            seconds = value * {"s": 1, "m": 60, "h": 3600}[unit]
+            out["time_seconds"] = float(seconds)
+            continue
+        m_tp = _TP_SL_RE.match(lower)
+        if m_tp:
+            out["tp_bps"] = float(m_tp.group(1))
+            out["sl_bps"] = float(m_tp.group(2))
+            continue
+        raise ValueError(
+            f"unrecognised exit-rule clause {part!r}; expected 'none', "
+            "'time:Nm' / 'time:Ns' / 'time:Nh', or 'tp_sl:Xbps/Ybps'."
+        )
+    return out
+
+
 _ActionTaken = Literal[
     "skipped_low_confidence",
     "allowed",
@@ -330,6 +379,12 @@ class SupervisorConfig(BaseModel):
     shakedown_state_path: Path
     risk_pct_per_trade: float = 0.005
     min_confidence_to_trade: float = 0.6
+    # Exit rule applied to open positions at the top of every tick. Syntax:
+    #   "none"                              - never close (legacy behavior)
+    #   "time:5m"                           - close after 5 minutes
+    #   "tp_sl:30bps/50bps"                 - +30bps TP / -50bps SL
+    #   "tp_sl:30bps/50bps,time:10m"        - either condition trips first
+    exit_rule: str = "none"
 
     @model_validator(mode="after")
     def _require_at_least_one_source(self) -> "SupervisorConfig":
@@ -467,6 +522,27 @@ def _today_iso(now: datetime) -> str:
     return now.astimezone(timezone.utc).date().isoformat()
 
 
+def _parse_position_opened_at(value: str) -> Optional[datetime]:
+    """Parse a Position.opened_at_utc ISO string; returns UTC-aware dt or None.
+
+    Handles both the canonical ``+00:00`` suffix and a trailing ``Z``.
+    Returns None on any parse error so the caller can skip the position
+    gracefully rather than crashing the whole tick.
+    """
+    if not value:
+        return None
+    try:
+        s = value.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(s)
+    except Exception:  # noqa: BLE001 - return None on any parse failure
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _placeholder_predict(
     symbol: str, ticker: Ticker
 ) -> Tuple[Literal["buy", "sell"], float]:
@@ -592,6 +668,12 @@ class Supervisor:
         self._symbol_tick_index: Dict[str, int] = {
             sym: 0 for sym in self._tradeables_by_symbol.keys()
         }
+
+        # Parse + cache the exit rule once at boot so typos are surfaced
+        # before the first tick (rather than silently at exit time).
+        self._exit_rule_parsed: Dict[str, Optional[float]] = _parse_exit_rule(
+            self.config.exit_rule
+        )
 
         # Hydrate (or initialise) the shakedown evidence file.
         self.shakedown_state: ShakedownState = self._load_or_init_shakedown()
@@ -1315,13 +1397,29 @@ class Supervisor:
                 notes=f"get_ticker: {exc!r}",
             )
 
-        # 2b. Bump per-symbol tick index, then drain any pending paper fill
-        # against the FRESH ticker. This is the heart of the
-        # defer-to-next-tick state machine -- the fill price for a paper
-        # signal emitted at tick N is the ticker observed at tick N+1.
+        # 2b. Bump per-symbol tick index so pending-fill staleness ages
+        # correctly. This is the heart of the defer-to-next-tick state
+        # machine -- the fill price for a paper signal emitted at tick N
+        # is the ticker observed at tick N+1.
         self._symbol_tick_index[symbol] = (
             self._symbol_tick_index.get(symbol, 0) + 1
         )
+
+        # 2c. Evaluate exits BEFORE draining the pending fill (entry) so a
+        # halted-breaker tick can still close stale positions, and a
+        # just-filled position is never instant-closed on the same tick.
+        # Always best-effort; per-position errors are logged but never
+        # abort the tick.
+        try:
+            self._check_exits(symbol=symbol, ticker=ticker)
+        except Exception as exc:  # noqa: BLE001 - never let exit logic kill loop
+            LOGGER.exception("exit-rule evaluation failed for %s", symbol)
+            self._safe_alert(
+                f"exit-rule evaluation failed for {symbol}: {exc}",
+                severity="alert",
+            )
+
+        # 2d. Drain any pending paper fill against the FRESH ticker.
         self._drain_pending_paper_fill(symbol, ticker)
 
         # 3. Build context + run breakers.
@@ -1797,6 +1895,123 @@ class Supervisor:
             position.opened_at_utc,
         )
         return position
+
+    # ------------------------------------------------------------------
+    # Exit-rule evaluation
+    # ------------------------------------------------------------------
+    def _check_exits(self, *, symbol: str, ticker: Ticker) -> None:
+        """Close any open positions on ``symbol`` whose exit rule has fired.
+
+        Called once per ``_tick_symbol`` invocation, after the ticker
+        fetch and before the entry decision. Iterates only positions
+        whose ``symbol`` matches this tick. Direction-aware: longs profit
+        when price rises, shorts profit when price falls.
+
+        Rule precedence is "whichever fires first" within a single tick;
+        ``time`` and ``tp_sl`` are checked together and the first matching
+        clause is recorded as the firing rule.
+        """
+        rule = self._exit_rule_parsed
+        if not rule:
+            return
+
+        # Cheap up-front mid; falls back to a sane default if the ticker
+        # somehow lacks one (shouldn't, post-commit 849325b — Ticker.mid
+        # falls back to last when bid/ask are 0).
+        try:
+            exit_mid = float(ticker.mid)
+        except Exception:  # noqa: BLE001 - skip the tick on garbage tickers
+            return
+        if exit_mid <= 0:
+            return
+
+        now = self._now()
+        time_seconds = rule.get("time_seconds")
+        tp_bps = rule.get("tp_bps")
+        sl_bps = rule.get("sl_bps")
+
+        # Snapshot to avoid iterating a mutating collection if record_close
+        # writes back to the same underlying store.
+        for position in list(self.position_store.list_open()):
+            if position.symbol != symbol:
+                continue
+            if position.status != "open":
+                # Skip pending/closing positions -- those have their own
+                # reconcile path (Phase 6+); we only act on fully-open ones.
+                continue
+
+            fired: Optional[str] = None
+
+            # tp_sl evaluation -- direction-aware.
+            if tp_bps is not None and sl_bps is not None:
+                entry = float(position.entry_price)
+                if entry > 0:
+                    # bps move in price (signed), always relative to entry.
+                    move_bps = (exit_mid - entry) / entry * 10_000.0
+                    if position.side == "long":
+                        if move_bps >= tp_bps:
+                            fired = f"tp:{tp_bps:g}bps"
+                        elif move_bps <= -sl_bps:
+                            fired = f"sl:{sl_bps:g}bps"
+                    else:  # short -- sign flips
+                        if move_bps <= -tp_bps:
+                            fired = f"tp:{tp_bps:g}bps"
+                        elif move_bps >= sl_bps:
+                            fired = f"sl:{sl_bps:g}bps"
+
+            # time-based evaluation runs only if tp_sl didn't already fire.
+            if fired is None and time_seconds is not None:
+                opened_at = _parse_position_opened_at(position.opened_at_utc)
+                if opened_at is not None:
+                    elapsed = (now - opened_at).total_seconds()
+                    if elapsed >= float(time_seconds):
+                        fired = f"time:{int(time_seconds)}s"
+
+            if fired is None:
+                continue
+
+            try:
+                exit_quote_usd = float(position.base_size) * float(exit_mid)
+                closed = self.position_store.record_close(
+                    position.position_id,
+                    exit_price=exit_mid,
+                    exit_quote_usd=exit_quote_usd,
+                    fees_usd=0.0,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep iterating
+                LOGGER.warning(
+                    "record_close failed for %s on %s: %s",
+                    position.position_id,
+                    symbol,
+                    exc,
+                )
+                continue
+
+            pnl = float(closed.realized_pnl_usd or 0.0)
+            LOGGER.info(
+                "exit | %s | entry=%.4f exit=%.4f pnl=$%.4f rule=%s",
+                symbol,
+                float(position.entry_price),
+                float(exit_mid),
+                pnl,
+                fired,
+            )
+
+            # Mirror the fill_event notification used on entry so operators
+            # see the exit land in the same channel. Best-effort.
+            close_side: Literal["buy", "sell"] = (
+                "sell" if position.side == "long" else "buy"
+            )
+            try:
+                self.notifier.fill_event(
+                    symbol=symbol,
+                    side=close_side,
+                    fill_price=float(exit_mid),
+                    fill_size=float(position.base_size),
+                    fees_usd=0.0,
+                )
+            except Exception as exc:  # noqa: BLE001 - notifier best-effort
+                LOGGER.warning("notifier.fill_event raised on exit: %s", exc)
 
     def _position_from_order(
         self,
@@ -3288,6 +3503,18 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Model confidence floor below which trades are skipped.",
     )
     p.add_argument(
+        "--exit-rule",
+        type=str,
+        default="none",
+        help=(
+            "How to close open paper/live positions. "
+            "Examples: 'none' (default, never close), 'time:5m' (close 5 "
+            "min after entry, matches model horizon), "
+            "'tp_sl:30bps/50bps' (TP/SL by price move), or a combined "
+            "form like 'tp_sl:30bps/50bps,time:10m' (whichever fires first)."
+        ),
+    )
+    p.add_argument(
         "--once",
         action="store_true",
         help="Run a single iteration and exit (cron-friendly).",
@@ -3497,6 +3724,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         shakedown_state_path=Path(args.shakedown_state_path),
         risk_pct_per_trade=args.risk_pct,
         min_confidence_to_trade=args.min_confidence,
+        exit_rule=args.exit_rule,
     )
 
     # Optional Sentry init -- a no-op if SENTRY_DSN is unset.

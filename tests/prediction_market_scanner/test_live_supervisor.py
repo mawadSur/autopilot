@@ -10,7 +10,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -208,7 +208,7 @@ class StubPositionStore:
                 * (float(exit_price) - float(existing.entry_price))
                 - total_fees
             )
-        else:
+        else:  # short
             realized = (
                 float(existing.base_size)
                 * (float(existing.entry_price) - float(exit_price))
@@ -418,6 +418,8 @@ def _build_supervisor(
     predict_fn=None,
     symbols: Optional[List[str]] = None,
     auto_trip_threshold: int = 10,
+    exit_rule: str = "none",
+    now_fn=None,
 ) -> Tuple[Supervisor, Dict[str, Any]]:
     """Construct a supervisor with stubbed dependencies, returning both."""
     if shakedown_path is None:
@@ -434,6 +436,7 @@ def _build_supervisor(
         shakedown_state_path=shakedown_path,
         risk_pct_per_trade=risk_pct,
         min_confidence_to_trade=min_confidence,
+        exit_rule=exit_rule,
     )
     exchange = exchange or StubExchange()
     position_store = position_store or StubPositionStore()
@@ -450,6 +453,8 @@ def _build_supervisor(
     def _fake_now() -> datetime:
         return fixed_now
 
+    effective_now_fn = now_fn or _fake_now
+
     sup = Supervisor(
         config=config,
         exchange=exchange,
@@ -458,7 +463,7 @@ def _build_supervisor(
         notifier=notifier,
         model_predict_fn=predict_fn or (lambda s, t: ("buy", 0.9)),
         sleep_fn=_fake_sleep,
-        now_fn=_fake_now,
+        now_fn=effective_now_fn,
         auto_trip_threshold=auto_trip_threshold,
     )
     if paper_days_clean:
@@ -2153,6 +2158,305 @@ class TestSupervisorWiresTradeables(unittest.TestCase):
             self.assertEqual(ticks[0].action_taken, "force_flatted")
             # Binary path doesn't reach the adapter when kill switch is up.
             self.assertEqual(pm.ticker_calls, 0)
+
+
+class TestExitRuleParser(unittest.TestCase):
+    """Direct unit tests on the module-level ``_parse_exit_rule`` helper."""
+
+    def test_none_returns_empty_dict(self) -> None:
+        from live_supervisor import _parse_exit_rule
+
+        self.assertEqual(_parse_exit_rule("none"), {})
+        self.assertEqual(_parse_exit_rule(""), {})
+        self.assertEqual(_parse_exit_rule("NONE"), {})
+
+    def test_time_clause(self) -> None:
+        from live_supervisor import _parse_exit_rule
+
+        self.assertEqual(_parse_exit_rule("time:5m"), {"time_seconds": 300.0})
+        self.assertEqual(_parse_exit_rule("time:90s"), {"time_seconds": 90.0})
+        self.assertEqual(_parse_exit_rule("time:2h"), {"time_seconds": 7200.0})
+
+    def test_tp_sl_clause(self) -> None:
+        from live_supervisor import _parse_exit_rule
+
+        self.assertEqual(
+            _parse_exit_rule("tp_sl:30bps/50bps"),
+            {"tp_bps": 30.0, "sl_bps": 50.0},
+        )
+
+    def test_combined_clause(self) -> None:
+        from live_supervisor import _parse_exit_rule
+
+        self.assertEqual(
+            _parse_exit_rule("tp_sl:30bps/50bps,time:10m"),
+            {"tp_bps": 30.0, "sl_bps": 50.0, "time_seconds": 600.0},
+        )
+
+    def test_unknown_clause_raises(self) -> None:
+        from live_supervisor import _parse_exit_rule
+
+        with self.assertRaises(ValueError):
+            _parse_exit_rule("garbage:xyz")
+
+
+def _opened_at(now: datetime, *, minutes_ago: float) -> str:
+    from datetime import timedelta as _td
+
+    return (now - _td(minutes=minutes_ago)).isoformat()
+
+
+def _seed_open_position(
+    *,
+    symbol: str = "ETH/USDT",
+    side: str = "long",
+    entry_price: float = 2_000.0,
+    base_size: float = 0.05,
+    opened_at_utc: str = "2026-04-26T11:55:00+00:00",
+) -> Position:
+    return Position(
+        position_id=str(uuid.uuid4()),
+        exchange="coinbase-paper",
+        symbol=symbol,
+        side=side,  # type: ignore[arg-type]
+        status="open",
+        entry_price=entry_price,
+        entry_quote_usd=entry_price * base_size,
+        base_size=base_size,
+        entry_order_id=f"paper-{uuid.uuid4().hex[:8]}",
+        opened_at_utc=opened_at_utc,
+    )
+
+
+class TestExitRuleNoneKeepsPositionsOpen(unittest.TestCase):
+    """exit_rule='none' preserves the legacy never-close behavior."""
+
+    def test_none_keeps_open_positions_across_many_ticks(self) -> None:
+        pos = _seed_open_position(opened_at_utc="2026-04-26T00:00:00+00:00")
+        store = StubPositionStore(open_positions=[pos])
+        # Don't open new positions: confidence below floor.
+        sup, refs = _build_supervisor(
+            position_store=store,
+            exit_rule="none",
+            predict_fn=lambda s, t: ("buy", 0.1),
+        )
+        for _ in range(5):
+            sup.run_once()
+        # Position still open; nothing closed.
+        self.assertEqual(len(store.list_open()), 1)
+        self.assertEqual(len(store._closed_today), 0)
+
+
+class TestExitRuleTimeFiresAtHorizon(unittest.TestCase):
+    """time:5m closes on/after the 5th minute, not before."""
+
+    def test_time_5m_fires_on_5th_minute_not_before(self) -> None:
+        now_holder: Dict[str, datetime] = {
+            "t": datetime(2026, 4, 26, 12, 0, 0, tzinfo=timezone.utc)
+        }
+
+        def now_fn() -> datetime:
+            return now_holder["t"]
+
+        # Position opened exactly at 12:00:00.
+        pos = _seed_open_position(opened_at_utc=now_holder["t"].isoformat())
+        store = StubPositionStore(open_positions=[pos])
+        sup, refs = _build_supervisor(
+            position_store=store,
+            exit_rule="time:5m",
+            now_fn=now_fn,
+            predict_fn=lambda s, t: ("buy", 0.1),  # no new entries
+        )
+
+        # T+1m: no exit.
+        now_holder["t"] = now_holder["t"] + timedelta(minutes=1)
+        sup.run_once()
+        self.assertEqual(len(store.list_open()), 1)
+
+        # T+4m59s: still no exit.
+        now_holder["t"] = datetime(
+            2026, 4, 26, 12, 4, 59, tzinfo=timezone.utc
+        )
+        sup.run_once()
+        self.assertEqual(len(store.list_open()), 1)
+
+        # T+5m: exit fires.
+        now_holder["t"] = datetime(
+            2026, 4, 26, 12, 5, 0, tzinfo=timezone.utc
+        )
+        sup.run_once()
+        self.assertEqual(len(store.list_open()), 0)
+        self.assertEqual(len(store._closed_today), 1)
+
+
+class TestExitRuleTpSlFiresOnPriceMove(unittest.TestCase):
+    """tp_sl:30bps/50bps closes on +30bps (TP) and -50bps (SL),
+    but not in between."""
+
+    def test_tp_fires_on_plus_30bps(self) -> None:
+        pos = _seed_open_position(entry_price=2_000.0)
+        store = StubPositionStore(open_positions=[pos])
+        # +30bps from 2000 = 2006.0
+        exch = StubExchange(ticker_mid=2_006.0)
+        sup, refs = _build_supervisor(
+            position_store=store,
+            exchange=exch,
+            exit_rule="tp_sl:30bps/50bps",
+            predict_fn=lambda s, t: ("buy", 0.1),
+        )
+        sup.run_once()
+        self.assertEqual(len(store.list_open()), 0)
+        self.assertEqual(len(store._closed_today), 1)
+        closed = store._closed_today[0]
+        # 0.05 base * (2006 - 2000) = 0.30
+        self.assertAlmostEqual(closed.realized_pnl_usd or 0.0, 0.30, places=4)
+
+    def test_sl_fires_on_minus_50bps(self) -> None:
+        pos = _seed_open_position(entry_price=2_000.0)
+        store = StubPositionStore(open_positions=[pos])
+        # -50bps from 2000 = 1990.0
+        exch = StubExchange(ticker_mid=1_990.0)
+        sup, refs = _build_supervisor(
+            position_store=store,
+            exchange=exch,
+            exit_rule="tp_sl:30bps/50bps",
+            predict_fn=lambda s, t: ("buy", 0.1),
+        )
+        sup.run_once()
+        self.assertEqual(len(store.list_open()), 0)
+        self.assertEqual(len(store._closed_today), 1)
+        closed = store._closed_today[0]
+        # 0.05 base * (1990 - 2000) = -0.50
+        self.assertAlmostEqual(closed.realized_pnl_usd or 0.0, -0.50, places=4)
+
+    def test_no_exit_in_between(self) -> None:
+        pos = _seed_open_position(entry_price=2_000.0)
+        store = StubPositionStore(open_positions=[pos])
+        # +20bps move (below TP threshold of 30, above SL threshold of -50).
+        exch = StubExchange(ticker_mid=2_004.0)
+        sup, refs = _build_supervisor(
+            position_store=store,
+            exchange=exch,
+            exit_rule="tp_sl:30bps/50bps",
+            predict_fn=lambda s, t: ("buy", 0.1),
+        )
+        sup.run_once()
+        self.assertEqual(len(store.list_open()), 1)
+        self.assertEqual(len(store._closed_today), 0)
+
+
+class TestExitRuleCombinedFiresWhicheverFirst(unittest.TestCase):
+    """Combined tp_sl + time rule fires on the first condition tripped."""
+
+    def test_tp_trips_before_time(self) -> None:
+        # Time would only fire after 10m, but +30bps move happens now -> TP
+        # wins.
+        pos = _seed_open_position(
+            entry_price=2_000.0,
+            opened_at_utc="2026-04-26T11:55:00+00:00",  # 5min ago
+        )
+        store = StubPositionStore(open_positions=[pos])
+        exch = StubExchange(ticker_mid=2_006.0)  # +30bps
+        sup, refs = _build_supervisor(
+            position_store=store,
+            exchange=exch,
+            exit_rule="tp_sl:30bps/50bps,time:10m",
+            predict_fn=lambda s, t: ("buy", 0.1),
+        )
+        sup.run_once()
+        self.assertEqual(len(store._closed_today), 1)
+        # PnL non-zero because TP fired, not time at flat price.
+        self.assertGreater(store._closed_today[0].realized_pnl_usd or 0.0, 0.0)
+
+    def test_time_trips_before_tp_sl(self) -> None:
+        # Price stays flat; time horizon reached first.
+        pos = _seed_open_position(
+            entry_price=2_000.0,
+            opened_at_utc="2026-04-26T11:50:00+00:00",  # 10min ago
+        )
+        store = StubPositionStore(open_positions=[pos])
+        exch = StubExchange(ticker_mid=2_000.0)  # flat
+        sup, refs = _build_supervisor(
+            position_store=store,
+            exchange=exch,
+            exit_rule="tp_sl:30bps/50bps,time:5m",
+            predict_fn=lambda s, t: ("buy", 0.1),
+        )
+        sup.run_once()
+        self.assertEqual(len(store._closed_today), 1)
+        # Flat-price exit at 2000 entry -> PnL exactly 0.
+        self.assertAlmostEqual(
+            store._closed_today[0].realized_pnl_usd or 0.0, 0.0, places=6
+        )
+
+
+class TestExitRulePnlComputation(unittest.TestCase):
+    """Closed positions get realized_pnl_usd populated correctly."""
+
+    def test_long_realized_pnl_formula(self) -> None:
+        # base_size=0.1, entry=2000, exit=2010 -> +1.00
+        pos = _seed_open_position(entry_price=2_000.0, base_size=0.1)
+        store = StubPositionStore(open_positions=[pos])
+        exch = StubExchange(ticker_mid=2_010.0)
+        sup, refs = _build_supervisor(
+            position_store=store,
+            exchange=exch,
+            exit_rule="tp_sl:30bps/50bps",
+            predict_fn=lambda s, t: ("buy", 0.1),
+        )
+        sup.run_once()
+        self.assertEqual(len(store._closed_today), 1)
+        closed = store._closed_today[0]
+        self.assertEqual(closed.status, "closed")
+        self.assertAlmostEqual(closed.realized_pnl_usd or 0.0, 1.0, places=6)
+        self.assertAlmostEqual(closed.exit_price or 0.0, 2_010.0, places=6)
+
+
+class TestExitRuleEmitsNotifierFillEvent(unittest.TestCase):
+    """Exit notifications fire through notifier.fill_event with the close
+    side."""
+
+    def test_long_exit_notifier_called_with_sell_side(self) -> None:
+        pos = _seed_open_position(entry_price=2_000.0, side="long")
+        store = StubPositionStore(open_positions=[pos])
+        exch = StubExchange(ticker_mid=2_006.0)  # +30bps -> TP
+        notif = StubNotifier()
+        sup, refs = _build_supervisor(
+            position_store=store,
+            exchange=exch,
+            notifier=notif,
+            exit_rule="tp_sl:30bps/50bps",
+            predict_fn=lambda s, t: ("buy", 0.1),
+        )
+        sup.run_once()
+        self.assertEqual(len(notif.fill_event_calls), 1)
+        call = notif.fill_event_calls[0]
+        # close-side for a long is "sell".
+        self.assertEqual(call["side"], "sell")
+        self.assertEqual(call["symbol"], "ETH/USDT")
+        self.assertAlmostEqual(call["fill_price"], 2_006.0, places=4)
+
+
+class TestExitRuleDirectionAware(unittest.TestCase):
+    """Short positions profit from a falling price (sign flip in tp_sl
+    and PnL)."""
+
+    def test_short_tp_on_price_drop(self) -> None:
+        pos = _seed_open_position(side="short", entry_price=2_000.0)
+        store = StubPositionStore(open_positions=[pos])
+        # -30bps from 2000 = 1994 -> TP for short
+        exch = StubExchange(ticker_mid=1_994.0)
+        sup, refs = _build_supervisor(
+            position_store=store,
+            exchange=exch,
+            exit_rule="tp_sl:30bps/50bps",
+            predict_fn=lambda s, t: ("buy", 0.1),
+        )
+        sup.run_once()
+        self.assertEqual(len(store._closed_today), 1)
+        closed = store._closed_today[0]
+        # Short pnl: base * (entry - exit) = 0.05 * (2000 - 1994) = 0.30
+        self.assertAlmostEqual(closed.realized_pnl_usd or 0.0, 0.30, places=4)
 
 
 if __name__ == "__main__":  # pragma: no cover
