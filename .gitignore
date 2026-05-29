@@ -65,3 +65,8 @@ ruvector.db
 
 # Polymarket scanner JSON exports
 output/
+
+# Supervisor runtime artifacts (nohup capture + pidfiles)
+nohup.out
+*.pid
+supervisor.pid
