@@ -129,5 +129,57 @@ class ReporterConfidenceDisplayTest(unittest.TestCase):
         self.assertNotIn("conf ", joined)
 
 
+class LeaderboardQualityTest(unittest.TestCase):
+    def test_top_rank_is_one(self):
+        self.assertEqual(wf.leaderboard_quality(0, 50), 1.0)
+
+    def test_bottom_rank_is_floor(self):
+        self.assertAlmostEqual(wf.leaderboard_quality(49, 50), 0.6, places=3)
+
+    def test_single_wallet_is_one(self):
+        self.assertEqual(wf.leaderboard_quality(0, 1), 1.0)
+
+    def test_monotonic_decreasing(self):
+        self.assertGreater(
+            wf.leaderboard_quality(0, 50), wf.leaderboard_quality(25, 50)
+        )
+
+
+class ConfidenceQualityScoresTest(unittest.TestCase):
+    def test_quality_scores_override_winrates(self):
+        # Win-rate 0.5 alone -> quality 0 -> low; but elite quality_scores win.
+        lo, lo_label = wf.compute_confidence(3, [0.5, 0.5], min_convergence=3)
+        hi, hi_label = wf.compute_confidence(
+            3, [0.5, 0.5], min_convergence=3, quality_scores=[0.99, 0.98, 0.97]
+        )
+        self.assertGreater(hi, lo)
+        self.assertEqual(hi_label, "high")  # 0.5*0.5 + 0.5*~0.98 = ~0.74
+
+    def test_three_elite_wallets_read_high(self):
+        # The exact leaderboard recalibration goal: 3 top wallets co-holding
+        # should NOT read 'low' anymore.
+        q = [wf.leaderboard_quality(i, 50) for i in (0, 1, 2)]
+        score, label = wf.compute_confidence(3, [], min_convergence=3, quality_scores=q)
+        self.assertEqual(label, "high")
+
+
+class RunOnceLeaderboardQualityTest(unittest.TestCase):
+    def test_wallet_quality_used_for_confidence(self):
+        led = PnlLedger(str(Path(tempfile.mkdtemp()) / "l.jsonl"))
+        cands = wf.run_once(
+            ledger=led,
+            client=_HoldersClient(),
+            target_wallets=["wA", "wB"],
+            markets_condition_ids=["c1"],
+            min_convergence=2,
+            mark_entry=False,
+            wallet_quality={"wA": 0.99, "wB": 0.98},  # elite -> should lift score
+        )
+        self.assertEqual(len(cands), 1)
+        # 2 holders (conv 2/6=0.333) + elite quality ~0.985 -> ~0.66 -> high/medium
+        self.assertIn(cands[0]["confidence_label"], ("medium", "high"))
+        self.assertGreater(cands[0]["confidence"], 0.4)
+
+
 if __name__ == "__main__":
     unittest.main()

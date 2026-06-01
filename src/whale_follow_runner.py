@@ -64,6 +64,7 @@ __all__ = [
     "find_convergence",
     "convergence_from_positions",
     "compute_confidence",
+    "leaderboard_quality",
     "run_once",
     "make_whale_price_fn",
     "main",
@@ -362,31 +363,63 @@ def _latest_price_for_outcome(
     return best_price
 
 
+def leaderboard_quality(rank_index: int, total: int) -> float:
+    """Map a 0-based profit-leaderboard rank to a [0.6, 1.0] quality score.
+
+    Being on the all-time top-N profit board is itself strong evidence of skill,
+    so even the lowest-ranked board member earns an "elite floor" of 0.6, while
+    the #1 wallet earns 1.0. Used as the confidence QUALITY term in leaderboard
+    mode: these whales win on SIZE, not hit-rate, so their settled win-rate
+    (~0.5) badly understates them — profit-rank is the honest quality signal.
+    """
+    if total <= 1:
+        return 1.0
+    idx = max(0, min(int(rank_index), int(total) - 1))
+    return round(0.6 + 0.4 * (1.0 - idx / (int(total) - 1)), 3)
+
+
 def compute_confidence(
     n_target_holders: int,
     converging_winrates: Sequence[float],
     *,
     min_convergence: int = 3,
+    quality_scores: Optional[Sequence[float]] = None,
 ) -> tuple:
     """Heuristic 0-1 conviction for a whale-convergence candidate.
 
     This is a SIGNAL-STRENGTH indicator, NOT a probability of profit. It blends:
       * COUNT — how many smart-money wallets converged on the outcome
         (saturates at ~6 wallets); and
-      * QUALITY — the average historical win-rate of those converging wallets
-        (mapped 0.50 -> 0.0 .. 0.90 -> 1.0); neutral 0.5 when unknown.
+      * QUALITY — how good the converging wallets are. Two sources:
+          - ``quality_scores`` (preferred when given): pre-mapped per-wallet
+            quality in [0, 1] — e.g. profit-leaderboard rank via
+            :func:`leaderboard_quality`. Used as-is (averaged). This is what
+            leaderboard mode passes, because top-profit whales have ~0.5
+            win-rates that understate them.
+          - else ``converging_winrates``: historical settled win-rates mapped
+            0.50 -> 0.0 .. 0.90 -> 1.0; neutral 0.5 when unknown.
 
     Returns ``(score, label)`` where label is ``'low'`` (<0.40), ``'medium'``
     (<0.66), or ``'high'`` (>=0.66). More/better wallets agreeing = higher.
     """
     holders = max(int(n_target_holders or 0), int(min_convergence or 0))
     conv_term = max(0.0, min(1.0, holders / 6.0))
-    rates = [float(r) for r in converging_winrates if isinstance(r, (int, float))]
-    if rates:
-        avg_wr = sum(rates) / len(rates)
-        quality_term = max(0.0, min(1.0, (avg_wr - 0.5) / 0.4))
+    qualities = (
+        [float(q) for q in quality_scores if isinstance(q, (int, float))]
+        if quality_scores is not None
+        else []
+    )
+    if qualities:
+        quality_term = max(0.0, min(1.0, sum(qualities) / len(qualities)))
     else:
-        quality_term = 0.5  # neutral when wallet quality is unknown
+        rates = [
+            float(r) for r in converging_winrates if isinstance(r, (int, float))
+        ]
+        if rates:
+            avg_wr = sum(rates) / len(rates)
+            quality_term = max(0.0, min(1.0, (avg_wr - 0.5) / 0.4))
+        else:
+            quality_term = 0.5  # neutral when wallet quality is unknown
     score = round(0.5 * conv_term + 0.5 * quality_term, 3)
     label = "high" if score >= 0.66 else "medium" if score >= 0.40 else "low"
     return score, label
@@ -401,6 +434,7 @@ def _log_candidates(
     size_usd: float = 0.0,
     mark_entry: bool = False,
     wallet_stats: Optional[Dict[str, Any]] = None,
+    wallet_quality: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     """Score + log a list of convergence candidates to the SHADOW ledger.
 
@@ -426,9 +460,15 @@ def _log_candidates(
         condition_id = str(cand.get("conditionId"))
         outcome_index = cand.get("outcomeIndex")
 
-        # Confidence = how many smart-money wallets converged x how good they are
-        # (avg historical win-rate from the ranking). Signal strength, not a
+        # Confidence = how many smart-money wallets converged x how good they
+        # are. Quality is profit-leaderboard rank when available (leaderboard
+        # mode), else historical win-rate (live mode). Signal strength, not a
         # profit probability. Stored on the candidate + in the notes for Discord.
+        quality_scores: List[float] = []
+        if wallet_quality:
+            quality_scores = [
+                float(wallet_quality[w]) for w in wallets if w in wallet_quality
+            ]
         winrates: List[float] = []
         if wallet_stats:
             for wallet in wallets:
@@ -444,6 +484,7 @@ def _log_candidates(
             int(cand.get("n_target_holders") or len(wallets)),
             winrates,
             min_convergence=min_convergence,
+            quality_scores=quality_scores or None,
         )
         cand["confidence"] = conf_score
         cand["confidence_label"] = conf_label
@@ -497,6 +538,7 @@ def run_once(
     size_usd: float = 0.0,
     mark_entry: bool = False,
     wallet_stats: Optional[Dict[str, Any]] = None,
+    wallet_quality: Optional[Dict[str, float]] = None,
     candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Run one convergence scan and log each candidate to the SHADOW ledger.
@@ -563,6 +605,7 @@ def run_once(
         size_usd=size_usd,
         mark_entry=mark_entry,
         wallet_stats=wallet_stats,
+        wallet_quality=wallet_quality,
     )
 
 
@@ -688,6 +731,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # wallet -> WalletStats for the current roster, so each convergence candidate
     # can be scored on the win-rate of the wallets that actually converged.
     wallet_stats: Dict[str, Any] = {}
+    # wallet -> [0,1] quality from profit-leaderboard rank (leaderboard mode);
+    # empty in live mode, where confidence falls back to win-rate.
+    wallet_quality: Dict[str, float] = {}
 
     def _rank_targets() -> List[str]:
         """Build the winners' roster for the configured ``--roster-source``.
@@ -711,6 +757,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     targets.append(wallet)
             # Stats come from convergence_from_positions per scan, not from here.
             wallet_stats.clear()
+            # Quality = profit-leaderboard rank (these whales win on size, not
+            # win-rate, so rank is the honest quality signal for confidence).
+            wallet_quality.clear()
+            wallet_quality.update(
+                {w: leaderboard_quality(i, len(targets)) for i, w in enumerate(targets)}
+            )
             print(
                 f"loaded {len(targets)} profit-leaderboard wallet(s) "
                 f"(window={args.leaderboard_window!r})"
@@ -730,6 +782,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         targets = [w.wallet for w in ranked]
         wallet_stats.clear()
         wallet_stats.update({w.wallet: w for w in ranked})
+        wallet_quality.clear()  # live mode scores on win-rate, not rank
         print(
             f"ranked {len(targets)} smart-money wallet(s) from "
             f"{len(discovered)} active"
@@ -785,6 +838,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 size_usd=args.size,
                 mark_entry=True,
                 wallet_stats=wallet_stats,
+                wallet_quality=wallet_quality,
                 candidates=candidates,
             )
         else:
