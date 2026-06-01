@@ -154,13 +154,18 @@ def run_once(
     Returns:
         The list of detected arbitrage opportunity dicts.
     """
-    fetch_fn = fetch_markets_fn
-    if fetch_fn is None:
+    if fetch_markets_fn is not None:
+        markets = list(fetch_markets_fn() or [])
+    else:
         if fetcher is None:  # pragma: no cover - only if fetcher import failed.
             raise RuntimeError("no fetch_markets_fn provided and fetcher import failed")
-        fetch_fn = fetcher.fetch_active_markets
-
-    markets = list(fetch_fn() or [])
+        # Gamma returns markets ordered by 24h volume (desc), so the top pages
+        # are the most liquid markets -- exactly where arb depth lives. Bound
+        # the page count to roughly ``max_markets`` so we don't paginate into
+        # Gamma's offset ceiling (it 422s past ~10k markets) when we only want
+        # the top few.
+        pages = max(1, (max_markets // 100) + 2)
+        markets = list(fetcher.fetch_active_markets(max_pages=pages) or [])
     rows = build_market_rows(
         markets,
         market_data_client=market_data_client,

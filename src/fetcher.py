@@ -198,6 +198,7 @@ def _market_from_gamma_payload(
         rules_text=_build_rules_text(parent_event, market_payload),
         avg_volume_7d=_extract_avg_volume_7d(market_payload),
         volume_change_1h=_extract_volume_change_1h(market_payload),
+        clob_token_ids=market_payload.get("clobTokenIds"),
     )
 
 
@@ -257,19 +258,34 @@ def fetch_active_markets(
     page_count = 0
     try:
         while True:
-            payload = _request_json(
-                http,
-                f"{GAMMA_API_BASE_URL}/markets",
-                params={
-                    "active": "true",
-                    "closed": "false",
-                    "limit": page_size,
-                    "offset": offset,
-                    "order": "volume24hr",
-                    "ascending": "false",
-                },
-                timeout=timeout,
-            )
+            try:
+                payload = _request_json(
+                    http,
+                    f"{GAMMA_API_BASE_URL}/markets",
+                    params={
+                        "active": "true",
+                        "closed": "false",
+                        "limit": page_size,
+                        "offset": offset,
+                        "order": "volume24hr",
+                        "ascending": "false",
+                    },
+                    timeout=timeout,
+                )
+            except requests.HTTPError as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                # Gamma rejects offsets past its ceiling (~10k markets) with a
+                # 422. Treat that as the natural end of pagination once we have
+                # already collected markets, rather than failing the whole scan.
+                if status == 422 and markets:
+                    LOGGER.warning(
+                        "Gamma offset ceiling reached at offset=%s (HTTP 422); "
+                        "stopping pagination with %d markets.",
+                        offset,
+                        len(markets),
+                    )
+                    break
+                raise
             if not payload:
                 break
             for market_payload in payload:

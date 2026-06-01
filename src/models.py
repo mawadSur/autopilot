@@ -62,6 +62,12 @@ class Market:
     avg_volume_7d: Optional[float] = None
     volume_change_1h: Optional[float] = None
     category_avg_spread: Optional[float] = None
+    # Raw Gamma ``clobTokenIds`` ([YES_token, NO_token] as a JSON-string or
+    # list), retained so the read-only CLOB order-book reader can resolve the
+    # two outcome tokens for intra-market arbitrage. ``None`` for non-binary or
+    # not-yet-CLOB-listed markets. Consumed by
+    # ``exchanges.polymarket_market_data.get_yes_no_best_asks``.
+    clob_token_ids: Optional[Any] = None
     spread: float = field(init=False)
     days_to_resolution: float = field(init=False)
 
