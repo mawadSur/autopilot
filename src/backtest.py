@@ -236,7 +236,13 @@ class ProfitOptimizedBacktester:
         else:
             window_size = int(cfg.window_size or meta.get("window_size", DEFAULT_SEQ_LEN))
 
-        fee_pct = 0.00075
+        # HONEST COSTS: use the *real* Coinbase Advanced retail fee schedule
+        # (taker 60 bps / maker 40 bps) that the live adapter charges, instead of
+        # the old fictional 7.5 bps. The previous ``fee_pct = 0.00075`` understated
+        # round-trip cost by ~16x and left the maker path unwired, making every
+        # backtest fictional. ``from_coinbase_fees()`` wires BOTH sides.
+        # See trading/simulator.py COINBASE_*_FEE_PCT and
+        # src/exchanges/adapters/coinbase_tradeable.py _DEFAULT_COINBASE_FEE_MODEL.
         tp_pct = float(meta.get("tp_pct", cfg.tp_pct))
         sl_pct = float(meta.get("sl_pct", cfg.sl_pct))
 
@@ -249,9 +255,8 @@ class ProfitOptimizedBacktester:
 
         overlap_rows = max(window_size + 5, 2000)
 
-        sim_cfg = SimulationConfig(
+        sim_cfg = SimulationConfig.from_coinbase_fees(
             start_capital=float(cfg.capital),
-            fee_pct=fee_pct,
             tp_pct=tp_pct,
             sl_pct=sl_pct,
             cooldown=int(cfg.cooldown),
@@ -501,6 +506,14 @@ class ProfitOptimizedBacktester:
         )
         if ev < 0.0005 or pf < 1.4:
             print("\033[91mRETRAIN WITH PROFIT MODE — current model is not profitable enough\033[0m")
+
+        # Hard reject gate — these thresholds are computed on the HONEST Coinbase
+        # fee schedule (see _run_stream). A model only "passes" if it clears both
+        # the profit-factor floor and the drawdown ceiling. We persist the verdict
+        # into profit_report.json so the decision is auditable, not just printed.
+        gate_min_profit_factor = 1.8
+        gate_max_drawdown_pct = 10.0
+        gate_rejected = bool(pf < gate_min_profit_factor or max_dd > gate_max_drawdown_pct)
         report = {
             "ev_per_trade": ev,
             "expectancy": ev,
@@ -509,11 +522,15 @@ class ProfitOptimizedBacktester:
             "sharpe": sharpe,
             "win_rate_pct": win_rate,
             "recommendation": "Retrain recommended" if ev < 0.0005 else "Hold model",
+            "gate_min_profit_factor": gate_min_profit_factor,
+            "gate_max_drawdown_pct": gate_max_drawdown_pct,
+            "gate_passed": (not gate_rejected),
+            "gate_verdict": "REJECTED" if gate_rejected else "ACCEPTED",
         }
         report_path = Path(self.model_dir) / "profit_report.json"
         report_path.write_text(json.dumps(report, indent=2))
 
-        if final_metrics["profit_factor"] < 1.8 or final_metrics["max_drawdown_pct"] > 10.0:
+        if gate_rejected:
             print("UNPROFITABLE - REJECTED")
         else:
             update_strategy_registry(Path(self.model_dir), final_metrics.get("recovery_factor", 0.0))
