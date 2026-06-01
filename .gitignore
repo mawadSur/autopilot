@@ -70,3 +70,4 @@ output/
 nohup.out
 *.pid
 supervisor.pid
+.gstack/
