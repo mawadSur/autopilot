@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import time
 import uuid
@@ -39,12 +40,18 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 try:  # Flat import under PYTHONPATH=src (matches the rest of the stack).
-    from state.pnl_ledger import DEFAULT_LEDGER_PATH, PnlLedger, TradeRecord
+    from state.pnl_ledger import (
+        DEFAULT_LEDGER_PATH,
+        PnlLedger,
+        TradeRecord,
+        duplicate_open_records,
+    )
 except Exception:  # pragma: no cover - import shim for alternate layouts.
     from src.state.pnl_ledger import (  # type: ignore
         DEFAULT_LEDGER_PATH,
         PnlLedger,
         TradeRecord,
+        duplicate_open_records,
     )
 
 try:  # Flat import under PYTHONPATH=src (matches the rest of the stack).
@@ -87,6 +94,106 @@ _OUTCOME_INDEX_RE = re.compile(r"outcomeIndex=(\d+)")
 
 
 STRATEGY = "whale_convergence"
+
+
+def _heal_duplicate_opens(ledger: PnlLedger) -> int:
+    """Cancel duplicate OPEN records so the ledger holds one per (market, outcome).
+
+    Two writers racing on the same ledger can each append an ``open`` for the same
+    convergence (each snapshots the open set before the other's append lands),
+    leaving duplicate open records that would show twice on the dashboard and
+    settle twice (double-counted P/L). This retires the extras with an append-only
+    :meth:`PnlLedger.cancel` — the earliest entry per (market, outcome) is kept,
+    the later duplicates are cancelled. Idempotent: a clean ledger heals zero.
+
+    Returns the number of duplicate records cancelled. Never raises (a read/cancel
+    failure is logged and the scan continues — settlement and the view layer dedup
+    too, so an un-healed duplicate is still harmless).
+    """
+    try:
+        extras = duplicate_open_records(ledger.open_positions())
+    except Exception as exc:  # noqa: BLE001 - never let a read crash the loop.
+        logging.warning("dedup heal: open_positions() failed (%s); skipping.", exc)
+        return 0
+    cancelled = 0
+    for record in extras:
+        try:
+            ledger.cancel(
+                record.trade_id, reason="duplicate_open (concurrent-writer race)"
+            )
+            cancelled += 1
+        except Exception as exc:  # noqa: BLE001 - one bad cancel must not abort.
+            logging.warning(
+                "dedup heal: cancel(%s) failed (%s); leaving as-is.",
+                getattr(record, "trade_id", "?"),
+                exc,
+            )
+    if cancelled:
+        print(f"dedup heal: cancelled {cancelled} duplicate open record(s)")
+    return cancelled
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with ``pid`` is currently running (POSIX)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # exists but owned by another user
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _acquire_ledger_lock(ledger_path: str) -> Optional[str]:
+    """Take a single-writer lock for ``ledger_path``; return the lock path or None.
+
+    Prevents the root cause of duplicate opens: two ``whale_follow_runner`` loops
+    writing the SAME ledger. The lock is a ``<ledger>.lock`` file holding this
+    process's PID. If a live PID already holds it, we refuse (return ``None`` and
+    print how to override). A stale lock (PID no longer running) is reclaimed.
+
+    Best-effort and POSIX-oriented; any filesystem error degrades to "no lock"
+    (returns the path) rather than blocking a legitimate run.
+    """
+    lock_path = f"{ledger_path}.lock"
+    try:
+        if os.path.exists(lock_path):
+            try:
+                with open(lock_path, "r", encoding="utf-8") as handle:
+                    holder = int((handle.read().strip() or "0"))
+            except (ValueError, OSError):
+                holder = 0
+            if holder and holder != os.getpid() and _pid_alive(holder):
+                print(
+                    f"REFUSING TO START: another writer (pid {holder}) already holds "
+                    f"{lock_path}. Two loops on one ledger create duplicate opens. "
+                    f"Stop it first (kill {holder}), or use a different --ledger-path."
+                )
+                return None
+        parent = os.path.dirname(os.path.abspath(lock_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(lock_path, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+        return lock_path
+    except OSError as exc:  # pragma: no cover - lock is best-effort, never fatal.
+        logging.warning("could not acquire ledger lock (%s); continuing.", exc)
+        return lock_path
+
+
+def _release_ledger_lock(lock_path: Optional[str]) -> None:
+    """Release a lock taken by :func:`_acquire_ledger_lock` (only if we own it)."""
+    if not lock_path:
+        return
+    try:
+        with open(lock_path, "r", encoding="utf-8") as handle:
+            holder = int((handle.read().strip() or "0"))
+        if holder == os.getpid():
+            os.remove(lock_path)
+    except (ValueError, OSError):
+        pass
 
 
 def find_convergence(
@@ -1011,6 +1118,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
     def _scan(targets: Sequence[str]) -> None:
+        # (0) Self-heal duplicate opens: retire any (market, outcome) that ended
+        # up with two open records (e.g. a past concurrent-writer race) so the
+        # rest of the scan — settle, exit rules, report — sees one per position
+        # and never double-counts. Idempotent; a clean ledger heals zero.
+        _heal_duplicate_opens(ledger)
         # (1) Settle resolved positions FIRST (before everything else): this
         # closes any market that has resolved since the last scan, freeing dedup
         # and surfacing realized P/L in the report.
@@ -1074,6 +1186,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # don't hammer the N+1 /positions calls on every scan). Each iteration
     # re-derives hot markets, runs a scan, reports, and sleeps. Ctrl-C exits
     # cleanly with the no-orders affirmation.
+    #
+    # Single-writer lock: two loops on one ledger are the ROOT CAUSE of duplicate
+    # opens (each snapshots the open set before the other's append lands). Refuse
+    # to start a second live writer on the same ledger.
+    lock_path = _acquire_ledger_lock(args.ledger_path)
+    if lock_path is None:
+        return 1
     refresh = max(1, int(args.rank_refresh_scans))
     targets: List[str] = []
     iteration = 0
@@ -1099,6 +1218,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\nstopped by user. No orders were ever placed.")
+    finally:
+        _release_ledger_lock(lock_path)
     return 0
 
 

@@ -34,6 +34,11 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
+try:  # Flat import under PYTHONPATH=src (matches the rest of the stack).
+    from state.pnl_ledger import dedupe_open_positions
+except Exception:  # pragma: no cover - alternate layout shim.
+    from src.state.pnl_ledger import dedupe_open_positions  # type: ignore
+
 
 __all__ = [
     "compute_settlement_pnl",
@@ -171,6 +176,13 @@ def settle_resolved_positions(
     except Exception as exc:  # pragma: no cover - never let a read crash the sweep.
         logging.warning("shadow settlement: open_positions() failed (%s)", exc)
         return counts
+
+    # Settle at most ONE record per (market, outcome). If two writers raced and
+    # wrote duplicate opens for the same position, settling both would book the
+    # realized P/L twice — so we settle the earliest and leave any duplicate
+    # untouched (it is hidden from the dashboard and retired by the runner's
+    # self-heal). Defense-in-depth: correct even if the heal has not run yet.
+    open_positions = dedupe_open_positions(open_positions)
 
     for record in open_positions:
         try:

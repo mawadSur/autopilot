@@ -37,7 +37,11 @@ if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
 from portfolio_reporter import DEFAULT_BANKROLL_USD, build_report  # noqa: E402
-from state.pnl_ledger import PnlLedger, TradeRecord  # noqa: E402
+from state.pnl_ledger import (  # noqa: E402
+    PnlLedger,
+    TradeRecord,
+    dedupe_open_positions,
+)
 
 __all__ = ["build_state", "parse_confidence", "clean_title", "normalize_exit_reason"]
 
@@ -131,12 +135,18 @@ def build_state(
     """
     report = build_report(ledger, price_fn=None, bankroll_usd=bankroll_usd)
 
+    # Collapse duplicate opens (same market+outcome, written by two writers racing
+    # on the ledger) to one position each — we shadow ONE unit per (market,
+    # outcome), so both the count and the cards must treat a dup as one. This is
+    # why ``n_open`` is taken from the deduped list rather than ``report``.
+    deduped_open = dedupe_open_positions(ledger.open_positions())
+
     summary = {
         "equity_usd": float(report.get("equity_usd", bankroll_usd)),
         "realized_pnl_usd": float(report.get("realized_pnl_usd", 0.0)),
         "unrealized_pnl_usd": float(report.get("unrealized_pnl_usd", 0.0)),
         "win_rate": float(report.get("win_rate", 0.0)),
-        "n_open": int(report.get("n_open", 0)),
+        "n_open": len(deduped_open),
         "n_settled": int(report.get("n_settled", 0)),
         "total_fees_usd": float(report.get("total_fees_usd", 0.0)),
         "bankroll_usd": float(bankroll_usd),
@@ -144,7 +154,7 @@ def build_state(
 
     # --- Open positions: clean title + parsed confidence (entry only, no mark) ---
     open_positions: List[Dict[str, Any]] = []
-    for record in ledger.open_positions():
+    for record in deduped_open:
         notes = getattr(record, "notes", "") or ""
         market_id = getattr(record, "market_id", "") or ""
         entry_price = getattr(record, "entry_price", None)

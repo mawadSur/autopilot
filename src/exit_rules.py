@@ -35,6 +35,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
+try:  # Flat import under PYTHONPATH=src (matches the rest of the stack).
+    from state.pnl_ledger import dedupe_open_positions
+except Exception:  # pragma: no cover - alternate layout shim.
+    from src.state.pnl_ledger import dedupe_open_positions  # type: ignore
+
 
 __all__ = [
     "evaluate_exit",
@@ -212,6 +217,12 @@ def apply_exit_rules(
     except Exception as exc:  # pragma: no cover - never let a read crash the sweep.
         logging.warning("exit rules: open_positions() failed (%s)", exc)
         return counts
+
+    # One early-exit per (market, outcome): if two writers raced and wrote
+    # duplicate opens, exiting both would book the realized P/L twice. Settle the
+    # earliest and leave any duplicate untouched (hidden from the dashboard and
+    # retired by the runner's self-heal). Mirrors shadow_settlement.
+    open_positions = dedupe_open_positions(open_positions)
 
     for record in open_positions:
         try:
