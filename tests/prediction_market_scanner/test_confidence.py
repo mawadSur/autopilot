@@ -181,5 +181,54 @@ class RunOnceLeaderboardQualityTest(unittest.TestCase):
         self.assertGreater(cands[0]["confidence"], 0.4)
 
 
+class MinConfidenceEntryFilterTest(unittest.TestCase):
+    """The ENTRY filter: skip convergences below the confidence floor.
+
+    Drives run_once on the same _HoldersClient (wA + wB converge on idx 0 of c1).
+    A low quality forces a low confidence (~0.25); a high quality forces a high
+    one (>=0.5). We assert the low one is NOT logged when min_confidence=0.5 and
+    the high one IS — proving the filter catches only the strongest signals.
+    """
+
+    def _run(self, *, min_confidence, wallet_quality):
+        led = PnlLedger(str(Path(tempfile.mkdtemp()) / "l.jsonl"))
+        cands = wf.run_once(
+            ledger=led,
+            client=_HoldersClient(),
+            target_wallets=["wA", "wB"],
+            markets_condition_ids=["c1"],
+            min_convergence=2,
+            mark_entry=False,
+            wallet_quality=wallet_quality,
+            min_confidence=min_confidence,
+        )
+        return led, cands
+
+    def test_low_confidence_candidate_not_logged(self):
+        # 2 holders (conv 2/6=0.333) + weak quality 0.10 -> conf ~0.22 < 0.5.
+        led, cands = self._run(
+            min_confidence=0.5, wallet_quality={"wA": 0.10, "wB": 0.10}
+        )
+        self.assertEqual(cands, [])  # filtered out before logging
+        self.assertEqual(led.all_records(), [])  # nothing written to the ledger
+
+    def test_high_confidence_candidate_logged(self):
+        # 2 holders (conv 2/6=0.333) + elite quality ~0.985 -> conf ~0.66 >= 0.5.
+        led, cands = self._run(
+            min_confidence=0.5, wallet_quality={"wA": 0.99, "wB": 0.98}
+        )
+        self.assertEqual(len(cands), 1)
+        self.assertGreaterEqual(cands[0]["confidence"], 0.5)
+        self.assertEqual(len(led.all_records()), 1)
+
+    def test_default_min_confidence_zero_logs_everything(self):
+        # min_confidence defaults to 0.0 (off): even a weak signal is logged.
+        led, cands = self._run(
+            min_confidence=0.0, wallet_quality={"wA": 0.10, "wB": 0.10}
+        )
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(len(led.all_records()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

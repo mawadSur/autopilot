@@ -456,6 +456,7 @@ def _log_candidates(
     wallet_quality: Optional[Dict[str, float]] = None,
     blocklist: Optional[Sequence[str]] = None,
     dedup: bool = True,
+    min_confidence: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """Score + log convergence candidates to the SHADOW ledger.
 
@@ -466,7 +467,7 @@ def _log_candidates(
     entry pricing, ``TradeRecord`` construction, and notes are written in
     exactly one place — never duplicated.
 
-    Two filters apply BEFORE logging:
+    Three filters apply BEFORE logging:
       * ``blocklist`` — operator do-not-trade terms (alcohol/casino/adult, etc.).
         A candidate whose title/outcome matches is skipped (and counted, never
         silently). Marked ``cand['blocked']=<term>``.
@@ -474,6 +475,11 @@ def _log_candidates(
         ``(market, outcome)`` that already has one open in the ledger, so an
         every-30-min loop doesn't pile up duplicates of the same convergence.
         Marked ``cand['skipped']='duplicate_open'``.
+      * ``min_confidence`` (function default 0.0 = off; the CLI overrides this to
+        0.5) — the ENTRY filter: after scoring, skip any candidate whose
+        ``confidence`` is below this floor, so only the STRONGEST convergences
+        (the most profitable to follow) are ever entered.
+        Counted (not silent); marked ``cand['skipped']='low_confidence'``.
 
     For each surviving candidate: compute confidence, optionally fetch a real
     decision-time entry price (``mark_entry``), and append an OPEN
@@ -492,6 +498,7 @@ def _log_candidates(
     logged: List[Dict[str, Any]] = []
     n_blocked = 0
     n_dup = 0
+    n_low_conf = 0
     for cand in candidates:
         outcome_label = cand.get("outcome")
         side = str(outcome_label) if outcome_label is not None else str(
@@ -549,6 +556,15 @@ def _log_candidates(
         cand["confidence"] = conf_score
         cand["confidence_label"] = conf_label
 
+        # ENTRY filter: only follow the strongest convergences. A candidate below
+        # the confidence floor is counted (never silently dropped) and skipped
+        # before any record is written — this is the "catch the most profitable"
+        # lever that keeps weak signals out of the shadow ledger entirely.
+        if conf_score < min_confidence:
+            cand["skipped"] = "low_confidence"
+            n_low_conf += 1
+            continue
+
         entry_price = 0.0
         if mark_entry and outcome_index is not None:
             entry_price = (
@@ -587,10 +603,11 @@ def _log_candidates(
         logged.append(cand)
 
     _print_summary(logged)
-    if n_blocked or n_dup:
+    if n_blocked or n_dup or n_low_conf:
         print(
             f"  (skipped {n_dup} already-open duplicate(s); "
-            f"blocked {n_blocked} do-not-trade market(s))"
+            f"blocked {n_blocked} do-not-trade market(s); "
+            f"skipped {n_low_conf} below-confidence candidate(s))"
         )
     return logged
 
@@ -608,6 +625,7 @@ def run_once(
     wallet_quality: Optional[Dict[str, float]] = None,
     blocklist: Optional[Sequence[str]] = None,
     dedup: bool = True,
+    min_confidence: float = 0.0,
     candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Run one convergence scan and log each candidate to the SHADOW ledger.
@@ -642,6 +660,9 @@ def run_once(
                                 0.0 — shadow positions carry no real size).
         mark_entry:             When True, fetch a real decision-time entry price
                                 per candidate via the data-api ``/trades`` page.
+        min_confidence:         ENTRY filter (default 0.0 = off): only log
+                                candidates whose computed ``confidence`` is
+                                >= this floor, keeping the strongest convergences.
         candidates:             OPTIONAL precomputed candidate list (same shape
                                 :func:`find_convergence` returns). When provided
                                 (e.g. leaderboard mode passes the output of
@@ -677,6 +698,7 @@ def run_once(
         wallet_quality=wallet_quality,
         blocklist=blocklist,
         dedup=dedup,
+        min_confidence=min_confidence,
     )
 
 
@@ -796,6 +818,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "(settlement ON) sweeps open positions at the start of each "
                         "scan, closing any whose Polymarket market has RESOLVED so "
                         "realized P/L shows in the report and dedup frees up.")
+    parser.add_argument("--min-confidence", type=float, default=0.5,
+                        help="ENTRY filter: only enter convergences whose computed "
+                        "confidence is >= this (default 0.5) — catch the most "
+                        "profitable, strongest convergences. 0.0 disables.")
+    parser.add_argument("--stop-loss-pct", type=float, default=0.40,
+                        help="Early-exit a position once it is down >= this fraction "
+                        "of its entry cost (default 0.40 = -40%%) — cap the loss "
+                        "instead of riding a loser to $0.")
+    parser.add_argument("--take-profit-pct", type=float, default=0.50,
+                        help="Early-exit a position once it is up >= this fraction "
+                        "of its entry cost (default 0.50 = +50%%) — lock the win.")
+    parser.add_argument("--take-profit-price", type=float, default=0.90,
+                        help="Early-exit a position once the outcome marks >= this "
+                        "absolute price (default 0.90) — a near-certain win, lock "
+                        "it in and redeploy.")
+    parser.add_argument("--no-exit-rules", action="store_true",
+                        help="Disable the stop-loss / take-profit early-exit sweep. "
+                        "Default (exit rules ON) sweeps open positions each scan "
+                        "and settles those past a stop/take-profit at the current "
+                        "mark (SHADOW-ONLY, NO orders).")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -816,6 +858,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from exchanges.polymarket_data_api import PolymarketDataAPIClient
     from exchanges import polymarket_market_data
     import shadow_settlement
+    import exit_rules
     import wallet_ranker
 
     client = PolymarketDataAPIClient()
@@ -849,6 +892,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # whale position to market (entry -> current). It re-prices via /trades using
     # the outcomeIndex marker in each record's notes; SHADOW/observability only.
     price_fn = make_whale_price_fn(client)
+
+    # Early-exit sweep (ON unless --no-exit-rules): re-price each open position to
+    # the CURRENT mark and settle those past the stop-loss / take-profit at that
+    # mark — capping losers (instead of riding to $0) and locking winners.
+    # SHADOW-ONLY read + ledger bookkeeping; places NO orders.
+    exit_rules_enabled = not args.no_exit_rules
+
+    def _apply_exit_rules() -> None:
+        """Sweep + early-exit open positions at the current mark. Never crashes
+        the loop (wrapped so a transient pricing error can't kill the scan)."""
+        if not exit_rules_enabled:
+            return
+        try:
+            res = exit_rules.apply_exit_rules(
+                ledger,
+                price_fn,
+                stop_loss_pct=args.stop_loss_pct,
+                take_profit_pct=args.take_profit_pct,
+                take_profit_price=args.take_profit_price,
+            )
+            print(
+                f"exits: {res['stop_loss']} stop-loss / "
+                f"{res['take_profit']} take-profit, "
+                f"realized ${res['realized_pnl_usd']:.2f}"
+            )
+        except Exception as exc:  # noqa: BLE001 - exit rules must never crash the scan.
+            logging.warning("exit-rules sweep failed (%s); continuing.", exc)
 
     # wallet -> WalletStats for the current roster, so each convergence candidate
     # can be scored on the win-rate of the wallets that actually converged.
@@ -941,10 +1011,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
     def _scan(targets: Sequence[str]) -> None:
-        # Settle resolved positions FIRST (before convergence detection): this
+        # (1) Settle resolved positions FIRST (before everything else): this
         # closes any market that has resolved since the last scan, freeing dedup
         # and surfacing realized P/L in the report.
         _settle()
+        # (2) Early-exit sweep: cap losers / lock winners at the CURRENT mark
+        # BEFORE opening new convergences, so the risk overlay runs on the
+        # already-open book each scan (SHADOW-ONLY, NO orders).
+        _apply_exit_rules()
+        # (3) Convergence detection -> log new candidates (entry-filtered).
         if args.roster_source == "leaderboard":
             # Convergence comes from the roster's CURRENT positions (not hot
             # markets). The same /positions fetch also yields per-wallet stats,
@@ -967,6 +1042,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 wallet_quality=wallet_quality,
                 blocklist=blocklist,
                 dedup=dedup,
+                min_confidence=args.min_confidence,
                 candidates=candidates,
             )
         else:
@@ -982,7 +1058,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 wallet_stats=wallet_stats,
                 blocklist=blocklist,
                 dedup=dedup,
+                min_confidence=args.min_confidence,
             )
+        # (4) Report.
         _report()
 
     # Single pass (default): rank once, scan once, report, done.
