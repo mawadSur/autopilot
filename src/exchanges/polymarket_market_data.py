@@ -75,6 +75,7 @@ except Exception:  # pragma: no cover - only hit if fetcher is unavailable.
 __all__ = [
     "PolymarketAPIError",
     "get_order_book",
+    "get_market_resolution",
     "best_ask",
     "best_bid",
     "get_yes_no_best_asks",
@@ -170,6 +171,89 @@ def get_order_book(token_id: str, session: Optional[requests.Session] = None) ->
             f"returned a non-dict payload: {type(book).__name__}"
         )
     return book
+
+
+def get_market_resolution(
+    condition_id: str,
+    session: Optional[requests.Session] = None,
+) -> Optional[Dict[str, Any]]:
+    """Read a CLOB market's resolution status for SHADOW settlement.
+
+    Issues ``GET {CLOB_API_BASE_URL}/markets/<condition_id>`` and normalizes
+    the subset of the response settlement needs into::
+
+        {
+          "closed": bool,            # market resolved? (do NOT settle if False)
+          "tokens": [               # ordered to match outcomeIndex (0, 1, ...)
+            {"outcome": str|None, "price": float|None, "winner": bool},
+            ...
+          ],
+        }
+
+    Resolution semantics (shape live-verified 2026-06-01):
+        While a market is open the CLOB returns ``closed: false`` and the caller
+        MUST leave the position open (no look-ahead settlement). Once
+        ``closed: true``, each token in the ordered ``tokens`` list carries a
+        boolean ``winner`` and a ``price`` of exactly 0 or 1. The token list is
+        ordered to match ``outcomeIndex`` (index 0, 1, ...), the same
+        ``[YES, NO]`` convention as ``clobTokenIds``, so the converged
+        ``outcomeIndex`` indexes directly into ``tokens``.
+
+    This is intentionally a degrade-gracefully read: settlement runs unattended
+    in a loop, and one unreachable/garbled market must NOT raise. ANY failure —
+    empty ``condition_id``, network error, non-2xx HTTP, non-JSON / non-dict
+    body, or a missing ``tokens``/``closed`` field — returns ``None`` so the
+    caller simply leaves that position open and retries on the next sweep.
+
+    SHADOW-ONLY: this is a pure read — it places no order, signs nothing, and
+    touches no wallet, consistent with the rest of this module.
+
+    Args:
+        condition_id: The market ``conditionId`` (a ``0x...`` string).
+        session: Optional injected ``requests.Session`` (tests patch its
+            ``get``). A fresh session carrying the scanner User-Agent is built
+            when omitted.
+
+    Returns:
+        The normalized resolution dict, or ``None`` on any error.
+    """
+    if not condition_id:
+        return None
+
+    http = _session_with_ua(session)
+    url = f"{CLOB_API_BASE_URL}/markets/{condition_id}"
+
+    try:
+        resp = http.get(url, timeout=DEFAULT_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+        payload = resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+    except Exception:  # pragma: no cover - defensive: never let a read crash a sweep.
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    raw_tokens = payload.get("tokens")
+    if not isinstance(raw_tokens, (list, tuple)):
+        return None
+
+    tokens: List[Dict[str, Any]] = []
+    for raw in raw_tokens:
+        if not isinstance(raw, dict):
+            # Preserve positional ordering by index: a malformed token entry
+            # would shift outcomeIndex alignment, so bail rather than mislabel.
+            return None
+        tokens.append(
+            {
+                "outcome": raw.get("outcome"),
+                "price": _coerce_price(raw.get("price")),
+                "winner": bool(raw.get("winner")),
+            }
+        )
+
+    return {"closed": bool(payload.get("closed")), "tokens": tokens}
 
 
 def _coerce_price(value: Any) -> Optional[float]:

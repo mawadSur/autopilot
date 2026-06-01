@@ -24,6 +24,7 @@ from exchanges.polymarket_market_data import (
     PolymarketAPIError,
     best_ask,
     best_bid,
+    get_market_resolution,
     get_order_book,
     get_yes_no_best_asks,
 )
@@ -280,6 +281,104 @@ class GetYesNoBestAsksTest(unittest.TestCase):
         market = {"clobTokenIds": json.dumps(["YES", "NO"])}
         with self.assertRaises(PolymarketAPIError):
             get_yes_no_best_asks(market, session=session)
+
+
+# ---------------------------------------------------------------------------
+# get_market_resolution: CLOB /markets/<conditionId> resolution read
+# ---------------------------------------------------------------------------
+
+
+def _market_payload(closed: bool, tokens: Any) -> dict:
+    """A CLOB /markets/<conditionId> shaped payload (subset settlement reads)."""
+    return {
+        "condition_id": "0xCOND",
+        "question": "Will it resolve YES?",
+        "closed": closed,
+        "end_date_iso": "2026-06-01T00:00:00Z",
+        "tokens": tokens,
+    }
+
+
+class GetMarketResolutionTest(unittest.TestCase):
+    def test_parses_closed_market_with_winner_flags(self) -> None:
+        # YES (index 0) won at $1; NO (index 1) lost at $0.
+        payload = _market_payload(
+            closed=True,
+            tokens=[
+                {"token_id": "111", "outcome": "Yes", "price": "1", "winner": True},
+                {"token_id": "222", "outcome": "No", "price": "0", "winner": False},
+            ],
+        )
+        get_mock = mock.Mock(return_value=_StubResponse(payload))
+        session = _make_session(get_mock)
+
+        res = get_market_resolution("0xCOND", session=session)
+        self.assertIsNotNone(res)
+        self.assertTrue(res["closed"])
+        self.assertEqual(len(res["tokens"]), 2)
+
+        yes, no = res["tokens"]
+        self.assertEqual(yes["outcome"], "Yes")
+        self.assertAlmostEqual(yes["price"], 1.0)
+        self.assertIs(yes["winner"], True)
+        self.assertAlmostEqual(no["price"], 0.0)
+        self.assertIs(no["winner"], False)
+
+        # It hit /markets/<conditionId> (token list ordered to match outcomeIndex).
+        args, _kwargs = get_mock.call_args
+        self.assertTrue(args[0].endswith("/markets/0xCOND"))
+
+    def test_open_market_reports_closed_false(self) -> None:
+        payload = _market_payload(
+            closed=False,
+            tokens=[
+                {"outcome": "Yes", "price": "0.62", "winner": False},
+                {"outcome": "No", "price": "0.38", "winner": False},
+            ],
+        )
+        get_mock = mock.Mock(return_value=_StubResponse(payload))
+        session = _make_session(get_mock)
+
+        res = get_market_resolution("0xCOND", session=session)
+        self.assertIsNotNone(res)
+        self.assertFalse(res["closed"])
+        # Prices still normalized to float even while open.
+        self.assertAlmostEqual(res["tokens"][0]["price"], 0.62)
+
+    def test_empty_condition_id_returns_none_without_call(self) -> None:
+        get_mock = mock.Mock(return_value=_StubResponse(_market_payload(True, [])))
+        session = _make_session(get_mock)
+        self.assertIsNone(get_market_resolution("", session=session))
+        get_mock.assert_not_called()
+
+    def test_http_error_returns_none_not_raise(self) -> None:
+        get_mock = mock.Mock(return_value=_StubResponse({}, status_code=500))
+        session = _make_session(get_mock)
+        # Settlement degrades gracefully: HTTP error -> None, never raises.
+        self.assertIsNone(get_market_resolution("0xCOND", session=session))
+
+    def test_network_error_returns_none_not_raise(self) -> None:
+        get_mock = mock.Mock(side_effect=requests.ConnectionError("refused"))
+        session = _make_session(get_mock)
+        self.assertIsNone(get_market_resolution("0xCOND", session=session))
+
+    def test_non_json_body_returns_none(self) -> None:
+        get_mock = mock.Mock(
+            return_value=_StubResponse(raise_on_json=ValueError("no json"))
+        )
+        session = _make_session(get_mock)
+        self.assertIsNone(get_market_resolution("0xCOND", session=session))
+
+    def test_non_dict_payload_returns_none(self) -> None:
+        get_mock = mock.Mock(return_value=_StubResponse(["not", "a", "dict"]))
+        session = _make_session(get_mock)
+        self.assertIsNone(get_market_resolution("0xCOND", session=session))
+
+    def test_missing_tokens_returns_none(self) -> None:
+        payload = {"condition_id": "0xCOND", "closed": True}  # no tokens key
+        get_mock = mock.Mock(return_value=_StubResponse(payload))
+        session = _make_session(get_mock)
+        self.assertIsNone(get_market_resolution("0xCOND", session=session))
 
 
 if __name__ == "__main__":

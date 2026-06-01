@@ -8,14 +8,18 @@ this existed there was no auditable paper/backtest result anywhere in the repo.
 JSONL event-log model
 ---------------------
 The ledger is an **append-only JSONL file**: one JSON object per line, never
-rewritten in place. Each line is an immutable *event*. There are two event
-kinds, both keyed by ``trade_id``:
+rewritten in place. Each line is an immutable *event*. There are three event
+kinds, all keyed by ``trade_id``:
 
 1. ``"open"`` — emitted by :meth:`PnlLedger.append` when a position is entered.
    Carries the full :class:`TradeRecord` snapshot at decision/entry time.
 2. ``"settle"`` — emitted by :meth:`PnlLedger.settle` when the position closes.
    Carries the exit fields (``exit_price``, ``exit_ts_utc``, ``market_outcome``,
    ``realized_pnl_usd``, ``status``) plus the ``trade_id`` they apply to.
+3. ``"cancel"`` — emitted by :meth:`PnlLedger.cancel` to retire an ``open``
+   record (status -> ``cancelled``); carries no exit price and no realized P/L,
+   only the ``trade_id`` plus an optional ``cancel_reason``. Used by the
+   dedup-heal path to drop a duplicate open written by racing writers.
 
 Readers *fold* the event stream into current state: for each ``trade_id`` the
 latest event wins for the fields it carries. The file is therefore an immutable
@@ -35,7 +39,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
@@ -45,6 +49,7 @@ DEFAULT_LEDGER_PATH = "runs/pnl_ledger.jsonl"
 # Event-kind discriminators written into each JSONL line under "_event".
 EVENT_OPEN = "open"
 EVENT_SETTLE = "settle"
+EVENT_CANCEL = "cancel"
 
 
 @dataclass
@@ -104,6 +109,56 @@ def _parse_iso8601(value: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _open_position_key(record: "TradeRecord") -> tuple:
+    """The identity of an open position for dedup: one per ``(market_id, side)``.
+
+    Two open records sharing this key are the SAME position — we shadow one unit
+    of a (market, outcome), never two. Such pairs only arise when two writers race
+    on the same ledger (each snapshots the open set before the other appends).
+    """
+    return (getattr(record, "market_id", None), getattr(record, "side", None))
+
+
+def dedupe_open_positions(records: List["TradeRecord"]) -> List["TradeRecord"]:
+    """Collapse open ``records`` to one per ``(market_id, side)``.
+
+    Keeps the EARLIEST-entered record for each key (by ``ts_utc``, which ISO-8601
+    sorts chronologically) — the original entry, whose decision-time price is the
+    honest one we'd have actually filled at. Input order is otherwise preserved
+    for the kept records. Pure and side-effect free; callers decide whether to
+    cancel the dropped duplicates in the ledger.
+    """
+    earliest: Dict[tuple, "TradeRecord"] = {}
+    for record in records:
+        key = _open_position_key(record)
+        kept = earliest.get(key)
+        if kept is None or (getattr(record, "ts_utc", "") or "") < (
+            getattr(kept, "ts_utc", "") or ""
+        ):
+            earliest[key] = record
+    # Preserve first-seen order of the kept records for stable display.
+    seen: set = set()
+    ordered: List["TradeRecord"] = []
+    for record in records:
+        key = _open_position_key(record)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(earliest[key])
+    return ordered
+
+
+def duplicate_open_records(records: List["TradeRecord"]) -> List["TradeRecord"]:
+    """Return the DROPPED duplicate open records (everything dedup would discard).
+
+    These are the later-entered records that share a ``(market_id, side)`` with an
+    earlier one — the exact set a caller should :meth:`PnlLedger.cancel` to make
+    the ledger self-consistent (one open per market/outcome).
+    """
+    keep = {id(r) for r in dedupe_open_positions(records)}
+    return [r for r in records if id(r) not in keep]
 
 
 class PnlLedger:
@@ -187,6 +242,42 @@ class PnlLedger:
         )
         return record
 
+    def cancel(self, trade_id: str, reason: str = "") -> "TradeRecord":
+        """Append a ``cancel`` event for ``trade_id`` and return the folded record.
+
+        A cancel marks an OPEN record as ``cancelled`` so it drops out of both
+        :meth:`open_positions` and :meth:`settled` — it never contributes P/L and
+        never settles. This is the append-only way to retire a position that
+        should not have been opened (e.g. a duplicate written by two concurrent
+        writers racing on the same ledger): the original ``open`` line is left
+        intact for the audit trail, and a ``cancel`` line records the retraction
+        plus its ``reason``.
+
+        Unlike :meth:`settle` there is no exit price and no look-ahead concern (a
+        cancel carries no realized P/L), so there is no timestamp guard.
+
+        Raises
+        ------
+        KeyError
+            If ``trade_id`` has no prior ``open`` event in the ledger.
+        """
+        state = self._fold()
+        record = state.get(trade_id)
+        if record is None:
+            raise KeyError(f"cannot cancel unknown trade_id: {trade_id!r}")
+
+        cancel_payload: Dict[str, Any] = {
+            "_event": EVENT_CANCEL,
+            "trade_id": trade_id,
+            "status": "cancelled",
+        }
+        if reason:
+            cancel_payload["cancel_reason"] = reason
+        self._write_line(cancel_payload)
+
+        record.status = "cancelled"
+        return record
+
     def _write_line(self, payload: Dict[str, Any]) -> None:
         """Append a single JSON object as one line, flushing to disk.
 
@@ -231,6 +322,13 @@ class PnlLedger:
                     continue
                 if kind == EVENT_OPEN:
                     state[trade_id] = TradeRecord.from_dict(event)
+                elif kind == EVENT_CANCEL:
+                    record = state.get(trade_id)
+                    if record is None:
+                        # Cancel with no prior open — ignore (keep the audit
+                        # honest; we never fabricate an entry to cancel).
+                        continue
+                    record.status = event.get("status", "cancelled")
                 elif kind == EVENT_SETTLE:
                     record = state.get(trade_id)
                     if record is None:
@@ -256,6 +354,18 @@ class PnlLedger:
     def open_positions(self) -> List[TradeRecord]:
         """Return records still in ``open`` status."""
         return [r for r in self._fold().values() if r.status == "open"]
+
+    def unique_open_positions(self) -> List[TradeRecord]:
+        """Open positions collapsed to one per ``(market_id, side)``.
+
+        Defense-in-depth against duplicate opens written by concurrent writers,
+        so the *positions we actually hold* are never counted twice. The
+        dashboard view-builder reads through this; the duck-typed sweeps
+        (:mod:`shadow_settlement`, :mod:`exit_rules`, :mod:`portfolio_reporter`)
+        call the module-level :func:`dedupe_open_positions` directly, since they
+        accept any ledger-like object, not only :class:`PnlLedger`.
+        """
+        return dedupe_open_positions(self.open_positions())
 
     def settled(self) -> List[TradeRecord]:
         """Return records in ``settled`` status."""
@@ -307,6 +417,9 @@ __all__ = [
     "DEFAULT_LEDGER_PATH",
     "EVENT_OPEN",
     "EVENT_SETTLE",
+    "EVENT_CANCEL",
     "PnlLedger",
     "TradeRecord",
+    "dedupe_open_positions",
+    "duplicate_open_records",
 ]

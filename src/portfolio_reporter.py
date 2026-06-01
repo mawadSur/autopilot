@@ -36,9 +36,13 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 _CONFIDENCE_RE = re.compile(r"confidence=([0-9.]+ \([a-z]+\))")
 
 try:  # Flat import (PYTHONPATH=src), matching the rest of the codebase.
-    from state.pnl_ledger import PnlLedger, TradeRecord
+    from state.pnl_ledger import PnlLedger, TradeRecord, dedupe_open_positions
 except ImportError:  # pragma: no cover - fallback for package-style import.
-    from src.state.pnl_ledger import PnlLedger, TradeRecord  # type: ignore
+    from src.state.pnl_ledger import (  # type: ignore
+        PnlLedger,
+        TradeRecord,
+        dedupe_open_positions,
+    )
 
 __all__ = [
     "DEFAULT_BANKROLL_USD",
@@ -150,10 +154,15 @@ def build_report(
     summary = ledger.summary()
     realized_pnl = float(summary.get("total_realized_pnl_usd", 0.0))
 
+    # Mark ONE position per (market, outcome): a duplicate open (two writers
+    # racing on the ledger) would otherwise inflate unrealized P/L and equity.
+    # Mirrors the dedup in shadow_settlement / exit_rules / dashboard.state so the
+    # marked equity is correct on its own, not reliant on a caller running the
+    # runner's self-heal first (e.g. arb_shadow_runner reports without healing).
     open_rows: List[Dict[str, Any]] = []
     unrealized_total = 0.0
     n_pending = 0
-    for record in ledger.open_positions():
+    for record in dedupe_open_positions(ledger.open_positions()):
         price = price_fn(record) if price_fn is not None else None
         row = mark_open_position(record, price)
         if row["marked"]:
@@ -183,7 +192,7 @@ def build_report(
         "unrealized_pnl_usd": unrealized_total,
         "total_pnl_usd": realized_pnl + unrealized_total,
         "equity_usd": equity,
-        "n_open": int(summary.get("n_open", len(open_rows))),
+        "n_open": len(open_rows),  # deduped (one per market+outcome), matches marking
         "n_settled": int(summary.get("n_settled", len(settled_rows))),
         "n_pending_mark": n_pending,
         "win_rate": float(summary.get("win_rate", 0.0)),
