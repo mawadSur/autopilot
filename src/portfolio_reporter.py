@@ -27,8 +27,13 @@ Pricing convention:
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
+
+# Recovers a "confidence=0.55 (medium)" marker written into a record's notes by
+# the whale-convergence runner, so it can be surfaced on the Discord card.
+_CONFIDENCE_RE = re.compile(r"confidence=([0-9.]+ \([a-z]+\))")
 
 try:  # Flat import (PYTHONPATH=src), matching the rest of the codebase.
     from state.pnl_ledger import PnlLedger, TradeRecord
@@ -199,17 +204,23 @@ def _trade_fields(rows: List[Dict[str, Any]], *, max_shown: int) -> Dict[str, st
     """Build Discord embed fields, one per trade (capped)."""
     fields: Dict[str, str] = {}
     for row in rows[:max_shown]:
-        title = str(row.get("title") or row.get("market_id") or "market")[:80]
+        full_title = str(row.get("title") or row.get("market_id") or "market")
+        title = full_title[:80]
+        conf_match = _CONFIDENCE_RE.search(full_title)
+        conf_suffix = f" | conf {conf_match.group(1)}" if conf_match else ""
         if "unrealized_pnl_usd" in row:  # open
             pl = row["unrealized_pnl_usd"]
             mark = row.get("current_price")
             mark_str = "pending" if mark is None else f"${mark:.3f}"
             value = (
                 f"{row['side']} | entry ${row['entry_price']:.3f} -> {mark_str} "
-                f"| unrl {_fmt_usd(pl)}"
+                f"| unrl {_fmt_usd(pl)}{conf_suffix}"
             )
         else:  # settled
-            value = f"{row['side']} | realized {_fmt_usd(row.get('realized_pnl_usd'))}"
+            value = (
+                f"{row['side']} | realized {_fmt_usd(row.get('realized_pnl_usd'))}"
+                f"{conf_suffix}"
+            )
         # Discord rejects duplicate-name collisions silently; suffix the id tail.
         key = f"{title} ({str(row.get('trade_id', ''))[-4:]})"
         fields[key[:256]] = value[:1024]
