@@ -62,6 +62,7 @@ except Exception:  # pragma: no cover - import shim for alternate layouts.
 __all__ = [
     "STRATEGY",
     "find_convergence",
+    "compute_confidence",
     "run_once",
     "make_whale_price_fn",
     "main",
@@ -212,6 +213,36 @@ def _latest_price_for_outcome(
     return best_price
 
 
+def compute_confidence(
+    n_target_holders: int,
+    converging_winrates: Sequence[float],
+    *,
+    min_convergence: int = 3,
+) -> tuple:
+    """Heuristic 0-1 conviction for a whale-convergence candidate.
+
+    This is a SIGNAL-STRENGTH indicator, NOT a probability of profit. It blends:
+      * COUNT — how many smart-money wallets converged on the outcome
+        (saturates at ~6 wallets); and
+      * QUALITY — the average historical win-rate of those converging wallets
+        (mapped 0.50 -> 0.0 .. 0.90 -> 1.0); neutral 0.5 when unknown.
+
+    Returns ``(score, label)`` where label is ``'low'`` (<0.40), ``'medium'``
+    (<0.66), or ``'high'`` (>=0.66). More/better wallets agreeing = higher.
+    """
+    holders = max(int(n_target_holders or 0), int(min_convergence or 0))
+    conv_term = max(0.0, min(1.0, holders / 6.0))
+    rates = [float(r) for r in converging_winrates if isinstance(r, (int, float))]
+    if rates:
+        avg_wr = sum(rates) / len(rates)
+        quality_term = max(0.0, min(1.0, (avg_wr - 0.5) / 0.4))
+    else:
+        quality_term = 0.5  # neutral when wallet quality is unknown
+    score = round(0.5 * conv_term + 0.5 * quality_term, 3)
+    label = "high" if score >= 0.66 else "medium" if score >= 0.40 else "low"
+    return score, label
+
+
 def run_once(
     *,
     ledger: PnlLedger,
@@ -221,6 +252,7 @@ def run_once(
     min_convergence: int = 3,
     size_usd: float = 0.0,
     mark_entry: bool = False,
+    wallet_stats: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Run one convergence scan and log each candidate to the SHADOW ledger.
 
@@ -277,6 +309,28 @@ def run_once(
         condition_id = str(cand.get("conditionId"))
         outcome_index = cand.get("outcomeIndex")
 
+        # Confidence = how many smart-money wallets converged x how good they are
+        # (avg historical win-rate from the ranking). Signal strength, not a
+        # profit probability. Stored on the candidate + in the notes for Discord.
+        winrates: List[float] = []
+        if wallet_stats:
+            for wallet in wallets:
+                stat = wallet_stats.get(wallet)
+                if stat is None:
+                    continue
+                rate = getattr(stat, "win_rate", stat)
+                try:
+                    winrates.append(float(rate))
+                except (TypeError, ValueError):
+                    continue
+        conf_score, conf_label = compute_confidence(
+            int(cand.get("n_target_holders") or len(wallets)),
+            winrates,
+            min_convergence=min_convergence,
+        )
+        cand["confidence"] = conf_score
+        cand["confidence_label"] = conf_label
+
         entry_price = 0.0
         if mark_entry and outcome_index is not None:
             entry_price = (
@@ -291,6 +345,7 @@ def run_once(
         notes = (
             "SHADOW MODE - NO ORDERS; "
             f"whale_convergence n={cand.get('n_target_holders')} "
+            f"confidence={conf_score:.2f} ({conf_label}); "
             f"outcomeIndex={outcome_index}; "
             f"{price_note}; "
             f"wallets={','.join(wallets)}"
@@ -348,6 +403,7 @@ def _print_summary(candidates: List[Dict[str, Any]]) -> None:
             f"outcome={cand.get('outcome')!r} "
             f"(idx {cand.get('outcomeIndex')}) "
             f"n_target_holders={cand.get('n_target_holders')} "
+            f"confidence={cand.get('confidence')} ({cand.get('confidence_label')}) "
             f"wallets={cand.get('wallets')}"
         )
 
@@ -410,6 +466,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # the outcomeIndex marker in each record's notes; SHADOW/observability only.
     price_fn = make_whale_price_fn(client)
 
+    # wallet -> WalletStats for the current roster, so each convergence candidate
+    # can be scored on the win-rate of the wallets that actually converged.
+    wallet_stats: Dict[str, Any] = {}
+
     def _rank_targets() -> List[str]:
         """Rank smart-money wallets (bounded discovery + per-wallet positions)."""
         discovered = wallet_ranker.discover_active_wallets(
@@ -423,6 +483,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             top_n=args.top_wallets,
         )
         targets = [w.wallet for w in ranked]
+        wallet_stats.clear()
+        wallet_stats.update({w.wallet: w for w in ranked})
         print(
             f"ranked {len(targets)} smart-money wallet(s) from "
             f"{len(discovered)} active"
@@ -468,6 +530,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             min_convergence=args.min_convergence,
             size_usd=args.size,
             mark_entry=True,
+            wallet_stats=wallet_stats,
         )
         _report()
 
