@@ -15,12 +15,16 @@ SCOPE — READ-ONLY, NO MONEY MOVES (Constitution: safety first):
     those are explicitly out of scope for the shadow stack.
 
 LIVE-VERIFICATION CAVEAT:
-    The three endpoints below were LIVE-VERIFIED against the production
-    data-api on 2026-05-31 (real responses probed). Polymarket can change
-    paths, query-parameter names, or response shapes without notice, so an
-    operator MUST re-confirm them before trusting this client in production.
-    The base URL is a constructor parameter (``DEFAULT_BASE_URL`` default) so
-    it can be overridden without a code change.
+    The data-api endpoints below were LIVE-VERIFIED against the production
+    data-api on 2026-05-31 (real responses probed). The profit-leaderboard
+    endpoint (``get_profit_leaderboard``) lives on a DIFFERENT host —
+    ``https://lb-api.polymarket.com`` — and was LIVE-VERIFIED on 2026-06-01;
+    only the windows ``'all'`` (all-time) and ``'1d'`` (today) are confirmed,
+    any other window string returns HTTP 400. Polymarket can change paths,
+    query-parameter names, or response shapes without notice, so an operator
+    MUST re-confirm them before trusting this client in production. Both base
+    URLs are constructor parameters (``DEFAULT_BASE_URL`` / ``DEFAULT_LB_BASE_URL``
+    defaults) so they can be overridden without a code change.
 
 Endpoints (shapes the parsers are built to, verbatim from the live probe):
 
@@ -47,6 +51,13 @@ Endpoints (shapes the parsers are built to, verbatim from the live probe):
             holders:[ {proxyWallet, asset, amount:float, outcomeIndex:int,
                        name, pseudonym, verified} ]}
 
+    GET /profit?window=<all|1d>&limit=N   (HOST: https://lb-api.polymarket.com)
+        -> JSON list of profit-leaderboard rows, descending by profit:
+           {proxyWallet, amount:float(profit USD), name, pseudonym}
+        -> ``window`` confirmed values: ``'all'`` (all-time) and ``'1d'``
+           (today). Any other window string -> HTTP 400 (surfaced as a
+           :class:`PolymarketDataAPIError`, never a crash).
+
 Hermetic by construction: all HTTP goes through an injected
 ``requests.Session`` so tests never touch the network.
 """
@@ -60,12 +71,15 @@ import requests
 
 __all__ = [
     "DEFAULT_BASE_URL",
+    "DEFAULT_LB_BASE_URL",
     "PolymarketDataAPIError",
     "PolymarketDataAPIClient",
 ]
 
 
 DEFAULT_BASE_URL = "https://data-api.polymarket.com"
+# The profit leaderboard lives on a SEPARATE host (note: lb-api, not data-api).
+DEFAULT_LB_BASE_URL = "https://lb-api.polymarket.com"
 _DEFAULT_TIMEOUT_S = 10.0
 
 
@@ -86,12 +100,15 @@ class PolymarketDataAPIClient:
     so the client is fully offline-testable: tests patch ``session.get``.
 
     Args:
-        base_url:   Override for the data-api base URL. Defaults to
-                    :data:`DEFAULT_BASE_URL`. See the module docstring's
-                    live-verification caveat.
-        session:    Injected ``requests.Session`` for tests; a fresh one is
-                    created when omitted.
-        timeout_s:  Per-request timeout in seconds (default 10s).
+        base_url:    Override for the data-api base URL. Defaults to
+                     :data:`DEFAULT_BASE_URL`. See the module docstring's
+                     live-verification caveat.
+        lb_base_url: Override for the profit-leaderboard host (a DIFFERENT
+                     service from the data-api). Defaults to
+                     :data:`DEFAULT_LB_BASE_URL`.
+        session:     Injected ``requests.Session`` for tests; a fresh one is
+                     created when omitted.
+        timeout_s:   Per-request timeout in seconds (default 10s).
     """
 
     def __init__(
@@ -99,8 +116,10 @@ class PolymarketDataAPIClient:
         base_url: str = DEFAULT_BASE_URL,
         session: Optional[requests.Session] = None,
         timeout_s: float = _DEFAULT_TIMEOUT_S,
+        lb_base_url: str = DEFAULT_LB_BASE_URL,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        self._lb_base_url = lb_base_url.rstrip("/")
         self._session: requests.Session = (
             session if session is not None else requests.Session()
         )
@@ -181,6 +200,37 @@ class PolymarketDataAPIClient:
         )
         return _as_list(payload)
 
+    def get_profit_leaderboard(
+        self,
+        window: str = "all",
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Fetch the historical *profit* leaderboard (real winners).
+
+        Issues ``GET /profit?window=<window>&limit=N`` against the separate
+        leaderboard host (:data:`DEFAULT_LB_BASE_URL`, note: ``lb-api``, NOT the
+        ``data-api`` host the other methods use). Returns the raw list of rows,
+        descending by realized profit; each row is
+        ``{proxyWallet, amount(profit USD float), name, pseudonym}``.
+
+        ``window`` is the leaderboard horizon. Only ``'all'`` (all-time) and
+        ``'1d'`` (today) are live-verified; any other value returns HTTP 400,
+        which is wrapped in :class:`PolymarketDataAPIError` (with the window in
+        the context) rather than crashing — callers see a clear error.
+
+        Read-only: this is a pure GET of a public leaderboard. It places no
+        orders, signs nothing, and touches no wallet/web3 path.
+        """
+        params: Dict[str, Any] = {"window": window, "limit": limit}
+        payload = self._get(
+            "/profit",
+            params=params,
+            context="get_profit_leaderboard",
+            detail=window,
+            base_url=self._lb_base_url,
+        )
+        return _as_list(payload)
+
     # ------------------------------------------------------------------
     # Internal HTTP
     # ------------------------------------------------------------------
@@ -191,6 +241,7 @@ class PolymarketDataAPIClient:
         params: Optional[Dict[str, Any]] = None,
         context: str = "",
         detail: Optional[str] = None,
+        base_url: Optional[str] = None,
     ) -> Any:
         """GET ``path`` and return parsed JSON, wrapping all failures.
 
@@ -198,8 +249,12 @@ class PolymarketDataAPIClient:
         :class:`PolymarketDataAPIError` with the call context (and the user or
         market detail, where relevant) and the original exception on
         ``__cause__``.
+
+        ``base_url`` defaults to the data-api host; pass the leaderboard host
+        (:data:`DEFAULT_LB_BASE_URL`) for the ``/profit`` endpoint.
         """
-        url = f"{self._base_url}{path}"
+        root = (base_url if base_url is not None else self._base_url)
+        url = f"{root}{path}"
         where = context or path
         if detail:
             where = f"{where}({detail!r})"

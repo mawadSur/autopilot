@@ -16,6 +16,7 @@ import requests
 
 from exchanges.polymarket_data_api import (
     DEFAULT_BASE_URL,
+    DEFAULT_LB_BASE_URL,
     PolymarketDataAPIClient,
     PolymarketDataAPIError,
 )
@@ -152,6 +153,23 @@ def _holders_payload() -> List[dict]:
                     "verified": False,
                 }
             ],
+        },
+    ]
+
+
+def _profit_payload() -> List[dict]:
+    return [
+        {
+            "proxyWallet": "0xWINNER_1",
+            "amount": 1234567.89,
+            "name": "Theo4",
+            "pseudonym": "theo",
+        },
+        {
+            "proxyWallet": "0xWINNER_2",
+            "amount": 98765.43,
+            "name": "WhaleTwo",
+            "pseudonym": "wtwo",
         },
     ]
 
@@ -313,6 +331,82 @@ class ErrorHandlingTest(unittest.TestCase):
         client = _make_client(get_mock)
         with self.assertRaises(PolymarketDataAPIError):
             client.get_trades()
+
+
+# ---------------------------------------------------------------------------
+# get_profit_leaderboard (DIFFERENT host: lb-api)
+# ---------------------------------------------------------------------------
+
+
+class GetProfitLeaderboardTest(unittest.TestCase):
+    def test_parses_profit_list(self) -> None:
+        get_mock = mock.Mock(return_value=_StubResponse(_profit_payload()))
+        client = _make_client(get_mock)
+
+        rows = client.get_profit_leaderboard(window="all", limit=100)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["proxyWallet"], "0xWINNER_1")
+        self.assertEqual(rows[0]["amount"], 1234567.89)
+        self.assertEqual(rows[0]["name"], "Theo4")
+        self.assertEqual(rows[1]["proxyWallet"], "0xWINNER_2")
+
+    def test_hits_lb_host_with_window_and_limit(self) -> None:
+        get_mock = mock.Mock(return_value=_StubResponse(_profit_payload()))
+        client = _make_client(get_mock)
+
+        client.get_profit_leaderboard(window="1d", limit=25)
+
+        args, kwargs = get_mock.call_args
+        # The profit endpoint MUST go to the lb-api host, not the data-api host.
+        self.assertEqual(args[0], f"{DEFAULT_LB_BASE_URL}/profit")
+        self.assertNotEqual(DEFAULT_LB_BASE_URL, DEFAULT_BASE_URL)
+        self.assertEqual(kwargs["params"]["window"], "1d")
+        self.assertEqual(kwargs["params"]["limit"], 25)
+
+    def test_default_window_is_all(self) -> None:
+        get_mock = mock.Mock(return_value=_StubResponse(_profit_payload()))
+        client = _make_client(get_mock)
+        client.get_profit_leaderboard()
+        _, kwargs = get_mock.call_args
+        self.assertEqual(kwargs["params"]["window"], "all")
+        self.assertEqual(kwargs["params"]["limit"], 100)
+
+    def test_bad_window_400_wrapped_with_context(self) -> None:
+        # An unsupported window string returns HTTP 400 -> wrapped, not crashed.
+        get_mock = mock.Mock(return_value=_StubResponse([], status_code=400))
+        client = _make_client(get_mock)
+        with self.assertRaises(PolymarketDataAPIError) as ctx:
+            client.get_profit_leaderboard(window="7d")
+        msg = str(ctx.exception)
+        self.assertIn("get_profit_leaderboard", msg)
+        self.assertIn("7d", msg)  # the offending window is surfaced
+        self.assertIn("400", msg)
+        self.assertIsInstance(ctx.exception.__cause__, requests.HTTPError)
+
+    def test_network_error_wrapped(self) -> None:
+        get_mock = mock.Mock(side_effect=requests.ConnectionError("refused"))
+        client = _make_client(get_mock)
+        with self.assertRaises(PolymarketDataAPIError) as ctx:
+            client.get_profit_leaderboard(window="all")
+        self.assertIn("get_profit_leaderboard", str(ctx.exception))
+        self.assertIsInstance(ctx.exception.__cause__, requests.ConnectionError)
+
+    def test_non_list_payload_yields_empty(self) -> None:
+        get_mock = mock.Mock(return_value=_StubResponse({"error": "nope"}))
+        client = _make_client(get_mock)
+        self.assertEqual(client.get_profit_leaderboard(), [])
+
+    def test_lb_base_url_override(self) -> None:
+        get_mock = mock.Mock(return_value=_StubResponse(_profit_payload()))
+        session = mock.Mock(spec=requests.Session)
+        session.get = get_mock
+        client = PolymarketDataAPIClient(
+            session=session, lb_base_url="https://lb.example.test/"
+        )
+        client.get_profit_leaderboard()
+        args, _ = get_mock.call_args
+        self.assertEqual(args[0], "https://lb.example.test/profit")
 
 
 # ---------------------------------------------------------------------------

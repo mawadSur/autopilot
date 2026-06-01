@@ -62,6 +62,7 @@ except Exception:  # pragma: no cover - import shim for alternate layouts.
 __all__ = [
     "STRATEGY",
     "find_convergence",
+    "convergence_from_positions",
     "compute_confidence",
     "run_once",
     "make_whale_price_fn",
@@ -155,6 +156,154 @@ def find_convergence(
     return candidates
 
 
+def _is_current_open_holding(position: Dict[str, Any]) -> bool:
+    """Return True iff a position is a CURRENT open holding (not resolved).
+
+    A current open holding has real notional still at risk:
+      * ``size > 0`` — the wallet actually holds the outcome token now; and
+      * NOT ``redeemable`` — a redeemable position is resolved/settled; and
+      * ``0 < curPrice < 1`` — a resolved/settled outcome marks to exactly 0 or
+        1, so a strict-interior price is the live, still-uncertain signal.
+
+    Any missing/non-numeric field is treated as NOT a current holding, so an
+    ambiguous row never produces a false convergence signal.
+    """
+    try:
+        size = float(position.get("size"))
+    except (TypeError, ValueError):
+        return False
+    if size <= 0:
+        return False
+    if position.get("redeemable") is True:
+        return False
+    try:
+        cur_price = float(position.get("curPrice"))
+    except (TypeError, ValueError):
+        return False
+    return 0.0 < cur_price < 1.0
+
+
+def convergence_from_positions(
+    client: Any,
+    roster_wallets: Sequence[str],
+    *,
+    min_convergence: int = 3,
+    return_stats: bool = False,
+) -> Any:
+    """Flag markets where >= ``min_convergence`` roster wallets CURRENTLY hold the
+    same outcome, derived from each wallet's live ``/positions``.
+
+    This is the leaderboard-mode counterpart to :func:`find_convergence`. Instead
+    of scanning a fixed set of "hot" markets via ``/holders``, it asks each
+    roster wallet what it is *holding right now* and looks for the same
+    (market, outcome) showing up across several winners. That matters because an
+    all-time profit legend may be dormant in today's hot markets — the only way
+    to follow them is to read their current book.
+
+    For each wallet in ``roster_wallets`` we fetch
+    ``client.get_positions(user=wallet)`` and keep only CURRENT OPEN holdings
+    (:func:`_is_current_open_holding`: ``size>0``, not ``redeemable``,
+    ``0<curPrice<1``). Each surviving holding records the wallet under its
+    ``(conditionId, outcomeIndex)`` key. A per-wallet fetch error is caught and
+    that wallet is skipped (the scan continues) so one bad wallet can't sink it.
+
+    A (market, outcome) held by ``>= min_convergence`` DISTINCT roster wallets is
+    emitted as a candidate dict in the SAME shape :func:`find_convergence`
+    returns::
+
+        {conditionId, outcomeIndex, outcome, n_target_holders, wallets:[...]}
+
+    so the downstream confidence + mark-to-market + logging path is unchanged.
+
+    Args:
+        client:           Read-only data-api client exposing
+                          ``get_positions(user=..., limit=...)``.
+        roster_wallets:   The winners' roster (e.g. profit-leaderboard wallets).
+        min_convergence:  Min distinct roster wallets holding one outcome to flag.
+        return_stats:     When True, ALSO return ``wallet_stats`` —
+                          ``{wallet: WalletStats}`` built from the SAME positions
+                          already fetched (no extra calls), so confidence can be
+                          scored on each wallet's settled win-rate. A wallet that
+                          errored or returned nothing is absent from the map.
+
+    Returns:
+        ``candidates`` (a list of candidate dicts), or
+        ``(candidates, wallet_stats)`` when ``return_stats`` is True.
+    """
+    # Lazy import keeps this module importable without wallet_ranker in minimal
+    # envs; the stats path only runs when return_stats is requested.
+    stats_from_positions = None
+    if return_stats:
+        try:  # Flat import under PYTHONPATH=src (matches the rest of the stack).
+            from wallet_ranker import stats_from_positions  # type: ignore
+        except Exception:  # pragma: no cover - alternate layout shim.
+            from src.wallet_ranker import stats_from_positions  # type: ignore
+
+    roster = [w for w in roster_wallets if w]
+    # (conditionId, outcomeIndex) -> {"outcome": label, "wallets": ordered set}
+    per_market_outcome: Dict[tuple, Dict[str, Any]] = {}
+    wallet_stats: Dict[str, Any] = {}
+
+    for wallet in roster:
+        try:
+            positions = client.get_positions(user=wallet)
+        except PolymarketDataAPIError as exc:
+            logging.warning(
+                "skipping wallet %s: /positions failed (%s)", wallet, exc
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001 - one bad wallet must not kill the scan.
+            logging.warning(
+                "skipping wallet %s: /positions raised (%s)", wallet, exc
+            )
+            continue
+
+        positions = positions or []
+        if return_stats and stats_from_positions is not None:
+            wallet_stats[wallet] = stats_from_positions(wallet, positions)
+
+        # A wallet is counted at most once per (market, outcome).
+        seen_keys: set = set()
+        for position in positions:
+            if not isinstance(position, dict):
+                continue
+            if not _is_current_open_holding(position):
+                continue
+            condition_id = position.get("conditionId")
+            outcome_index = position.get("outcomeIndex")
+            if not condition_id or outcome_index is None:
+                continue
+            key = (condition_id, outcome_index)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            bucket = per_market_outcome.setdefault(
+                key,
+                {"outcome": position.get("outcome"), "wallets": {}},
+            )
+            if bucket["outcome"] is None:
+                bucket["outcome"] = position.get("outcome")
+            bucket["wallets"][wallet] = None  # ordered distinct set.
+
+    candidates: List[Dict[str, Any]] = []
+    for (condition_id, outcome_index), bucket in per_market_outcome.items():
+        wallets = list(bucket["wallets"].keys())
+        if len(wallets) >= min_convergence:
+            candidates.append(
+                {
+                    "conditionId": condition_id,
+                    "outcomeIndex": outcome_index,
+                    "outcome": bucket["outcome"],
+                    "n_target_holders": len(wallets),
+                    "wallets": wallets,
+                }
+            )
+
+    if return_stats:
+        return candidates, wallet_stats
+    return candidates
+
+
 def _utc_now_iso() -> str:
     """Current UTC time as an ISO-8601 string (decision/entry timestamp)."""
     return datetime.now(timezone.utc).isoformat()
@@ -243,63 +392,31 @@ def compute_confidence(
     return score, label
 
 
-def run_once(
+def _log_candidates(
     *,
     ledger: PnlLedger,
-    client: Optional[Any] = None,
-    target_wallets: Sequence[str],
-    markets_condition_ids: Sequence[str],
+    client: Any,
+    candidates: List[Dict[str, Any]],
     min_convergence: int = 3,
     size_usd: float = 0.0,
     mark_entry: bool = False,
     wallet_stats: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """Run one convergence scan and log each candidate to the SHADOW ledger.
+    """Score + log a list of convergence candidates to the SHADOW ledger.
 
-    For every convergence candidate from :func:`find_convergence`, append an
-    OPEN :class:`TradeRecord` to ``ledger`` (``venue='polymarket'``,
-    ``strategy='whale_convergence'``, ``side`` = the converged outcome label).
-    The notes flag SHADOW MODE and list the contributing wallets so the
-    candidate is auditable. NO orders are placed — the client is read-only.
+    Shared back-end for both runner modes: the live ``/holders`` path
+    (:func:`run_once` -> :func:`find_convergence`) and the leaderboard
+    ``/positions`` path (:func:`convergence_from_positions`) hand the SAME
+    candidate shape to this one function, so the confidence, mark-to-market
+    entry pricing, ``TradeRecord`` construction, and notes are written in
+    exactly one place — never duplicated.
 
-    Entry price:
-        * ``mark_entry=False`` (default) — record ``entry_price = 0.0`` with the
-          legacy note, because the ``/holders`` endpoint carries no price. This
-          preserves the original behavior exactly (no ``get_trades`` call).
-        * ``mark_entry=True`` — set ``entry_price`` to the current market price of
-          the converged outcome via :func:`_latest_price_for_outcome` (the price
-          you'd pay to follow now, a decision-time entry — NOT look-ahead). When
-          a real price is found the note reflects it; when none is found we fall
-          back to ``0.0`` and keep the "holders endpoint carries no price" note.
-        Either way the ``outcomeIndex=<n>`` marker is preserved in the notes so
-        :func:`make_whale_price_fn` can re-price the open position later.
-
-    Args:
-        ledger:                 The shadow :class:`PnlLedger` to append to.
-        client:                 Read-only data-api client. Required in practice;
-                                kept optional for signature symmetry with other
-                                runners. A ``None`` client raises ``ValueError``.
-        target_wallets:         The smart-money roster.
-        markets_condition_ids:  Markets to scan.
-        min_convergence:        Convergence threshold (default 3).
-        size_usd:               Notional label for the shadow record (default
-                                0.0 — shadow positions carry no real size).
-        mark_entry:             When True, fetch a real decision-time entry price
-                                per candidate via the data-api ``/trades`` page.
-
-    Returns:
-        The list of convergence candidates that were logged.
+    For each candidate: compute confidence from the converging wallets' settled
+    win-rates (``wallet_stats``), optionally fetch a real decision-time entry
+    price (``mark_entry``), and append an OPEN :class:`TradeRecord`. NO orders
+    are placed — the client is read-only. Mutates each candidate in place with
+    ``confidence`` / ``confidence_label`` and returns the same list.
     """
-    if client is None:
-        raise ValueError("run_once requires a read-only data-api client")
-
-    candidates = find_convergence(
-        client,
-        target_wallets,
-        markets_condition_ids=markets_condition_ids,
-        min_convergence=min_convergence,
-    )
-
     for cand in candidates:
         outcome_label = cand.get("outcome")
         side = str(outcome_label) if outcome_label is not None else str(
@@ -370,6 +487,85 @@ def run_once(
     return candidates
 
 
+def run_once(
+    *,
+    ledger: PnlLedger,
+    client: Optional[Any] = None,
+    target_wallets: Sequence[str] = (),
+    markets_condition_ids: Sequence[str] = (),
+    min_convergence: int = 3,
+    size_usd: float = 0.0,
+    mark_entry: bool = False,
+    wallet_stats: Optional[Dict[str, Any]] = None,
+    candidates: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Run one convergence scan and log each candidate to the SHADOW ledger.
+
+    For every convergence candidate from :func:`find_convergence`, append an
+    OPEN :class:`TradeRecord` to ``ledger`` (``venue='polymarket'``,
+    ``strategy='whale_convergence'``, ``side`` = the converged outcome label).
+    The notes flag SHADOW MODE and list the contributing wallets so the
+    candidate is auditable. NO orders are placed — the client is read-only.
+
+    Entry price:
+        * ``mark_entry=False`` (default) — record ``entry_price = 0.0`` with the
+          legacy note, because the ``/holders`` endpoint carries no price. This
+          preserves the original behavior exactly (no ``get_trades`` call).
+        * ``mark_entry=True`` — set ``entry_price`` to the current market price of
+          the converged outcome via :func:`_latest_price_for_outcome` (the price
+          you'd pay to follow now, a decision-time entry — NOT look-ahead). When
+          a real price is found the note reflects it; when none is found we fall
+          back to ``0.0`` and keep the "holders endpoint carries no price" note.
+        Either way the ``outcomeIndex=<n>`` marker is preserved in the notes so
+        :func:`make_whale_price_fn` can re-price the open position later.
+
+    Args:
+        ledger:                 The shadow :class:`PnlLedger` to append to.
+        client:                 Read-only data-api client. Required in practice;
+                                kept optional for signature symmetry with other
+                                runners. A ``None`` client raises ``ValueError``.
+        target_wallets:         The smart-money roster.
+        markets_condition_ids:  Markets to scan.
+        min_convergence:        Convergence threshold (default 3).
+        size_usd:               Notional label for the shadow record (default
+                                0.0 — shadow positions carry no real size).
+        mark_entry:             When True, fetch a real decision-time entry price
+                                per candidate via the data-api ``/trades`` page.
+        candidates:             OPTIONAL precomputed candidate list (same shape
+                                :func:`find_convergence` returns). When provided
+                                (e.g. leaderboard mode passes the output of
+                                :func:`convergence_from_positions`), the
+                                ``/holders`` scan is SKIPPED and these candidates
+                                are logged directly. When ``None`` (the live
+                                default), candidates are discovered from
+                                ``markets_condition_ids`` via
+                                :func:`find_convergence`.
+
+    Returns:
+        The list of convergence candidates that were logged.
+    """
+    if client is None:
+        raise ValueError("run_once requires a read-only data-api client")
+
+    if candidates is None:
+        candidates = find_convergence(
+            client,
+            target_wallets,
+            markets_condition_ids=markets_condition_ids,
+            min_convergence=min_convergence,
+        )
+
+    return _log_candidates(
+        ledger=ledger,
+        client=client,
+        candidates=candidates,
+        min_convergence=min_convergence,
+        size_usd=size_usd,
+        mark_entry=mark_entry,
+        wallet_stats=wallet_stats,
+    )
+
+
 def make_whale_price_fn(client: Any) -> Callable[[TradeRecord], Optional[float]]:
     """Build a ``price_fn(record) -> Optional[float]`` for the portfolio reporter.
 
@@ -409,16 +605,39 @@ def _print_summary(candidates: List[Dict[str, Any]]) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """CLI: rank smart-money wallets, scan hot markets for convergence, log to
-    the SHADOW ledger, and optionally post per-trade P/L + portfolio to Discord.
+    """CLI: build a winners' roster, detect convergence, log to the SHADOW
+    ledger, and optionally post per-trade P/L + portfolio to Discord.
 
-    Full pipeline, READ-ONLY + SHADOW: ranks wallets from the public data-api,
-    derives candidate markets from recent trades, flags convergence, and logs
-    candidates. NO orders are ever placed.
+    Two roster sources, READ-ONLY + SHADOW (NO orders are ever placed):
+
+    * ``--roster-source leaderboard`` (default) — the roster is Polymarket's
+      HISTORICAL PROFIT LEADERBOARD (``/profit``, real winners). Convergence
+      then comes from what those winners CURRENTLY hold (each wallet's
+      ``/positions``) via :func:`convergence_from_positions`, NOT from a fixed
+      set of "hot" markets — an all-time legend may be dormant in today's hot
+      markets, so the only way to follow them is to read their live book.
+    * ``--roster-source live`` — the EXACT prior behavior: discover active
+      wallets from recent trades, rank them by realized PnL/win-rate, derive
+      hot candidate markets, and flag convergence on ``/holders``.
+
+    Both paths feed the same confidence + mark-to-market + ledger logging.
     """
     parser = argparse.ArgumentParser(
         description="SHADOW whale-convergence follower (logs candidates, places NO orders)."
     )
+    parser.add_argument("--roster-source", choices=("live", "leaderboard"),
+                        default="leaderboard",
+                        help="Where the winners' roster comes from: 'leaderboard' "
+                        "(default) ranks Polymarket's historical /profit leaderboard "
+                        "and detects convergence from those wallets' CURRENT "
+                        "/positions; 'live' discovers + ranks active wallets and "
+                        "scans hot markets via /holders (the prior behavior).")
+    parser.add_argument("--leaderboard-window", type=str, default="all",
+                        help="Profit-leaderboard window for --roster-source leaderboard: "
+                        "'all' (all-time, default) or '1d' (today). Other values return HTTP 400.")
+    parser.add_argument("--leaderboard-limit", type=int, default=100,
+                        help="How many top profit-leaderboard wallets to pull as the "
+                        "roster (default 100).")
     parser.add_argument("--min-convergence", type=int, default=3,
                         help="Min distinct target wallets on one outcome to flag (default 3).")
     parser.add_argument("--top-wallets", type=int, default=30,
@@ -471,7 +690,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     wallet_stats: Dict[str, Any] = {}
 
     def _rank_targets() -> List[str]:
-        """Rank smart-money wallets (bounded discovery + per-wallet positions)."""
+        """Build the winners' roster for the configured ``--roster-source``.
+
+        * ``leaderboard`` — pull the top profit-leaderboard wallets (real
+          historical winners). ``wallet_stats`` is left empty here; it is filled
+          per-scan by :func:`convergence_from_positions` from the SAME
+          ``/positions`` fetch used to detect convergence (no extra calls).
+        * ``live`` — discover + rank active wallets and capture their
+          :class:`WalletStats` for confidence scoring (the prior behavior).
+        """
+        if args.roster_source == "leaderboard":
+            rows = client.get_profit_leaderboard(
+                window=args.leaderboard_window,
+                limit=args.leaderboard_limit,
+            )
+            targets: List[str] = []
+            for row in rows:
+                wallet = row.get("proxyWallet") if isinstance(row, dict) else None
+                if wallet and wallet not in targets:
+                    targets.append(wallet)
+            # Stats come from convergence_from_positions per scan, not from here.
+            wallet_stats.clear()
+            print(
+                f"loaded {len(targets)} profit-leaderboard wallet(s) "
+                f"(window={args.leaderboard_window!r})"
+            )
+            return targets
+
         discovered = wallet_ranker.discover_active_wallets(
             client, pages=args.discover_pages
         )
@@ -521,17 +766,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
     def _scan(targets: Sequence[str]) -> None:
-        market_ids = _hot_markets()
-        run_once(
-            ledger=ledger,
-            client=client,
-            target_wallets=targets,
-            markets_condition_ids=market_ids,
-            min_convergence=args.min_convergence,
-            size_usd=args.size,
-            mark_entry=True,
-            wallet_stats=wallet_stats,
-        )
+        if args.roster_source == "leaderboard":
+            # Convergence comes from the roster's CURRENT positions (not hot
+            # markets). The same /positions fetch also yields per-wallet stats,
+            # so confidence gets real win-rates with no extra calls.
+            candidates, stats = convergence_from_positions(
+                client,
+                targets,
+                min_convergence=args.min_convergence,
+                return_stats=True,
+            )
+            wallet_stats.clear()
+            wallet_stats.update(stats)
+            run_once(
+                ledger=ledger,
+                client=client,
+                min_convergence=args.min_convergence,
+                size_usd=args.size,
+                mark_entry=True,
+                wallet_stats=wallet_stats,
+                candidates=candidates,
+            )
+        else:
+            market_ids = _hot_markets()
+            run_once(
+                ledger=ledger,
+                client=client,
+                target_wallets=targets,
+                markets_condition_ids=market_ids,
+                min_convergence=args.min_convergence,
+                size_usd=args.size,
+                mark_entry=True,
+                wallet_stats=wallet_stats,
+            )
         _report()
 
     # Single pass (default): rank once, scan once, report, done.
