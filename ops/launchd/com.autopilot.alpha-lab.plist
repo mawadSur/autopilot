@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  alpha_lab nightly cross-asset rank-IC miner.
+
+  Schedule: 05:00 UTC every day (StartCalendarInterval is interpreted in
+  the user's local timezone, NOT UTC. Adjust the Hour field below to match
+  your local offset to 05:00 UTC, or set TZ in EnvironmentVariables.)
+
+  Install:
+    cp ops/launchd/com.autopilot.alpha-lab.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.autopilot.alpha-lab.plist
+
+  Uninstall:
+    launchctl unload -w ~/Library/LaunchAgents/com.autopilot.alpha-lab.plist
+    rm ~/Library/LaunchAgents/com.autopilot.alpha-lab.plist
+
+  Logs:
+    ~/Library/Logs/autopilot/alpha-lab.stdout.log
+    ~/Library/Logs/autopilot/alpha-lab.stderr.log
+
+  This plist assumes the repo lives at /Users/mawad/Desktop/autopilot. Edit
+  WorkingDirectory + ProgramArguments paths to match your checkout.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.autopilot.alpha-lab</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mawad/Desktop/autopilot/.venv/bin/python</string>
+        <string>-m</string>
+        <string>alpha_lab.nightly_runner</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mawad/Desktop/autopilot</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/mawad/Desktop/autopilot/src</string>
+        <key>TZ</key>
+        <string>UTC</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>5</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mawad/Library/Logs/autopilot/alpha-lab.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/mawad/Library/Logs/autopilot/alpha-lab.stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>

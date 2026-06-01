@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional, ClassVar
 
 try:
@@ -19,13 +20,22 @@ except Exception:
 # before importing `cfg`, e.g. `TRADING_CAPITAL=20000 python src/backtest.py`.
 
 FEATURE_VERSION = "v2026-02-119"
+# Polymarket charges a maker/taker fee on each trade (2% as of 2026-Q2).
+# Used by ``risk_management_agent.risk_engine`` to discount the calibrated
+# edge before it feeds Kelly sizing. Expressed in basis points.
+POLYMARKET_FEE_BPS: int = 200
+_CONFIG_DIR = Path(__file__).resolve().parent
+_ENV_FILES = (
+    str(_CONFIG_DIR.parent / ".env"),
+    str(_CONFIG_DIR / ".env"),
+)
 
 
 class TradingConfig(BaseSettings):
     FEATURE_VERSION: ClassVar[str] = FEATURE_VERSION
     # Data / model
     data_dir: str = Field("eth_1m_data", env="DATA_DIR")
-    model_dir: str = Field("model", env="MODEL_DIR")
+    model_dir: str = Field("model_sanity", env="MODEL_DIR")
     window_size: Optional[int] = Field(None, env="WINDOW_SIZE")
     batch_size: int = Field(512, env="BATCH_SIZE")
     chunksize: int = Field(300_000, env="CHUNKSIZE")
@@ -84,16 +94,22 @@ class TradingConfig(BaseSettings):
     coindesk_market: str = Field("coinbase", env="COINDESK_WS_MARKET")
     coindesk_instrument: str = Field("ETH-USDT", env="COINDESK_WS_INSTRUMENT")
     coindesk_api_key: Optional[str] = Field(None, env="COINDESK_API_KEY")
+    gemini_api_key: Optional[str] = Field(None, env="GEMINI_API_KEY")
+    gemini_model: str = Field("gemini-2.5-flash", env="GEMINI_MODEL")
+    gemini_timeout_s: int = Field(30, env="GEMINI_TIMEOUT_S")
+    gemini_use_search_grounding: bool = Field(True, env="GEMINI_USE_SEARCH_GROUNDING")
 
     if _USE_PYDANTIC_SETTINGS and SettingsConfigDict is not None:
         model_config = SettingsConfigDict(
-            env_file=".env",
+            env_file=_ENV_FILES,
             env_file_encoding="utf-8",
+            extra="ignore",
         )
     else:
         class Config:
-            env_file = ".env"
+            env_file = _ENV_FILES
             env_file_encoding = "utf-8"
+            extra = "ignore"
 
 
 def load_config() -> TradingConfig:

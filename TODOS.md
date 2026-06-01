@@ -1,0 +1,116 @@
+# TODOS — Autopilot backlog
+
+Backlog of follow-on work, organized by category. Items are P0/P1/P2/P3 by priority. Closed items keep a ✅ DONE marker with the commit hash so the audit trail stays intact across the full project history.
+
+This file is human-mutable; agents read it but should not mutate it without operator authorization. See **How to use this file** at the bottom.
+
+Last updated: 2026-05-08 (post-Wave-1 + Lane D in flight + E4 regime memory partial).
+
+---
+
+## Lane D follow-ups (multi-symbol multiprocess supervisor)
+
+- **D2 Polymarket tradeable + supervisor wiring** — ✅ DONE (`0ac448d` adapter + `live_supervisor.py` wiring; 25 unit tests pass).
+  - Brief: `autopilot_lane_d_launch_briefs_2026_05_08.md` ("Sub-agent D2").
+  - Adds `PolymarketTradeable` adapter + `SupervisorConfig.tradeables` field so Polymarket binary markets tick alongside crypto symbols in the same loop.
+  - Closed 2026-05-30: adapter + `SupervisorConfig.tradeables` + `--polymarket-markets` CLI flag + the symbols-OR-tradeables config validation all landed and pass `tests.prediction_market_scanner.test_polymarket_tradeable` (25 tests OK). The 3 broker follow-ups in the adapter header (`get_balances` / limit+cancel orders / single-market `get_ticker`) are demoted to the P2 broker backlog — they are NOT part of D2 closure. D3 (multiprocessing-per-symbol) remains the open Lane D item.
+
+- **D3 multiprocessing-per-symbol supervisor refactor** — P1, ~3 engineering days, pending D2.
+  - Spawn one child process per Tradeable via `mp.get_context("spawn")`. Daily-close leader election via Redis SETNX. Crash respawn with 5s backoff, 3/hr cap.
+  - Needs the 60-second multi-process smoke test + Redis-shared shakedown verification.
+  - Highest-risk sub-agent of Lane D — must follow with a real-Redis multi-process smoke before push.
+
+- **CoinbaseExchange.get_product() helper** — P2.
+  - Today the CoinbaseTradeable adapter probes a few fee-tier paths and falls back to a 60bps taker assumption. Plumb a real `get_product(symbol)` method through to ccxt and surface tick_size + min_size + the live taker tier.
+  - Suggested next action: 1-day brief that adds `get_product()` to `src/exchanges/coinbase.py` and wires the adapter to it.
+
+- **Coinbase fee-tier query API** — P2.
+  - Same shape as above — Coinbase exposes a /fees endpoint that returns the operator's current 30-day-volume tier. Adapter currently hardcodes the public-tier 60bps taker; a query would let live PnL math reflect lower tiers automatically.
+
+- **Hyperliquid margin-tier estimator** — P2.
+  - HyperliquidTradeable.risk_attributes returns a placeholder margin_used_usd today. Pull the live tier from `clearinghouseState` so liquidation_price + margin_used reflect the actual maintenance margin.
+
+---
+
+## CEO roadmap (Phases 3-5)
+
+- **E2 cross-asset alpha lab** — P1, ~12-15d, needs eng-review.
+  - Walk-forward backtest harness across crypto + prediction-market datasets so new alpha hypotheses can be A/B tested cheaply.
+  - Suggested next action: write the eng-review brief; covers data sourcing, equity-curve aggregation, leakage isolation, and the minimum tests before live.
+
+- **E3 LLM strategy generation loop** — P1, ~10d.
+  - Build a feedback loop where Gemini proposes new feature definitions / position sizing tweaks based on the postmortem corpus, then those proposals are fed into E2's harness for backtesting before any human review.
+  - Adversarial guard: the LLM must propose with a structured "hypothesis + null + falsifier" frame, not raw "increase XYZ by N%".
+
+- **E4 regime memory** — ✅ DONE (predictor integration `54e3c1d`).
+  - `src/regime_memory/{store,lookup,backfill}.py` landed at `45d642c` / `107e96e` / `98d425d`. Integration into `predictor.py` landed at `54e3c1d` (see Closed note below). See `src/regime_memory/INTEGRATION.md`.
+  - Closed 2026-05-30: the real public API is `RegimeLookup.resolve_params()` (not `resolve()`), wired into `XGBoostPredictor._resolve_threshold()` — consulted from `predict_full()` and applied only when `_regime_confidence >= 0.5` — with a 232-line test file (`tests/prediction_market_scanner/test_predictor.py`; 51 predictor tests pass, regime-override + low-confidence/broken-store/mid-predict-raise fallbacks all covered). `MultiSymbolXGBoostPredictor.predict_full()` routes to the per-symbol predictor, so it inherits the integration. Remaining open sub-items are doc caveats only (encoder VERSION stamp in the `.npz` + RiskCalculator-side override per `INTEGRATION.md`); the path is inert until `REGIME_STORE_PATH` is set, and `optimal_threshold`/`regime_label` are still v0 synthetic heuristics — do not enable on weak evidence without a real per-symbol threshold sweep.
+
+- **P3 stocks adapter (Alpaca / IBKR)** — P2, depends on Lane D D1 + D2.
+  - Lane D ships the Tradeable Protocol; once that's stable, a Stocks adapter is a 2-day brief instead of a 2-week port. Lower priority than crypto + Polymarket because the legal review is heavier.
+
+---
+
+## Forensics swarm improvements
+
+- **A1 Mahalanobis live on real bundles** — P1.
+  - Trainer writes `feature_means` + `feature_stds` per fold (commit `906f843`) but the shipped `model_crypto/*/meta.json` files were trained before that change and lack the stats. Until a re-run lands, A1 still skips Mahalanobis on production bundles.
+  - Action: run `scripts/retrain_all_crypto_models.sh` (this commit). Validate the new meta.jsons populate the new fields. Re-spot-check A1's verdicts on a few real losses.
+
+- **Verdict-ladder cluster-tier promotion** — ✅ DONE (`c2fb9a4` + `c91282b`).
+  - A5 ProcessIntegrity promotes contributing → primary when the error counter ≥ 15.
+  - A4 ContextForensics promotes contributing → primary when ≥ 10 in-window news headlines cluster.
+
+- **Twitter/X sentiment** — P2, scaffold landed at `317de79`, needs API keys + wiring.
+  - The scaffold is a no-op fetcher with the documented `X_API_BEARER_TOKEN` env var. Once an account is provisioned, add the live fetch path + tests + a single context-forensics integration test that proves the wiring.
+
+- **Position metadata structuring** — ✅ DONE (`af9cdbe`).
+  - `Position.partial_fills` / `rejection_reason` / `stop_trigger_price` populated by the supervisor. A2 ExecutionForensics prefers structured fields, falls back to notes scan for legacy snapshots.
+
+- **Breaker snapshot canonical fields** — ✅ DONE (`8d8fd53`).
+  - `kill_switch_reason` / `stop_loss_trigger_price` / `breaker_decision` populated. A5 prefers structured, falls back to notes scan.
+
+- **Predictor surface extension** — ✅ DONE (`9518192`).
+  - `PredictorResult` now exposes `feature_buffer` + `model_probs`; `predict_full()` is the rich path; `model_meta` accessor unblocks Mahalanobis once retrain lands.
+
+---
+
+## Operational hardening
+
+- **Real-Redis multiprocessing smoke test** — P1, needs real infra.
+  - Today's D3 acceptance test uses `fakeredis`. A 60-second smoke against a real Redis (and a real Coinbase REST stub) is the gate before D3 lands on `main`.
+  - Suggested next action: ops-time brief — spin up local Redis, run 3 children for 60s, assert 15 ticks recorded + clean shutdown + shakedown counter increments exactly once per symbol.
+
+- **Real training run on 3 crypto datasets** — P1.
+  - See `scripts/retrain_all_crypto_models.sh` (this commit). Estimated runtime ~30-60 min on developer machine.
+  - Action: operator runs `chmod +x scripts/retrain_all_crypto_models.sh && bash scripts/retrain_all_crypto_models.sh`. Validates AUC + reliability_slope + feature_means/feature_stds populated y/n. Commit the regenerated `model_crypto/*/meta.json` if numbers look sane.
+
+- **Grafana dashboard JSON deploy** — P2.
+  - See `observability/grafana_dashboard.json` (this commit). v0 — 8 panels covering tick duration, model confidence, order latency, daily PnL by symbol, shakedown clean-days, kill switch / auto-trip / auto-pause, reconciliation health, open positions.
+  - Action: operator imports via `grafana-cli` or the dashboard import UI. Adjust target queries / data source after import (the dashboard ships with `prometheus` as default but is environment-agnostic).
+
+- **Operator dry-run with `--auto-pause-enabled`** — P1, needs real session.
+  - Required pre-flight before live promotion. Run the supervisor in paper mode for ≥1 UTC day with `--auto-pause-enabled --auto-pause-loss-pct 0.02 --auto-pause-confidence-window 200 --auto-pause-confidence-sigma 2.0`. Confirm the marker file appears + clears as expected.
+
+- **Audit-trail wart on `5ffbb91`** — P3.
+  - The commit message of `5ffbb91` says "Lane E: loss-postmortem integration tests" but the actual diff is W1C Task 1 — auto-pause + confidence-history CLI wiring (3 files, +318 lines on `live_supervisor.py` and 2 test files). Cause: a staging race during W1A's first commit attempt.
+  - The actual Lane E integration tests + 5 simulated-loss fixtures landed at `b8ed10b`.
+  - Cannot be cleanly rebased per harness restriction (no `git rebase -i`); branch is already pushed. Documented in this round's README "Commit history notes" subsection.
+
+---
+
+## Documentation
+
+- **README mention of retrain script** — ✅ DONE (this commit, "Operational tools" section).
+- **README mention of Grafana dashboard import path** — ✅ DONE (this commit, "Operational tools" section).
+- **README "Commit history notes" subsection** — ✅ DONE (this commit, points archaeologists at `5ffbb91` vs `b8ed10b`).
+
+---
+
+## How to use this file
+
+- **Humans mutate; agents read.** Agents may reference this file for context but should not edit without operator authorization (call it out in the brief if a backlog item is being closed).
+- **Closed items stay** with a ✅ DONE marker + commit hash. We don't delete them — the audit trail is more useful than a clean file.
+- **Priorities** are P0 (drop everything) / P1 (next sprint) / P2 (this quarter) / P3 (eventually). Re-rank during the weekly retro; don't bikeshed mid-week.
+- **Each entry** carries a "what / why / suggested next action" body. If you can't write the next action concisely, the item probably needs a brief, not a TODO.
+- **When in doubt, link the brief.** Memory files under `~/.claude/projects/-Users-mawad-Desktop-autopilot/memory/` are the source of truth for round-by-round briefs; this file is the rolling backlog index.

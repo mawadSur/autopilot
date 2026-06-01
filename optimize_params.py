@@ -18,7 +18,7 @@ from utils import read_csv_concat_sorted, compute_features, build_windows, load_
 from backtest import apply_gating, simulate_trades_with_tp_sl
 
 DATA_DIR = "eth_1m_data"
-MODEL_DIR = "model"
+MODEL_DIR = "model_sanity"
 
 SEARCH = {
     "thr_long": [0.70, 0.75, 0.80],

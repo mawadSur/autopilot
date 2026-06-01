@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  E3 LLM Strategy-Gen weekly retrain trigger.
+
+  Schedule: Sunday 06:00 UTC (Weekday=0 in launchd = Sunday).
+
+  IMPORTANT: this job invokes the WeeklyJob orchestrator which by default
+  runs in dry-run mode (PROpener does not actually create PRs). Before
+  enabling --no-dry-run, you MUST also:
+    1. Provision Docker sandboxing for E3 LLM-proposed code (roadmap #8).
+    2. Replace the SHA256 stub BacktestRunner with real walk-forward
+       retrain (roadmap #9).
+    3. Provide a real gh_runner via make_subprocess_gh_runner() (already
+       implemented in pr_opener; pass through env or a deploy wrapper).
+  Otherwise this job will fail-safe to dry-run and the operator gets a
+  weekly log digest without code being written or PRs being opened.
+
+  Install:
+    cp ops/launchd/com.autopilot.e3-weekly.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.autopilot.e3-weekly.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.autopilot.e3-weekly</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mawad/Desktop/autopilot/.venv/bin/python</string>
+        <string>-m</string>
+        <string>llm_strategy_gen.weekly_job</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mawad/Desktop/autopilot</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/mawad/Desktop/autopilot/src</string>
+        <key>TZ</key>
+        <string>UTC</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mawad/Library/Logs/autopilot/e3-weekly.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/mawad/Library/Logs/autopilot/e3-weekly.stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
