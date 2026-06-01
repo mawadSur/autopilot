@@ -529,10 +529,12 @@ class ConvergenceFromPositionsTest(unittest.TestCase):
         self.assertEqual(cand["outcome"], "Yes")
         self.assertEqual(cand["n_target_holders"], 2)
         self.assertEqual(set(cand["wallets"]), {"0xT1", "0xT2"})
-        # Candidate shape matches find_convergence exactly.
+        # Candidate shape is the find_convergence shape plus a ``title`` (carried
+        # from /positions so the do-not-trade blocklist can match on it).
         self.assertEqual(
             set(cand),
-            {"conditionId", "outcomeIndex", "outcome", "n_target_holders", "wallets"},
+            {"conditionId", "outcomeIndex", "outcome", "title",
+             "n_target_holders", "wallets"},
         )
 
     def test_resolved_and_redeemable_positions_excluded(self) -> None:

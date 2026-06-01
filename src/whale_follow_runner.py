@@ -58,6 +58,18 @@ except Exception:  # pragma: no cover - import shim for alternate layouts.
         class PolymarketDataAPIError(Exception):  # type: ignore
             """Fallback when the data-api client cannot be imported."""
 
+try:  # Flat import under PYTHONPATH=src (matches the rest of the stack).
+    from trade_blocklist import blocked_term, load_blocklist
+except Exception:  # pragma: no cover - import shim for alternate layouts.
+    try:
+        from src.trade_blocklist import blocked_term, load_blocklist  # type: ignore
+    except Exception:  # pragma: no cover - degrade to no blocklist if missing.
+        def blocked_term(text, terms):  # type: ignore
+            return None
+
+        def load_blocklist(*_a, **_k):  # type: ignore
+            return []
+
 
 __all__ = [
     "STRATEGY",
@@ -280,10 +292,16 @@ def convergence_from_positions(
             seen_keys.add(key)
             bucket = per_market_outcome.setdefault(
                 key,
-                {"outcome": position.get("outcome"), "wallets": {}},
+                {
+                    "outcome": position.get("outcome"),
+                    "title": position.get("title"),
+                    "wallets": {},
+                },
             )
             if bucket["outcome"] is None:
                 bucket["outcome"] = position.get("outcome")
+            if not bucket.get("title"):
+                bucket["title"] = position.get("title")
             bucket["wallets"][wallet] = None  # ordered distinct set.
 
     candidates: List[Dict[str, Any]] = []
@@ -295,6 +313,7 @@ def convergence_from_positions(
                     "conditionId": condition_id,
                     "outcomeIndex": outcome_index,
                     "outcome": bucket["outcome"],
+                    "title": bucket.get("title"),
                     "n_target_holders": len(wallets),
                     "wallets": wallets,
                 }
@@ -435,8 +454,10 @@ def _log_candidates(
     mark_entry: bool = False,
     wallet_stats: Optional[Dict[str, Any]] = None,
     wallet_quality: Optional[Dict[str, float]] = None,
+    blocklist: Optional[Sequence[str]] = None,
+    dedup: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Score + log a list of convergence candidates to the SHADOW ledger.
+    """Score + log convergence candidates to the SHADOW ledger.
 
     Shared back-end for both runner modes: the live ``/holders`` path
     (:func:`run_once` -> :func:`find_convergence`) and the leaderboard
@@ -445,12 +466,32 @@ def _log_candidates(
     entry pricing, ``TradeRecord`` construction, and notes are written in
     exactly one place — never duplicated.
 
-    For each candidate: compute confidence from the converging wallets' settled
-    win-rates (``wallet_stats``), optionally fetch a real decision-time entry
-    price (``mark_entry``), and append an OPEN :class:`TradeRecord`. NO orders
-    are placed — the client is read-only. Mutates each candidate in place with
-    ``confidence`` / ``confidence_label`` and returns the same list.
+    Two filters apply BEFORE logging:
+      * ``blocklist`` — operator do-not-trade terms (alcohol/casino/adult, etc.).
+        A candidate whose title/outcome matches is skipped (and counted, never
+        silently). Marked ``cand['blocked']=<term>``.
+      * ``dedup`` (default True) — never log a SECOND open position for a
+        ``(market, outcome)`` that already has one open in the ledger, so an
+        every-30-min loop doesn't pile up duplicates of the same convergence.
+        Marked ``cand['skipped']='duplicate_open'``.
+
+    For each surviving candidate: compute confidence, optionally fetch a real
+    decision-time entry price (``mark_entry``), and append an OPEN
+    :class:`TradeRecord`. NO orders are placed — the client is read-only.
+    Returns only the candidates actually LOGGED.
     """
+    existing_open = set()
+    if dedup:
+        try:
+            existing_open = {
+                (r.market_id, r.side) for r in ledger.open_positions()
+            }
+        except Exception:  # pragma: no cover - never let a read break logging.
+            existing_open = set()
+
+    logged: List[Dict[str, Any]] = []
+    n_blocked = 0
+    n_dup = 0
     for cand in candidates:
         outcome_label = cand.get("outcome")
         side = str(outcome_label) if outcome_label is not None else str(
@@ -459,6 +500,25 @@ def _log_candidates(
         wallets = cand.get("wallets") or []
         condition_id = str(cand.get("conditionId"))
         outcome_index = cand.get("outcomeIndex")
+
+        # Do-not-trade blocklist (operator policy): skip blocked topics. Matched
+        # against the market title + outcome label (title present in leaderboard
+        # mode via convergence_from_positions).
+        if blocklist:
+            match = blocked_term(
+                f"{cand.get('title') or ''} {outcome_label or ''}", blocklist
+            )
+            if match:
+                cand["blocked"] = match
+                n_blocked += 1
+                continue
+
+        # Dedup: one open position per (market, outcome) — no per-scan pile-up.
+        key = (condition_id, side)
+        if dedup and key in existing_open:
+            cand["skipped"] = "duplicate_open"
+            n_dup += 1
+            continue
 
         # Confidence = how many smart-money wallets converged x how good they
         # are. Quality is profit-leaderboard rank when available (leaderboard
@@ -523,9 +583,16 @@ def _log_candidates(
             notes=notes,
         )
         ledger.append(record)
+        existing_open.add(key)
+        logged.append(cand)
 
-    _print_summary(candidates)
-    return candidates
+    _print_summary(logged)
+    if n_blocked or n_dup:
+        print(
+            f"  (skipped {n_dup} already-open duplicate(s); "
+            f"blocked {n_blocked} do-not-trade market(s))"
+        )
+    return logged
 
 
 def run_once(
@@ -539,6 +606,8 @@ def run_once(
     mark_entry: bool = False,
     wallet_stats: Optional[Dict[str, Any]] = None,
     wallet_quality: Optional[Dict[str, float]] = None,
+    blocklist: Optional[Sequence[str]] = None,
+    dedup: bool = True,
     candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Run one convergence scan and log each candidate to the SHADOW ledger.
@@ -606,6 +675,8 @@ def run_once(
         mark_entry=mark_entry,
         wallet_stats=wallet_stats,
         wallet_quality=wallet_quality,
+        blocklist=blocklist,
+        dedup=dedup,
     )
 
 
@@ -711,9 +782,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="In loop mode, re-rank smart-money wallets every N scans "
                         "(default 48); wallets are cached between re-ranks to avoid "
                         "hammering the per-wallet /positions calls.")
+    parser.add_argument("--blocklist-file", type=str, default=None,
+                        help="Path to an extra do-not-trade list (one term per line, "
+                        "# comments ok). Added on top of the built-in alcohol / "
+                        "casino / adult defaults.")
+    parser.add_argument("--no-blocklist", action="store_true",
+                        help="Disable the do-not-trade blocklist entirely.")
+    parser.add_argument("--no-dedup", action="store_true",
+                        help="Disable dedup (allow re-logging a convergence that "
+                        "already has an open position). Default keeps one per market.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    # Do-not-trade blocklist (operator policy): built-in alcohol/casino/adult
+    # defaults plus any --blocklist-file terms. Empty when --no-blocklist.
+    blocklist = (
+        []
+        if args.no_blocklist
+        else load_blocklist(args.blocklist_file)
+    )
+    dedup = not args.no_dedup
+    if blocklist:
+        print(f"do-not-trade blocklist active: {len(blocklist)} term(s)")
 
     # Local imports keep the module importable without the data-api/ranker in
     # minimal/test environments (the unit tests inject fakes instead).
@@ -839,6 +930,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 mark_entry=True,
                 wallet_stats=wallet_stats,
                 wallet_quality=wallet_quality,
+                blocklist=blocklist,
+                dedup=dedup,
                 candidates=candidates,
             )
         else:
@@ -852,6 +945,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 size_usd=args.size,
                 mark_entry=True,
                 wallet_stats=wallet_stats,
+                blocklist=blocklist,
+                dedup=dedup,
             )
         _report()
 
