@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SHADOW · Whale-Follow Dashboard</title>
+<style>
+  :root {
+    --bg:        #0b0e14;
+    --bg-2:      #121722;
+    --panel:     #161c28;
+    --panel-2:   #1c2433;
+    --line:      #232c3d;
+    --text:      #e6ebf3;
+    --muted:     #8a97ad;
+    --faint:     #5a6679;
+    --green:     #2ee6a6;
+    --green-dim: #1f9c74;
+    --red:       #ff5d6c;
+    --amber:     #ffb454;
+    --teal:      #3ad6c8;
+    --orange:    #ff8a3d;
+    --grey:      #6b7588;
+    --accent:    #6ea8ff;
+    --shadow:    0 8px 30px rgba(0,0,0,.35);
+    --radius:    14px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 80% -10%, #15203a 0%, transparent 55%),
+      radial-gradient(900px 500px at -10% 0%, #161227 0%, transparent 50%),
+      var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    padding: 22px clamp(14px, 3vw, 40px) 60px;
+  }
+  .mono {
+    font-family: "SF Mono", "JetBrains Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.2px;
+  }
+
+  /* ---------- Header ---------- */
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    flex-wrap: wrap; gap: 12px; margin-bottom: 22px;
+  }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .brand h1 {
+    font-size: 19px; margin: 0; font-weight: 650; letter-spacing: .3px;
+  }
+  .brand .sub { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .shadow-badge {
+    display: inline-flex; align-items: center; gap: 7px;
+    background: linear-gradient(180deg, #2a1d14, #241813);
+    color: var(--amber); border: 1px solid #4a3320;
+    padding: 7px 13px; border-radius: 999px; font-size: 12px; font-weight: 600;
+    letter-spacing: .4px;
+  }
+  .shadow-badge .dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--amber);
+    box-shadow: 0 0 0 0 rgba(255,180,84,.7); animation: pulse 2.2s infinite;
+  }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(255,180,84,.6); }
+    70%  { box-shadow: 0 0 0 9px rgba(255,180,84,0); }
+    100% { box-shadow: 0 0 0 0 rgba(255,180,84,0); }
+  }
+  .updated { color: var(--faint); font-size: 12px; }
+  .updated b { color: var(--muted); font-weight: 600; }
+
+  /* ---------- KPI row ---------- */
+  .kpis {
+    display: grid; gap: 14px; margin-bottom: 18px;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  }
+  .kpi {
+    background: linear-gradient(180deg, var(--panel), var(--bg-2));
+    border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 16px 18px; box-shadow: var(--shadow); position: relative; overflow: hidden;
+  }
+  .kpi .label { color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .5px; text-transform: uppercase; }
+  .kpi .value { font-size: 28px; font-weight: 680; margin-top: 8px; transition: color .4s ease; }
+  .kpi .meta { color: var(--faint); font-size: 12px; margin-top: 4px; }
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  .kpi.flash::after {
+    content: ""; position: absolute; inset: 0; border-radius: var(--radius);
+    background: var(--accent); opacity: .14; animation: flashfade .8s ease forwards;
+    pointer-events: none;
+  }
+  @keyframes flashfade { from { opacity: .18; } to { opacity: 0; } }
+
+  /* ---------- Layout ---------- */
+  .grid {
+    display: grid; gap: 16px;
+    grid-template-columns: 1.55fr 1fr;
+  }
+  @media (max-width: 920px) { .grid { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: linear-gradient(180deg, var(--panel), var(--bg-2));
+    border: 1px solid var(--line); border-radius: var(--radius);
+    box-shadow: var(--shadow); padding: 16px 18px; min-width: 0;
+  }
+  .panel h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: .6px;
+    color: var(--muted); margin: 0 0 12px; font-weight: 650;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .panel h2 .count {
+    color: var(--faint); font-weight: 600; font-size: 12px;
+    background: var(--panel-2); border: 1px solid var(--line);
+    padding: 2px 8px; border-radius: 999px;
+  }
+
+  /* ---------- Equity chart ---------- */
+  #chartWrap { position: relative; }
+  canvas { width: 100%; display: block; }
+  .chart-empty {
+    color: var(--faint); font-size: 13px; text-align: center; padding: 40px 0;
+  }
+
+  /* ---------- Open position cards ---------- */
+  .cards { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); }
+  .card {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 11px;
+    padding: 12px 13px; animation: fadein .5s ease; min-width: 0;
+  }
+  @keyframes fadein { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .card .title { font-size: 13.5px; font-weight: 620; word-break: break-word; }
+  .card .row2 { display: flex; align-items: center; justify-content: space-between; margin-top: 9px; gap: 8px; }
+  .card .side { color: var(--muted); font-size: 12px; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .entry { color: var(--text); font-size: 12.5px; }
+  .pill {
+    display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .3px;
+    padding: 3px 9px; border-radius: 999px; margin-top: 10px; text-transform: uppercase;
+  }
+  .pill.low    { background: #2a2f3a; color: var(--grey);  border: 1px solid #39414f; }
+  .pill.medium { background: #2e2410; color: var(--amber); border: 1px solid #4a3a18; }
+  .pill.high   { background: #0f2c22; color: var(--green); border: 1px solid #1c4d3c; }
+  .pill.none   { background: #232a36; color: var(--faint); border: 1px solid var(--line); }
+
+  /* ---------- Exit feed ---------- */
+  .feed { display: flex; flex-direction: column; gap: 8px; max-height: 360px; overflow-y: auto; padding-right: 4px; }
+  .feed-item {
+    display: flex; align-items: center; gap: 10px;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
+    padding: 9px 11px; animation: slidein .45s ease;
+  }
+  @keyframes slidein { from { opacity: 0; transform: translateX(14px); } to { opacity: 1; transform: none; } }
+  .chip {
+    font-size: 10.5px; font-weight: 800; letter-spacing: .4px; padding: 3px 8px;
+    border-radius: 6px; white-space: nowrap; text-transform: uppercase;
+  }
+  .chip.won  { background: #0f2c22; color: var(--green); }
+  .chip.lost { background: #2c1318; color: var(--red); }
+  .chip.take_profit { background: #0f2a2a; color: var(--teal); }
+  .chip.stop_loss   { background: #2c1d10; color: var(--orange); }
+  .feed-item .fi-title { flex: 1; font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .feed-item .fi-pnl { font-weight: 700; font-size: 13px; }
+
+  /* ---------- Exit mix bars ---------- */
+  .mix { display: flex; flex-direction: column; gap: 9px; }
+  .mix-row { display: grid; grid-template-columns: 92px 1fr 34px; align-items: center; gap: 10px; }
+  .mix-row .name { font-size: 12px; color: var(--muted); text-transform: capitalize; }
+  .mix-row .track { height: 10px; background: var(--panel-2); border-radius: 6px; overflow: hidden; border: 1px solid var(--line); }
+  .mix-row .fill { height: 100%; border-radius: 6px; width: 0; transition: width .6s cubic-bezier(.2,.7,.3,1); }
+  .mix-row .num { font-size: 12.5px; color: var(--text); text-align: right; }
+  .fill.won  { background: linear-gradient(90deg, var(--green-dim), var(--green)); }
+  .fill.lost { background: var(--red); }
+  .fill.take_profit { background: var(--teal); }
+  .fill.stop_loss   { background: var(--orange); }
+  .fill.other { background: var(--accent); }
+
+  .empty { color: var(--faint); font-size: 13px; padding: 14px 2px; }
+  .stack { display: flex; flex-direction: column; gap: 16px; }
+
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: #2a3344; border-radius: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div>
+        <h1>Whale-Follow <span style="color:var(--accent)">SHADOW</span></h1>
+        <div class="sub">Read-only realized track record · polls every 4s</div>
+      </div>
+    </div>
+    <div style="display:flex; align-items:center; gap:16px;">
+      <span class="shadow-badge"><span class="dot"></span>SHADOW — no real money</span>
+      <span class="updated">updated <b id="updated">—</b></span>
+    </div>
+  </header>
+
+  <section class="kpis" id="kpis">
+    <div class="kpi" id="kpi-equity">
+      <div class="label">Equity</div>
+      <div class="value mono" id="v-equity">$—</div>
+      <div class="meta" id="m-equity">bankroll $—</div>
+    </div>
+    <div class="kpi" id="kpi-realized">
+      <div class="label">Realized P/L</div>
+      <div class="value mono" id="v-realized">$—</div>
+      <div class="meta" id="m-realized">net of fees</div>
+    </div>
+    <div class="kpi" id="kpi-winrate">
+      <div class="label">Win rate</div>
+      <div class="value mono" id="v-winrate">—%</div>
+      <div class="meta" id="m-winrate">of settled</div>
+    </div>
+    <div class="kpi" id="kpi-counts">
+      <div class="label">Open / Settled</div>
+      <div class="value mono" id="v-counts">— / —</div>
+      <div class="meta" id="m-counts">fees $—</div>
+    </div>
+  </section>
+
+  <div class="grid">
+    <div class="stack">
+      <div class="panel" id="chartPanel">
+        <h2>Realized equity <span class="count mono" id="eq-last">$—</span></h2>
+        <div id="chartWrap">
+          <canvas id="equity" height="260"></canvas>
+          <div class="chart-empty" id="chart-empty" style="display:none">No settled trades yet — the equity curve appears once positions resolve.</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Open positions <span class="count" id="open-count">0</span></h2>
+        <div class="cards" id="open-cards"></div>
+        <div class="empty" id="open-empty" style="display:none">No open positions.</div>
+      </div>
+    </div>
+
+    <div class="stack">
+      <div class="panel">
+        <h2>Exit feed <span class="count" id="feed-count">0</span></h2>
+        <div class="feed" id="feed"></div>
+        <div class="empty" id="feed-empty" style="display:none">No closed positions yet.</div>
+      </div>
+
+      <div class="panel">
+        <h2>Exit mix</h2>
+        <div class="mix" id="mix"></div>
+        <div class="empty" id="mix-empty" style="display:none">Nothing settled yet.</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+"use strict";
+
+const POLL_MS = 4000;
+
+// ---- formatting helpers ----
+const fmtUsd = (v, signed) => {
+  if (v === null || v === undefined || Number.isNaN(v)) return "$—";
+  const s = (signed && v >= 0) ? "+" : (v < 0 ? "-" : "");
+  return s + "$" + Math.abs(v).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+};
+const fmtPct = (v) => (v === null || v === undefined || Number.isNaN(v)) ? "—%" : (v * 100).toFixed(1) + "%";
+const clsSign = (v) => v >= 0 ? "pos" : "neg";
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, c => (
+  {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]
+));
+const shortTime = (iso) => {
+  if (!iso || iso === "start") return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  return d.toLocaleString(undefined, {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"});
+};
+
+// ---- animated count-up for the equity KPI ----
+const animState = {};
+function animateNumber(key, el, target, render) {
+  const prev = animState[key];
+  if (prev === undefined) { animState[key] = target; el.textContent = render(target); return; }
+  if (prev === target) { el.textContent = render(target); return; }
+  const from = prev, to = target, start = performance.now(), dur = 650;
+  function step(now) {
+    const t = Math.min(1, (now - start) / dur);
+    const eased = 1 - Math.pow(1 - t, 3);
+    const cur = from + (to - from) * eased;
+    el.textContent = render(cur);
+    if (t < 1) requestAnimationFrame(step); else animState[key] = to;
+  }
+  animState[key] = to;
+  requestAnimationFrame(step);
+}
+
+function flash(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash");
+}
+
+// ---- KPI render ----
+let lastSummaryKey = null;
+function renderKpis(s) {
+  const eqEl = document.getElementById("v-equity");
+  animateNumber("equity", eqEl, s.equity_usd, (v) => fmtUsd(v, false));
+  document.getElementById("m-equity").textContent = "bankroll " + fmtUsd(s.bankroll_usd, false);
+
+  const rl = document.getElementById("v-realized");
+  animateNumber("realized", rl, s.realized_pnl_usd, (v) => fmtUsd(v, true));
+  rl.className = "value mono " + clsSign(s.realized_pnl_usd);
+
+  const wr = document.getElementById("v-winrate");
+  animateNumber("winrate", wr, s.win_rate, (v) => (v * 100).toFixed(1) + "%");
+
+  document.getElementById("v-counts").textContent = s.n_open + " / " + s.n_settled;
+  document.getElementById("m-counts").textContent = "fees " + fmtUsd(s.total_fees_usd, false);
+
+  const key = JSON.stringify([s.equity_usd, s.realized_pnl_usd, s.n_open, s.n_settled]);
+  if (lastSummaryKey !== null && key !== lastSummaryKey) {
+    flash("kpi-equity"); flash("kpi-realized"); flash("kpi-counts");
+  }
+  lastSummaryKey = key;
+}
+
+// ---- hand-rolled canvas line chart with draw animation ----
+const canvas = document.getElementById("equity");
+const ctx = canvas.getContext("2d");
+let chartAnim = null;
+let lastCurveKey = null;
+
+function drawChart(curve, progress) {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 600;
+  const cssH = 260;
+  canvas.width = cssW * dpr; canvas.height = cssH * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  if (!curve || curve.length < 2) return;
+
+  const padL = 56, padR = 14, padT = 14, padB = 26;
+  const w = cssW - padL - padR, h = cssH - padT - padB;
+  const ys = curve.map(p => p.equity);
+  let min = Math.min(...ys), max = Math.max(...ys);
+  if (min === max) { min -= 1; max += 1; }
+  const span = max - min;
+  min -= span * 0.08; max += span * 0.08;
+
+  const x = (i) => padL + (w * i) / (curve.length - 1);
+  const y = (v) => padT + h - (h * (v - min)) / (max - min);
+
+  // gridlines + y labels
+  ctx.strokeStyle = "#1e2735"; ctx.lineWidth = 1;
+  ctx.fillStyle = "#5a6679"; ctx.font = "11px ui-monospace, monospace"; ctx.textAlign = "right";
+  const rows = 4;
+  for (let r = 0; r <= rows; r++) {
+    const v = min + ((max - min) * r) / rows;
+    const yy = y(v);
+    ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(cssW - padR, yy); ctx.stroke();
+    ctx.fillText("$" + v.toFixed(0), padL - 8, yy + 3);
+  }
+
+  // baseline (bankroll = first point) as a dashed reference
+  const base = curve[0].equity;
+  ctx.save();
+  ctx.setLineDash([4, 4]); ctx.strokeStyle = "#33405a"; ctx.beginPath();
+  ctx.moveTo(padL, y(base)); ctx.lineTo(cssW - padR, y(base)); ctx.stroke();
+  ctx.restore();
+
+  // how many segments to draw (animation)
+  const total = curve.length - 1;
+  const shown = Math.max(1, Math.floor(total * progress));
+  const frac = (total * progress) - shown;
+
+  const last = curve[curve.length - 1].equity;
+  const lineColor = last >= base ? "#2ee6a6" : "#ff5d6c";
+
+  // area fill under the (drawn portion of the) line
+  ctx.beginPath();
+  ctx.moveTo(x(0), y(curve[0].equity));
+  for (let i = 1; i <= shown; i++) ctx.lineTo(x(i), y(curve[i].equity));
+  let endX = x(shown), endY = y(curve[shown] ? curve[shown].equity : curve[shown - 1].equity);
+  if (frac > 0 && shown < total) {
+    const a = curve[shown], b = curve[shown + 1];
+    endX = x(shown) + (x(shown + 1) - x(shown)) * frac;
+    endY = y(a.equity + (b.equity - a.equity) * frac);
+    ctx.lineTo(endX, endY);
+  }
+  const grad = ctx.createLinearGradient(0, padT, 0, padT + h);
+  grad.addColorStop(0, last >= base ? "rgba(46,230,166,.22)" : "rgba(255,93,108,.22)");
+  grad.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.lineTo(endX, padT + h); ctx.lineTo(x(0), padT + h); ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+
+  // the line itself
+  ctx.beginPath();
+  ctx.moveTo(x(0), y(curve[0].equity));
+  for (let i = 1; i <= shown; i++) ctx.lineTo(x(i), y(curve[i].equity));
+  if (frac > 0 && shown < total) ctx.lineTo(endX, endY);
+  ctx.strokeStyle = lineColor; ctx.lineWidth = 2.2; ctx.lineJoin = "round";
+  ctx.shadowColor = lineColor; ctx.shadowBlur = 8; ctx.stroke(); ctx.shadowBlur = 0;
+
+  // last-value dot + label (only once fully drawn)
+  if (progress >= 1) {
+    ctx.beginPath(); ctx.arc(x(total), y(last), 3.4, 0, Math.PI * 2);
+    ctx.fillStyle = lineColor; ctx.fill();
+    ctx.fillStyle = "#e6ebf3"; ctx.textAlign = "right"; ctx.font = "12px ui-monospace, monospace";
+    const lbl = "$" + last.toFixed(2);
+    const ly = Math.min(Math.max(y(last) - 8, padT + 10), padT + h - 4);
+    ctx.fillText(lbl, cssW - padR, ly);
+  }
+}
+
+function animateChart(curve) {
+  if (chartAnim) cancelAnimationFrame(chartAnim);
+  const start = performance.now(), dur = 750;
+  function step(now) {
+    const p = Math.min(1, (now - start) / dur);
+    drawChart(curve, p);
+    if (p < 1) chartAnim = requestAnimationFrame(step); else chartAnim = null;
+  }
+  chartAnim = requestAnimationFrame(step);
+}
+
+function renderChart(curve) {
+  const empty = document.getElementById("chart-empty");
+  const lastEl = document.getElementById("eq-last");
+  if (!curve || curve.length < 2) {
+    empty.style.display = "block"; canvas.style.display = "none";
+    lastEl.textContent = curve && curve.length ? fmtUsd(curve[curve.length - 1].equity, false) : "$—";
+    return;
+  }
+  empty.style.display = "none"; canvas.style.display = "block";
+  lastEl.textContent = fmtUsd(curve[curve.length - 1].equity, false);
+  const key = JSON.stringify(curve.map(p => [p.t, Math.round(p.equity * 100)]));
+  if (key !== lastCurveKey) { animateChart(curve); lastCurveKey = key; }
+  else drawChart(curve, 1);
+}
+
+// ---- open positions ----
+function confClass(c) {
+  if (!c || !c.label) return "none";
+  if (["low","medium","high"].includes(c.label)) return c.label;
+  return "none";
+}
+function renderOpen(list) {
+  const wrap = document.getElementById("open-cards");
+  const empty = document.getElementById("open-empty");
+  document.getElementById("open-count").textContent = list.length;
+  if (!list.length) { wrap.innerHTML = ""; empty.style.display = "block"; return; }
+  empty.style.display = "none";
+  wrap.innerHTML = list.map(p => {
+    const c = p.confidence;
+    const cls = confClass(c);
+    const pillText = c ? (c.label + " · " + Number(c.score).toFixed(2)) : "no conf";
+    const entry = (p.entry_price === null || p.entry_price === undefined)
+      ? "—" : "$" + Number(p.entry_price).toFixed(3);
+    return `<div class="card">
+      <div class="title">${esc(p.title)}</div>
+      <div class="row2">
+        <span class="side">${esc(p.side)}</span>
+        <span class="entry mono">entry ${entry}</span>
+      </div>
+      <span class="pill ${cls}">${esc(pillText)}</span>
+    </div>`;
+  }).join("");
+}
+
+// ---- exit feed ----
+function chipClass(reason) {
+  if (["won","lost","take_profit","stop_loss"].includes(reason)) return reason;
+  return "won";
+}
+function chipText(reason) {
+  return { won:"WON", lost:"LOST", take_profit:"TAKE-PROFIT", stop_loss:"STOP-LOSS" }[reason]
+    || String(reason).toUpperCase();
+}
+function renderFeed(list) {
+  const wrap = document.getElementById("feed");
+  const empty = document.getElementById("feed-empty");
+  document.getElementById("feed-count").textContent = list.length;
+  if (!list.length) { wrap.innerHTML = ""; empty.style.display = "block"; return; }
+  empty.style.display = "none";
+  wrap.innerHTML = list.map(p => {
+    const reason = p.reason || "won";
+    const pnl = Number(p.realized_pnl_usd || 0);
+    return `<div class="feed-item">
+      <span class="chip ${chipClass(reason)}">${chipText(reason)}</span>
+      <span class="fi-title" title="${esc(p.title)} · ${shortTime(p.exit_ts_utc)}">${esc(p.title)}</span>
+      <span class="fi-pnl mono ${clsSign(pnl)}">${fmtUsd(pnl, true)}</span>
+    </div>`;
+  }).join("");
+}
+
+// ---- exit mix ----
+const MIX_ORDER = ["won","take_profit","lost","stop_loss"];
+function renderMix(mix) {
+  const wrap = document.getElementById("mix");
+  const empty = document.getElementById("mix-empty");
+  const keys = Object.keys(mix || {});
+  if (!keys.length) { wrap.innerHTML = ""; empty.style.display = "block"; return; }
+  empty.style.display = "none";
+  const ordered = MIX_ORDER.filter(k => k in mix).concat(keys.filter(k => !MIX_ORDER.includes(k)));
+  const maxV = Math.max(...ordered.map(k => mix[k]), 1);
+  wrap.innerHTML = ordered.map(k => {
+    const v = mix[k];
+    const pct = (v / maxV) * 100;
+    const fillCls = ["won","lost","take_profit","stop_loss"].includes(k) ? k : "other";
+    const name = k.replace(/_/g, " ");
+    return `<div class="mix-row">
+      <span class="name">${esc(name)}</span>
+      <span class="track"><span class="fill ${fillCls}" data-w="${pct}"></span></span>
+      <span class="num mono">${v}</span>
+    </div>`;
+  }).join("");
+  // animate widths after layout
+  requestAnimationFrame(() => {
+    wrap.querySelectorAll(".fill").forEach(el => { el.style.width = el.getAttribute("data-w") + "%"; });
+  });
+}
+
+// ---- poll loop ----
+async function tick() {
+  try {
+    const res = await fetch("/api/state", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    renderKpis(data.summary || {});
+    renderChart(data.equity_curve || []);
+    renderOpen(data.open_positions || []);
+    renderFeed(data.closed_positions || []);
+    renderMix(data.exit_mix || {});
+    document.getElementById("updated").textContent = new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById("updated").textContent = "error: " + e.message;
+  }
+}
+
+window.addEventListener("resize", () => { if (lastCurveKey) { try { drawChart(JSON.parse("[]"), 1); } catch(_){} } });
+window.addEventListener("resize", () => tick());
+tick();
+setInterval(tick, POLL_MS);
+</script>
+</body>
+</html>
