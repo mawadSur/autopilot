@@ -10,6 +10,22 @@ from utils import fmt_money, fmt_pct
 
 
 # ----------------------------
+# Venue fee schedules
+# ----------------------------
+#
+# HONEST COSTS. These mirror the *real* Coinbase Advanced retail fee schedule
+# that the live adapter charges — see
+# ``src/exchanges/adapters/coinbase_tradeable.py`` (``_DEFAULT_COINBASE_FEE_MODEL``,
+# ``FeeModel(maker=0.0040, taker=0.0060)``). Historically the simulator defaulted
+# to ``fee_pct=0.0008`` (8 bps) and left ``maker_fee_pct`` unset, which understated
+# round-trip cost by ~7.5x and made every crypto-1m backtest fictional. We keep the
+# cheap default available for non-Coinbase callers / legacy tests, but the backtest
+# now reaches for these realistic rates via ``SimulationConfig.from_coinbase_fees()``.
+COINBASE_TAKER_FEE_PCT: float = 0.0060  # 60 bps per side
+COINBASE_MAKER_FEE_PCT: float = 0.0040  # 40 bps per side
+
+
+# ----------------------------
 # Data containers
 # ----------------------------
 
@@ -70,6 +86,52 @@ class SimulationConfig:
     breakeven_trigger_short: Optional[float] = None
     record_trades: bool = True
     keep_equity_curve: bool = True
+
+    @classmethod
+    def from_coinbase_fees(
+        cls,
+        *,
+        taker_fee_pct: float = COINBASE_TAKER_FEE_PCT,
+        maker_fee_pct: float = COINBASE_MAKER_FEE_PCT,
+        **kwargs: Any,
+    ) -> "SimulationConfig":
+        """Build a config wired to the *real* Coinbase Advanced retail fees.
+
+        This is the honest cost path. ``fee_pct`` becomes the taker rate
+        (60 bps) and ``maker_fee_pct`` is explicitly set to the maker rate
+        (40 bps) so the maker entry/exit path is no longer fictional. All
+        other ``SimulationConfig`` fields can be overridden via ``kwargs``.
+
+        Round-trip cost under this config:
+          * taker-in + taker-out  = 2 * 60 = ~120 bps
+          * maker-in + maker-out  = 2 * 40 = ~80 bps
+          * taker-in + maker-out  = 60 + 40 = ~100 bps
+
+        Compare to the legacy default (``fee_pct=0.0008``), whose round-trip
+        was only ~16 bps — a ~7.5x understatement.
+        """
+        kwargs.pop("fee_pct", None)
+        kwargs.pop("maker_fee_pct", None)
+        return cls(
+            fee_pct=float(taker_fee_pct),
+            maker_fee_pct=float(maker_fee_pct),
+            **kwargs,
+        )
+
+    @classmethod
+    def from_fee_model(cls, fee_model: Any, **kwargs: Any) -> "SimulationConfig":
+        """Build a config from any ``FeeModel``-like object (duck-typed).
+
+        Accepts the live adapters' ``protocols.FeeModel`` (``.maker``/``.taker``)
+        without importing it here — the two modules live under different import
+        roots. This keeps the simulator the single source of truth for cost while
+        letting venue adapters own their published fee schedule.
+        """
+        return cls.from_coinbase_fees(
+            taker_fee_pct=float(fee_model.taker),
+            maker_fee_pct=float(fee_model.maker),
+            **kwargs,
+        )
 
 
 # ----------------------------
@@ -405,6 +467,14 @@ class PortfolioSimulator:
         return float(bar.best_bid) if order_side > 0 else float(bar.best_ask)
 
     def _post_only_filled(self, order_side: int, limit_price: float, bar: Bar) -> bool:
+        # OPTIMISTIC-FILL ASSUMPTION (look-ahead): a post-only maker order is
+        # placed at this bar's best bid/ask and treated as FILLED if this *same*
+        # bar's low/high crosses the limit. In reality a resting limit posted at
+        # the open would only fill if price came back to it *later* in the bar,
+        # and even then queue position is not guaranteed. This same-bar maker
+        # fill is therefore optimistic and slightly inflates maker fill rates /
+        # understates missed entries. It does NOT touch the fee understatement
+        # this commit fixes; it is flagged here so it is not silently relied on.
         if order_side > 0:
             return float(bar.low) <= float(limit_price)
         return float(bar.high) >= float(limit_price)
