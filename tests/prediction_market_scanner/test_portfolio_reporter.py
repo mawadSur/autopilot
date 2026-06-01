@@ -58,9 +58,13 @@ class BuildReportTest(unittest.TestCase):
     def _ledger(self):
         d = tempfile.mkdtemp()
         led = PnlLedger(str(Path(d) / "ledger.jsonl"))
-        led.append(_rec("a", "YES", 0.50, 100.0, fees_usd=1.0))   # markable
-        led.append(_rec("b", "YES", 0.40, 100.0, fees_usd=0.0))   # pending
-        led.append(_rec("c", "YES", 0.50, 100.0, status="open"))  # to settle
+        # Distinct markets: 'a' and 'b' are SEPARATE positions, not the same
+        # (market, outcome). build_report dedups open positions by (market_id,
+        # side) — two opens sharing that key are treated as one (a duplicate from
+        # racing writers) — so distinct positions must use distinct markets.
+        led.append(_rec("a", "YES", 0.50, 100.0, fees_usd=1.0, market_id="m1"))  # markable
+        led.append(_rec("b", "YES", 0.40, 100.0, fees_usd=0.0, market_id="m2"))  # pending
+        led.append(_rec("c", "YES", 0.50, 100.0, status="open", market_id="m3"))  # to settle
         led.settle("c", exit_price=1.0, exit_ts_utc="2026-06-02T00:00:00+00:00",
                    market_outcome="Yes", realized_pnl_usd=25.0)
         return led

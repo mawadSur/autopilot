@@ -37,11 +37,7 @@ if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
 from portfolio_reporter import DEFAULT_BANKROLL_USD, build_report  # noqa: E402
-from state.pnl_ledger import (  # noqa: E402
-    PnlLedger,
-    TradeRecord,
-    dedupe_open_positions,
-)
+from state.pnl_ledger import PnlLedger, TradeRecord  # noqa: E402
 
 __all__ = ["build_state", "parse_confidence", "clean_title", "normalize_exit_reason"]
 
@@ -139,7 +135,7 @@ def build_state(
     # on the ledger) to one position each — we shadow ONE unit per (market,
     # outcome), so both the count and the cards must treat a dup as one. This is
     # why ``n_open`` is taken from the deduped list rather than ``report``.
-    deduped_open = dedupe_open_positions(ledger.open_positions())
+    deduped_open = ledger.unique_open_positions()
 
     summary = {
         "equity_usd": float(report.get("equity_usd", bankroll_usd)),

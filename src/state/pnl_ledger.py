@@ -8,14 +8,18 @@ this existed there was no auditable paper/backtest result anywhere in the repo.
 JSONL event-log model
 ---------------------
 The ledger is an **append-only JSONL file**: one JSON object per line, never
-rewritten in place. Each line is an immutable *event*. There are two event
-kinds, both keyed by ``trade_id``:
+rewritten in place. Each line is an immutable *event*. There are three event
+kinds, all keyed by ``trade_id``:
 
 1. ``"open"`` — emitted by :meth:`PnlLedger.append` when a position is entered.
    Carries the full :class:`TradeRecord` snapshot at decision/entry time.
 2. ``"settle"`` — emitted by :meth:`PnlLedger.settle` when the position closes.
    Carries the exit fields (``exit_price``, ``exit_ts_utc``, ``market_outcome``,
    ``realized_pnl_usd``, ``status``) plus the ``trade_id`` they apply to.
+3. ``"cancel"`` — emitted by :meth:`PnlLedger.cancel` to retire an ``open``
+   record (status -> ``cancelled``); carries no exit price and no realized P/L,
+   only the ``trade_id`` plus an optional ``cancel_reason``. Used by the
+   dedup-heal path to drop a duplicate open written by racing writers.
 
 Readers *fold* the event stream into current state: for each ``trade_id`` the
 latest event wins for the fields it carries. The file is therefore an immutable
@@ -35,7 +39,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
@@ -354,10 +358,12 @@ class PnlLedger:
     def unique_open_positions(self) -> List[TradeRecord]:
         """Open positions collapsed to one per ``(market_id, side)``.
 
-        Defense-in-depth against duplicate opens written by concurrent writers:
-        readers that care about the *positions we actually hold* (the dashboard,
-        the settlement sweep) use this so a stray duplicate is never shown twice
-        nor settled twice. See :func:`dedupe_open_positions`.
+        Defense-in-depth against duplicate opens written by concurrent writers,
+        so the *positions we actually hold* are never counted twice. The
+        dashboard view-builder reads through this; the duck-typed sweeps
+        (:mod:`shadow_settlement`, :mod:`exit_rules`, :mod:`portfolio_reporter`)
+        call the module-level :func:`dedupe_open_positions` directly, since they
+        accept any ledger-like object, not only :class:`PnlLedger`.
         """
         return dedupe_open_positions(self.open_positions())
 

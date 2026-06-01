@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 import whale_follow_runner as runner
 from dashboard.state import build_state
 from exit_rules import apply_exit_rules
+from portfolio_reporter import build_report
 from shadow_settlement import settle_resolved_positions
 from state.pnl_ledger import (
     PnlLedger,
@@ -224,6 +225,44 @@ class BuildStateDedupTests(unittest.TestCase):
         sides = sorted(p["side"] for p in state["open_positions"])
         self.assertEqual(sides, ["Frances Tiafoe", "Matteo Arnaldi"])  # dup collapsed
         self.assertEqual(state["summary"]["n_open"], 2)  # count matches the cards
+
+
+class PortfolioReportDedupTests(unittest.TestCase):
+    """build_report marks ONE position per (market, outcome) — a duplicate open
+    must not inflate unrealized P/L or equity (the arb runner reports without the
+    runner's self-heal, so build_report has to be correct on its own)."""
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self._dir.cleanup()
+
+    def _ledger(self, name: str) -> PnlLedger:
+        return PnlLedger(os.path.join(self._dir.name, name))
+
+    def test_duplicate_open_does_not_inflate_marked_equity(self) -> None:
+        # A ledger with a duplicate open (same market+outcome).
+        dup = self._ledger("dup.jsonl")
+        dup.append(_open(trade_id="t-keep", ts_utc=ENTRY_TS_1, entry_price=0.40))
+        dup.append(_open(trade_id="t-dup", ts_utc=ENTRY_TS_2, entry_price=0.40))
+        # A ledger with the single true position.
+        single = self._ledger("single.jsonl")
+        single.append(_open(trade_id="t-keep", ts_utc=ENTRY_TS_1, entry_price=0.40))
+
+        price_fn = lambda record: 0.70  # a real mark > entry
+        dup_report = build_report(dup, price_fn=price_fn, bankroll_usd=1000.0)
+        single_report = build_report(single, price_fn=price_fn, bankroll_usd=1000.0)
+
+        self.assertEqual(dup_report["n_open"], 1)
+        self.assertAlmostEqual(
+            dup_report["unrealized_pnl_usd"],
+            single_report["unrealized_pnl_usd"],
+            places=9,
+        )
+        self.assertAlmostEqual(
+            dup_report["equity_usd"], single_report["equity_usd"], places=9
+        )
 
 
 class HealDuplicateOpensTests(unittest.TestCase):

@@ -158,25 +158,39 @@ def _acquire_ledger_lock(ledger_path: str) -> Optional[str]:
     (returns the path) rather than blocking a legitimate run.
     """
     lock_path = f"{ledger_path}.lock"
+    parent = os.path.dirname(os.path.abspath(lock_path))
     try:
-        if os.path.exists(lock_path):
-            try:
-                with open(lock_path, "r", encoding="utf-8") as handle:
-                    holder = int((handle.read().strip() or "0"))
-            except (ValueError, OSError):
-                holder = 0
-            if holder and holder != os.getpid() and _pid_alive(holder):
-                print(
-                    f"REFUSING TO START: another writer (pid {holder}) already holds "
-                    f"{lock_path}. Two loops on one ledger create duplicate opens. "
-                    f"Stop it first (kill {holder}), or use a different --ledger-path."
-                )
-                return None
-        parent = os.path.dirname(os.path.abspath(lock_path))
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(lock_path, "w", encoding="utf-8") as handle:
-            handle.write(str(os.getpid()))
+        for _attempt in range(2):  # one retry after reclaiming a stale lock
+            try:
+                # ATOMIC create-or-fail: only one racer wins O_CREAT|O_EXCL, so
+                # two runners starting at once can't both pass a check and both
+                # write a PID.
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(str(os.getpid()))
+                return lock_path
+            except FileExistsError:
+                try:
+                    with open(lock_path, "r", encoding="utf-8") as handle:
+                        holder = int((handle.read().strip() or "0"))
+                except (ValueError, OSError):
+                    holder = 0
+                if holder == os.getpid():
+                    return lock_path  # already ours
+                if holder and _pid_alive(holder):
+                    print(
+                        f"REFUSING TO START: another writer (pid {holder}) already holds "
+                        f"{lock_path}. Two loops on one ledger create duplicate opens. "
+                        f"Stop it first (kill {holder}), or use a different --ledger-path."
+                    )
+                    return None
+                # Stale lock (holder gone / unreadable): reclaim and retry once.
+                try:
+                    os.remove(lock_path)
+                except OSError:
+                    return lock_path  # can't reclaim; degrade to no-lock
         return lock_path
     except OSError as exc:  # pragma: no cover - lock is best-effort, never fatal.
         logging.warning("could not acquire ledger lock (%s); continuing.", exc)

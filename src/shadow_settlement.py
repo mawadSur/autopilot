@@ -138,7 +138,7 @@ def settle_resolved_positions(
       * ``entry_price <= 0`` -> skip + count ``unpriced``; we never fabricate a
         realized PnL for an unmarkable entry.
       * otherwise -> ``won = bool(token["winner"])`` (falling back to
-        ``token["price"] >= 0.5`` if ``winner`` is absent/false-y but the price
+        ``token["price"] >= 0.999`` if ``winner`` is absent/false-y but the price
         marks the outcome a winner), compute the realized PnL via
         :func:`compute_settlement_pnl`, and append a ``settle`` event with
         ``exit_price = 1.0`` (won) / ``0.0`` (lost), ``market_outcome =
