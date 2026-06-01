@@ -107,6 +107,35 @@ Last updated: 2026-05-08 (post-Wave-1 + Lane D in flight + E4 regime memory part
 
 ---
 
+## Profitability Pivot (CEO review 2026-05-31)
+
+Strategic record: `docs/PROFITABILITY_PIVOT.md`. Crypto kill arithmetic: `docs/CRYPTO_1M_KILL.md`.
+Decision: **kill the crypto 1m directional stack** (predicted edge +10–20bps < ~120bps Coinbase
+round-trip — unprofitable by arithmetic), **freeze ~80% of the infra**, and **lead with model-free
+Polymarket arbitrage**, proven in shadow before any capital.
+
+Phase 0 — foundation (the rung-0 validate/kill tools):
+- **T1 honest fees in simulator** — ✅ DONE (`5f1db49`). `from_coinbase_fees()` wires 60/40bps.
+- **T2 backtest gate persists verdict** — ✅ DONE (`5f1db49`). `profit_report.json` now carries `gate_passed`/`gate_verdict`.
+- **T3 shadow PnL ledger** — ✅ DONE (`94eda08`). `src/state/pnl_ledger.py`, append-only, no-look-ahead guard.
+- **T4 documented crypto kill** — ✅ DONE (`5f1db49`). Deterministic test + `docs/CRYPTO_1M_KILL.md`.
+- **T5 freeze + governance norm** — ✅ DONE. "No new subsystem without a validated edge it serves." Frozen: `loss_postmortem`, `regime_memory`, `llm_strategy_gen`, extra adapters, D3, Grafana.
+
+Phase 1 — model-free arbitrage edge (SHADOW only, no execution):
+- **T6 honest directional EV helper** — ✅ DONE (`42f3ed2`). Warns: `fair_prob` is a MOCK until a real forecaster is validated.
+- **T7 intra-market arb detector** — ✅ DONE (`42f3ed2`). `src/arb_detector.py` YES+NO<$1 net of fee/gas, logs shadow candidates to the ledger.
+- **T8 read-only Kalshi feed** — ✅ DONE (`94eda08`). `src/exchanges/kalshi_market_data.py` for cross-venue gaps. Base URL/auth need live verification.
+- **T9 run the closed-loop shadow ledger 2–4 weeks** — ⏳ P1, ongoing. Prove arb survives real depth/latency/slippage before any capital. Needs live Polymarket (+Kalshi) order-book feeds wired into `scan_intramarket_arbs`.
+
+Phase 2 — execution (🔒 GATED: real money, explicit deliberate opt-in per Constitution; NOT built autonomously):
+- **T10 real Polymarket CLOB execution** — 🔒 P2. `polymarket_tradeable.py` is a stub; needs `py-clob-client` + signed orders + `get_balances` + settlement reader. Only after T9 shows positive net-of-fee edge.
+- **T11 strict size cap + self-slippage guard** — 🔒 P2. Reuse `risk_engine` Kelly/fee haircut; cap to ~$5–15k depth.
+- **T12 $50–100 live pilot** — 🔒 P2. Smallest real-money confirmation that fills match the shadow ledger. Scale only if they do.
+
+Explicitly deferred: LLM-forecasting edge (revisit only on thin/news-latency markets after arb pays — build the shadow loop so it's measurable); crypto funding-rate/basis arb on Hyperliquid (Phase 3 option).
+
+---
+
 ## How to use this file
 
 - **Humans mutate; agents read.** Agents may reference this file for context but should not edit without operator authorization (call it out in the brief if a backlog item is being closed).
