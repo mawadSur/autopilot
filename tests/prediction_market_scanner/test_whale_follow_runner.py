@@ -838,6 +838,105 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(PnlLedger(self.path).all_records(), [])
 
+    def test_settlement_on_by_default_closes_resolved_position(self) -> None:
+        # Seed an OPEN whale position whose market has since RESOLVED (won).
+        # On the next main() run (settlement ON by default) it must be settled.
+        seed = PnlLedger(self.path)
+        seed.append(
+            TradeRecord(
+                trade_id="whale-seed",
+                ts_utc="2026-06-01T00:00:00+00:00",
+                venue="polymarket",
+                market_id="0xRESOLVED",
+                side="Yes",
+                entry_price=0.50,
+                size=100.0,
+                fees_usd=0.0,
+                slippage_bps=0.0,
+                strategy=STRATEGY,
+                status="open",
+                notes="SHADOW MODE - NO ORDERS; whale_convergence n=3 "
+                "outcomeIndex=0; entry_price=0.5000; wallets=0xT1,0xT2,0xT3",
+            )
+        )
+
+        # No convergence this run (empty leaderboard) — we only care about the
+        # settlement sweep firing.
+        fake = _MainFakeClient(leaderboard=[])
+
+        import exchanges.polymarket_market_data as mkt_mod
+        original = mkt_mod.get_market_resolution
+        mkt_mod.get_market_resolution = lambda cid: (
+            {"closed": True,
+             "tokens": [
+                 {"outcome": "Yes", "price": 1.0, "winner": True},
+                 {"outcome": "No", "price": 0.0, "winner": False},
+             ]}
+            if cid == "0xRESOLVED"
+            else None
+        )
+        try:
+            rc = self._run_main(fake, ["--roster-source", "leaderboard"])
+        finally:
+            mkt_mod.get_market_resolution = original
+        self.assertEqual(rc, 0)
+
+        ledger = PnlLedger(self.path)
+        settled = ledger.settled()
+        self.assertEqual(len(settled), 1)
+        rec = settled[0]
+        self.assertEqual(rec.trade_id, "whale-seed")
+        self.assertEqual(rec.exit_price, 1.0)
+        self.assertEqual(rec.market_outcome, "won:Yes")
+        self.assertAlmostEqual(rec.realized_pnl_usd, 96.0, places=4)
+        self.assertEqual(ledger.open_positions(), [])
+
+    def test_no_settle_flag_leaves_resolved_position_open(self) -> None:
+        # Same seed, but --no-settle: the resolver must never be consulted and
+        # the position stays open.
+        seed = PnlLedger(self.path)
+        seed.append(
+            TradeRecord(
+                trade_id="whale-seed",
+                ts_utc="2026-06-01T00:00:00+00:00",
+                venue="polymarket",
+                market_id="0xRESOLVED",
+                side="Yes",
+                entry_price=0.50,
+                size=100.0,
+                fees_usd=0.0,
+                slippage_bps=0.0,
+                strategy=STRATEGY,
+                status="open",
+                notes="SHADOW MODE - NO ORDERS; whale_convergence n=3 "
+                "outcomeIndex=0; entry_price=0.5000; wallets=0xT1",
+            )
+        )
+        fake = _MainFakeClient(leaderboard=[])
+
+        import exchanges.polymarket_market_data as mkt_mod
+        calls: List[str] = []
+        original = mkt_mod.get_market_resolution
+
+        def _spy(cid: str):
+            calls.append(cid)
+            return {"closed": True, "tokens": [{"winner": True}, {"winner": False}]}
+
+        mkt_mod.get_market_resolution = _spy
+        try:
+            rc = self._run_main(
+                fake, ["--roster-source", "leaderboard", "--no-settle"]
+            )
+        finally:
+            mkt_mod.get_market_resolution = original
+        self.assertEqual(rc, 0)
+
+        # --no-settle: resolver untouched, position still open.
+        self.assertEqual(calls, [])
+        ledger = PnlLedger(self.path)
+        self.assertEqual(len(ledger.open_positions()), 1)
+        self.assertEqual(ledger.settled(), [])
+
     def test_live_mode_still_works_as_before(self) -> None:
         # Live path: discover wallets from /trades, rank by /positions, derive
         # hot markets, flag convergence on /holders. Two ranked wallets converge.

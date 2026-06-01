@@ -791,6 +791,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--no-dedup", action="store_true",
                         help="Disable dedup (allow re-logging a convergence that "
                         "already has an open position). Default keeps one per market.")
+    parser.add_argument("--no-settle", action="store_true",
+                        help="Disable settlement of resolved positions. Default "
+                        "(settlement ON) sweeps open positions at the start of each "
+                        "scan, closing any whose Polymarket market has RESOLVED so "
+                        "realized P/L shows in the report and dedup frees up.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -809,10 +814,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Local imports keep the module importable without the data-api/ranker in
     # minimal/test environments (the unit tests inject fakes instead).
     from exchanges.polymarket_data_api import PolymarketDataAPIClient
+    from exchanges import polymarket_market_data
+    import shadow_settlement
     import wallet_ranker
 
     client = PolymarketDataAPIClient()
     ledger = PnlLedger(args.ledger_path)
+
+    # Settlement (ON unless --no-settle): a resolver maps a market conditionId
+    # to its CLOB resolution status. SHADOW-ONLY read — closes resolved
+    # positions into the ledger, places NO orders.
+    settle_enabled = not args.no_settle
+    resolver = (
+        (lambda cid: polymarket_market_data.get_market_resolution(cid))
+        if settle_enabled
+        else None
+    )
+
+    def _settle() -> None:
+        """Sweep + settle any resolved open positions. Never crashes the loop."""
+        if not settle_enabled:
+            return
+        try:
+            res = shadow_settlement.settle_resolved_positions(ledger, resolver)
+            print(
+                f"settled {res['settled']}: {res['won']} won / "
+                f"{res['lost']} lost, realized ${res['total_realized_pnl_usd']:.2f}; "
+                f"still_open {res['still_open']}"
+            )
+        except Exception as exc:  # noqa: BLE001 - settlement must never crash the scan.
+            logging.warning("settlement sweep failed (%s); continuing.", exc)
 
     # A current-market price_fn so the Discord portfolio report marks each open
     # whale position to market (entry -> current). It re-prices via /trades using
@@ -910,6 +941,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
     def _scan(targets: Sequence[str]) -> None:
+        # Settle resolved positions FIRST (before convergence detection): this
+        # closes any market that has resolved since the last scan, freeing dedup
+        # and surfacing realized P/L in the report.
+        _settle()
         if args.roster_source == "leaderboard":
             # Convergence comes from the roster's CURRENT positions (not hot
             # markets). The same /positions fetch also yields per-wallet stats,
