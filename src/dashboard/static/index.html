@@ -89,7 +89,7 @@
 
   /* ---------- KPI row ---------- */
   .kpis {
-    display: grid; gap: 14px; margin-bottom: 18px;
+    display: grid; gap: 16px; margin-bottom: 18px;
     grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   }
   .kpi {
@@ -151,7 +151,7 @@
   }
 
   /* ---------- Open position cards ---------- */
-  .cards { display: grid; gap: 11px; grid-template-columns: repeat(auto-fill, minmax(230px,1fr)); }
+  .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(230px,1fr)); }
   .card {
     background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px;
     padding: 13px 14px; box-shadow: var(--shadow-card); animation: fadein .45s ease; min-width: 0;
@@ -185,13 +185,14 @@
   .chip {
     font-size: 10px; font-weight: 700; letter-spacing: .5px; padding: 4px 8px;
     border-radius: 6px; white-space: nowrap; text-transform: uppercase;
+    min-width: 84px; text-align: center; flex: none;
   }
   .chip.won  { background: rgba(34,216,143,.15); color: var(--green); }
   .chip.lost { background: rgba(244,81,95,.15);  color: var(--red); }
   .chip.take_profit { background: rgba(45,212,191,.15); color: var(--teal); }
   .chip.stop_loss   { background: rgba(251,146,60,.15); color: var(--orange); }
   .feed-item .fi-title { flex: 1; font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .feed-item .fi-pnl { font-weight: 600; font-size: 13px; }
+  .feed-item .fi-pnl { font-weight: 600; font-size: 13px; min-width: 78px; text-align: right; flex: none; }
 
   /* ---------- Exit mix bars ---------- */
   .mix { display: flex; flex-direction: column; gap: 10px; }

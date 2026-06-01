@@ -683,8 +683,14 @@ def _log_candidates(
             price_note = f"entry_price={entry_price:.4f} (latest /trades mark)"
         else:
             price_note = "entry_price=0.0 (holders endpoint carries no price)"
+        # Human market title (leaderboard mode carries it via /positions) so the
+        # dashboard shows a real name instead of a hex conditionId slug. Strip
+        # ';' so the `title=...;` marker stays parseable by clean_title.
+        title_raw = (cand.get("title") or "").replace(";", ",").strip()
+        title_note = f"title={title_raw}; " if title_raw else ""
         notes = (
             "SHADOW MODE - NO ORDERS; "
+            f"{title_note}"
             f"whale_convergence n={cand.get('n_target_holders')} "
             f"confidence={conf_score:.2f} ({conf_label}); "
             f"outcomeIndex={outcome_index}; "
