@@ -239,11 +239,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=DEFAULT_LEDGER_PATH,
         help=f"Path to the JSONL PnL ledger (default {DEFAULT_LEDGER_PATH}).",
     )
+    parser.add_argument(
+        "--discord",
+        action="store_true",
+        help="After each scan, post per-trade P/L + portfolio value to Discord "
+        "(reads DISCORD_WEBHOOK_URL; no-op if unset). Read-only reporting.",
+    )
+    parser.add_argument(
+        "--bankroll",
+        type=float,
+        default=1000.0,
+        help="Paper bankroll (USD) used as the portfolio-equity baseline in reports.",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     ledger = PnlLedger(args.ledger_path)
+
+    notifier = None
+    report_fn = None
+    if args.discord:
+        try:
+            from portfolio_reporter import load_env_files
+            from portfolio_reporter import report_to_discord as report_fn  # noqa: F811
+            from alerts.notifier import Notifier
+            load_env_files()  # pick up DISCORD_WEBHOOK_URL from .env for CLI runs
+            notifier = Notifier()
+        except ImportError:
+            logging.warning(
+                "Discord reporting unavailable (alerts/portfolio_reporter import "
+                "failed); continuing without it."
+            )
+
+    # An intra-market arb pair redeems for $1 at resolution, so its locked mark
+    # is 1.0; other strategies are left unpriced (reported as 'pending').
+    def _arb_price_fn(record: Any) -> Optional[float]:
+        return 1.0 if getattr(record, "side", None) == "YES+NO" else None
 
     def _scan() -> None:
         run_once(
@@ -252,6 +284,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             min_net_edge_pct=args.min_edge,
             size_usd=args.size,
         )
+        if notifier is not None and report_fn is not None:
+            report_fn(
+                ledger,
+                notifier,
+                price_fn=_arb_price_fn,
+                bankroll_usd=args.bankroll,
+                label="Shadow arb",
+            )
 
     if args.interval is not None and args.interval > 0:
         print(f"{_SHADOW_BANNER}: looping every {args.interval:.1f}s (Ctrl-C to stop).")
