@@ -140,6 +140,17 @@ Phase 2 — execution (🔒 GATED: real money, explicit deliberate opt-in per Co
 
 Explicitly deferred: LLM-forecasting edge (revisit only on thin/news-latency markets after arb pays — build the shadow loop so it's measurable); crypto funding-rate/basis arb on Hyperliquid (Phase 3 option).
 
+### Make the whale-follow edge real (CEO review 2026-06-01)
+
+CEO review verdict: the whale-convergence signal is **−EV at resolution** — `whale_leaderboard_ledger.jsonl` shows **165 settled / 13.3% win / −$6,232 realized** (hold-to-resolution). The only positive number (`whale_optimized` +$299 / 33 settled) comes ENTIRELY from the SL/TP exit overlay AND assumes you can sell at the current mark — an unmodeled, likely-false liquidity assumption on thin books. Operator chose to KEEP whale-follow but make the edge legitimate. The work below is the honest test; W4's gate decides keep-or-kill. **All SHADOW; no live capital until the gate passes net of realistic cost.**
+
+- **W1 book-aware EXIT pricing** — P1. The make-or-break. `make_whale_price_fn` (`src/whale_follow_runner.py`) re-prices exits off the last `/trades` print; replace with a volume-weighted fill that WALKS THE BID SIDE of CLOB `/book` (`exchanges/polymarket_market_data.get_order_book` already pulls it) for the position's actual size. Then `exit_rules`/`shadow_settlement` book realized PnL at the price you'd really get, not top-of-book. This single change tells you whether +$299 is real or an accounting mirage. Effort: human ~1d / CC ~45min. Verify: re-price the 33 optimized exits with the book model and compare realized vs the mark-based number.
+- **W2 book-aware ENTRY + per-market depth cap** — P1. `_latest_price_for_outcome` uses the last trade, not the ask you'd lift; price entries off the ask side and SIZE each entry to ≤2–5% of book depth within a few cents of mid. A convergence in a $300-liquidity market is untradeable at $100 — skip or scale it. Both legs must be fillable. Effort: human ~1d / CC ~45min. Depends on W1 (shared book helper).
+- **W3 enforced exposure cap + daily-loss kill switch** — P1 (risk-of-ruin). Today `--bankroll` is a report label, NOT a cap. Add: (a) hard ceiling on Σ open size — refuse new entries above it; (b) per-market cap (from W2); (c) daily realized-loss kill switch — if today's realized < −$Y, stop entering, alert, require manual `--resume`. These are the three things that turn a bad day into ruin once live. Effort: human ~1d / CC ~1hr.
+- **W4 fresh re-run + KEEP/KILL gate** — P1. New ledger, W1+W2+W3 active, run 2–4 weeks. KEEP only if realized clears net of the 2% fee AND modeled slippage. If it doesn't, treat −$6,232 as the verdict and kill whale-follow (fold back to the arb edge). This is T13's original decision gate, finally with honest fills.
+
+Note: **T9 (the chosen market-neutral arbitrage edge) was never actually run** — `arb_detector.py`/`arb_shadow_runner.py` exist but no arb ledger is on disk; blocked by `fetch_active_markets()` returning markets without `clobTokenIds`. It remains the bounded-downside fallback if W4 kills whale-follow.
+
 ---
 
 ## How to use this file
