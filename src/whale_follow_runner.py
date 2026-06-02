@@ -578,6 +578,9 @@ def _log_candidates(
     blocklist: Optional[Sequence[str]] = None,
     dedup: bool = True,
     min_confidence: float = 0.0,
+    min_entry_price: float = 0.0,
+    max_entry_price: float = 1.0,
+    require_directional: bool = False,
 ) -> List[Dict[str, Any]]:
     """Score + log convergence candidates to the SHADOW ledger.
 
@@ -588,19 +591,24 @@ def _log_candidates(
     entry pricing, ``TradeRecord`` construction, and notes are written in
     exactly one place — never duplicated.
 
-    Three filters apply BEFORE logging:
+    Filters apply BEFORE logging (each counted, never silent):
       * ``blocklist`` — operator do-not-trade terms (alcohol/casino/adult, etc.).
-        A candidate whose title/outcome matches is skipped (and counted, never
-        silently). Marked ``cand['blocked']=<term>``.
-      * ``dedup`` (default True) — never log a SECOND open position for a
-        ``(market, outcome)`` that already has one open in the ledger, so an
-        every-30-min loop doesn't pile up duplicates of the same convergence.
+        Marked ``cand['blocked']=<term>``.
+      * ``require_directional`` (default off; CLI on) — DIRECTIONAL READ filter.
+        Drop every candidate in a market where convergence fired on more than one
+        OUTCOME (target wallets split across both sides). A signal that flags both
+        sides of a game carries no directional information — it says "whales are
+        here", not "this side is mispriced". Marked ``cand['skipped']='split_market'``.
+      * ``dedup`` (default True) — one open position per ``(market, outcome)``.
         Marked ``cand['skipped']='duplicate_open'``.
-      * ``min_confidence`` (function default 0.0 = off; the CLI overrides this to
-        0.5) — the ENTRY filter: after scoring, skip any candidate whose
-        ``confidence`` is below this floor, so only the STRONGEST convergences
-        (the most profitable to follow) are ever entered.
-        Counted (not silent); marked ``cand['skipped']='low_confidence'``.
+      * ``min_confidence`` (function default 0.0 = off; CLI 0.5) — only enter the
+        strongest convergences. Marked ``cand['skipped']='low_confidence'``.
+      * ``[min_entry_price, max_entry_price]`` (function default 0..1 = off; CLI
+        0.15..0.85) — ENTRY-BAND filter (needs ``mark_entry``). Skip a candidate
+        whose decision-time mark is outside the band: near $1 you pay the full 2%
+        fee for ~zero upside (near-decided market); near $0 you're buying the
+        losing side. Only enter where the outcome is genuinely uncertain and there
+        is room to be right. Marked ``cand['skipped']='entry_out_of_band'``.
 
     For each surviving candidate: compute confidence, optionally fetch a real
     decision-time entry price (``mark_entry``), and append an OPEN
@@ -616,10 +624,27 @@ def _log_candidates(
         except Exception:  # pragma: no cover - never let a read break logging.
             existing_open = set()
 
+    # Directional read: find markets where the signal fired on >1 outcome — the
+    # convergence is split across both sides, so there's no directional edge to
+    # follow. Drop the whole market (computed once, up front).
+    split_markets: set = set()
+    if require_directional:
+        outcomes_by_market: Dict[str, set] = {}
+        for cand in candidates:
+            cid = str(cand.get("conditionId"))
+            label = cand.get("outcome")
+            side_key = str(label) if label is not None else str(cand.get("outcomeIndex"))
+            outcomes_by_market.setdefault(cid, set()).add(side_key)
+        split_markets = {cid for cid, outs in outcomes_by_market.items() if len(outs) > 1}
+
+    band_active = (min_entry_price > 0.0) or (max_entry_price < 1.0)
+
     logged: List[Dict[str, Any]] = []
     n_blocked = 0
     n_dup = 0
     n_low_conf = 0
+    n_split = 0
+    n_band = 0
     for cand in candidates:
         outcome_label = cand.get("outcome")
         side = str(outcome_label) if outcome_label is not None else str(
@@ -640,6 +665,13 @@ def _log_candidates(
                 cand["blocked"] = match
                 n_blocked += 1
                 continue
+
+        # Directional read: if the signal fired on both sides of this market,
+        # it carries no directional edge — skip the whole market.
+        if require_directional and condition_id in split_markets:
+            cand["skipped"] = "split_market"
+            n_split += 1
+            continue
 
         # Dedup: one open position per (market, outcome) — no per-scan pile-up.
         key = (condition_id, side)
@@ -693,6 +725,15 @@ def _log_candidates(
                 or 0.0
             )
 
+        # ENTRY-BAND filter: only enter where the outcome is genuinely uncertain.
+        # Outside [min, max] is fee-drag (near $1) or the losing side (near $0); an
+        # unmarkable 0.0 is also out-of-band, so the band keeps unpriceable entries
+        # out of the filtered loop.
+        if band_active and not (min_entry_price <= entry_price <= max_entry_price):
+            cand["skipped"] = "entry_out_of_band"
+            n_band += 1
+            continue
+
         if entry_price > 0:
             price_note = f"entry_price={entry_price:.4f} (latest /trades mark)"
         else:
@@ -730,11 +771,13 @@ def _log_candidates(
         logged.append(cand)
 
     _print_summary(logged)
-    if n_blocked or n_dup or n_low_conf:
+    if n_blocked or n_dup or n_low_conf or n_split or n_band:
         print(
             f"  (skipped {n_dup} already-open duplicate(s); "
             f"blocked {n_blocked} do-not-trade market(s); "
-            f"skipped {n_low_conf} below-confidence candidate(s))"
+            f"skipped {n_low_conf} below-confidence; "
+            f"{n_split} split-market (no directional read); "
+            f"{n_band} out-of-band entry)"
         )
     return logged
 
@@ -753,6 +796,9 @@ def run_once(
     blocklist: Optional[Sequence[str]] = None,
     dedup: bool = True,
     min_confidence: float = 0.0,
+    min_entry_price: float = 0.0,
+    max_entry_price: float = 1.0,
+    require_directional: bool = False,
     candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Run one convergence scan and log each candidate to the SHADOW ledger.
@@ -826,6 +872,9 @@ def run_once(
         blocklist=blocklist,
         dedup=dedup,
         min_confidence=min_confidence,
+        min_entry_price=min_entry_price,
+        max_entry_price=max_entry_price,
+        require_directional=require_directional,
     )
 
 
@@ -949,6 +998,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="ENTRY filter: only enter convergences whose computed "
                         "confidence is >= this (default 0.5) — catch the most "
                         "profitable, strongest convergences. 0.0 disables.")
+    parser.add_argument("--min-entry-price", type=float, default=0.15,
+                        help="ENTRY-BAND floor (default 0.15): skip entries priced "
+                        "below this — buying near $0 is the losing side. Set 0.0 to "
+                        "disable the band.")
+    parser.add_argument("--max-entry-price", type=float, default=0.85,
+                        help="ENTRY-BAND ceiling (default 0.85): skip entries priced "
+                        "above this — buying near $1 pays the full 2%% fee for ~zero "
+                        "upside (near-decided market). Set 1.0 to disable.")
+    parser.add_argument("--allow-split-markets", action="store_true",
+                        help="Disable the directional-read filter. Default (filter "
+                        "ON) drops any market where convergence fired on >1 outcome "
+                        "(whales split both sides = no directional edge to follow).")
     parser.add_argument("--stop-loss-pct", type=float, default=0.40,
                         help="Early-exit a position once it is down >= this fraction "
                         "of its entry cost (default 0.40 = -40%%) — cap the loss "
@@ -1175,6 +1236,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 blocklist=blocklist,
                 dedup=dedup,
                 min_confidence=args.min_confidence,
+                min_entry_price=args.min_entry_price,
+                max_entry_price=args.max_entry_price,
+                require_directional=not args.allow_split_markets,
                 candidates=candidates,
             )
         else:
@@ -1191,6 +1255,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 blocklist=blocklist,
                 dedup=dedup,
                 min_confidence=args.min_confidence,
+                min_entry_price=args.min_entry_price,
+                max_entry_price=args.max_entry_price,
+                require_directional=not args.allow_split_markets,
             )
         # (4) Report.
         _report()
