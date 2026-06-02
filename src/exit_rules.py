@@ -166,6 +166,7 @@ def apply_exit_rules(
     stop_loss_pct: Optional[float],
     take_profit_pct: Optional[float],
     take_profit_price: Optional[float],
+    fill_fn: Optional[Callable[[Any], Optional[float]]] = None,
     fee_bps: float = DEFAULT_FEE_BPS,
     now_iso: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -177,9 +178,16 @@ def apply_exit_rules(
       * decide the exit via :func:`evaluate_exit` on the record's
         ``entry_price`` and that mark;
       * if an exit fires, compute the realized P/L via :func:`compute_exit_pnl`
-        and append a ``settle`` event at the current mark with
+        at the FILL price and append a ``settle`` event with
         ``market_outcome = "exit:<reason>"``;
       * otherwise leave it open.
+
+    Mark vs fill (W1): the exit DECISION uses the mark (``price_fn`` — what the
+    position is worth), but the realized P/L is booked at the price you'd
+    actually GET. When ``fill_fn`` is supplied and returns a price, the P/L and
+    recorded ``exit_price`` use that book-walked fill (well below the mark on a
+    thin book — the honest number). When ``fill_fn`` is ``None`` or returns
+    ``None``, the fill falls back to the mark (the prior behavior).
 
     A position with no current mark (``price_fn`` returns ``None``) or one that
     does not meet a threshold is LEFT OPEN — settlement only ever happens at a
@@ -193,6 +201,9 @@ def apply_exit_rules(
         price_fn: ``callable(record) -> current mark | None`` (decision-time).
         stop_loss_pct / take_profit_pct / take_profit_price: see
             :func:`evaluate_exit`.
+        fill_fn: optional ``callable(record) -> realistic sell price | None``. The
+            book-walked fill the realized P/L is booked at; falls back to the mark
+            when absent/None.
         fee_bps: Proceeds haircut passed to :func:`compute_exit_pnl`.
         now_iso: Exit timestamp to record (ISO-8601 UTC). Defaults to now. Must
             be at/after each record's entry time or the ledger guard rejects it.
@@ -238,15 +249,24 @@ def apply_exit_rules(
                 counts["still_open"] += 1
                 continue
 
+            # Decide on the mark; FILL at the price we'd actually realize. The
+            # book-walked fill (when available) is the honest exit number — on a
+            # thin book it's well below the mark, so a "take-profit" can book a
+            # smaller gain or even a loss. Fall back to the mark if no fill price.
+            fill_price = float(current_price)
+            if fill_fn is not None:
+                fp = fill_fn(record)
+                if fp is not None:
+                    fill_price = float(fp)
             pnl = compute_exit_pnl(
                 float(record.entry_price),
                 float(record.size),
-                float(current_price),
+                fill_price,
                 fee_bps=fee_bps,
             )
             ledger.settle(
                 record.trade_id,
-                exit_price=float(current_price),
+                exit_price=fill_price,
                 exit_ts_utc=exit_ts,
                 market_outcome=f"exit:{reason}",
                 realized_pnl_usd=pnl,

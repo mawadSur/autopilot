@@ -86,11 +86,14 @@ __all__ = [
     "leaderboard_quality",
     "run_once",
     "make_whale_price_fn",
+    "make_whale_fill_fn",
     "main",
 ]
 
 # Pulls the ``outcomeIndex=<n>`` marker the runner writes into a record's notes.
 _OUTCOME_INDEX_RE = re.compile(r"outcomeIndex=(\d+)")
+# Pulls the ``asset=<token_id>`` marker (the CLOB outcome token id) for book-aware exits.
+_ASSET_RE = re.compile(r"asset=([^;]+)")
 
 
 STRATEGY = "whale_convergence"
@@ -267,11 +270,15 @@ def find_convergence(
                 bucket = per_outcome.setdefault(
                     outcome_index,
                     {"outcome": holder.get("name") or holder.get("outcome"),
+                     "asset": holder.get("asset"),
                      "wallets": {}},
                 )
                 # name/outcome label may only appear on some rows; keep first seen.
                 if bucket["outcome"] is None:
                     bucket["outcome"] = holder.get("name") or holder.get("outcome")
+                # asset = the CLOB outcome token id; keep first seen (for book-aware exits).
+                if not bucket.get("asset"):
+                    bucket["asset"] = holder.get("asset")
                 bucket["wallets"][wallet] = None  # ordered distinct set.
 
         for outcome_index, bucket in per_outcome.items():
@@ -282,6 +289,7 @@ def find_convergence(
                         "conditionId": condition_id,
                         "outcomeIndex": outcome_index,
                         "outcome": bucket["outcome"],
+                        "asset": bucket.get("asset"),
                         "n_target_holders": len(wallets),
                         "wallets": wallets,
                     }
@@ -416,6 +424,7 @@ def convergence_from_positions(
                 {
                     "outcome": position.get("outcome"),
                     "title": position.get("title"),
+                    "asset": position.get("asset"),
                     "wallets": {},
                 },
             )
@@ -423,6 +432,9 @@ def convergence_from_positions(
                 bucket["outcome"] = position.get("outcome")
             if not bucket.get("title"):
                 bucket["title"] = position.get("title")
+            # asset = the CLOB outcome token id; keep first seen (book-aware exits).
+            if not bucket.get("asset"):
+                bucket["asset"] = position.get("asset")
             bucket["wallets"][wallet] = None  # ordered distinct set.
 
     candidates: List[Dict[str, Any]] = []
@@ -435,6 +447,7 @@ def convergence_from_positions(
                     "outcomeIndex": outcome_index,
                     "outcome": bucket["outcome"],
                     "title": bucket.get("title"),
+                    "asset": bucket.get("asset"),
                     "n_target_holders": len(wallets),
                     "wallets": wallets,
                 }
@@ -743,9 +756,13 @@ def _log_candidates(
         # ';' so the `title=...;` marker stays parseable by clean_title.
         title_raw = (cand.get("title") or "").replace(";", ",").strip()
         title_note = f"title={title_raw}; " if title_raw else ""
+        # asset = the CLOB outcome token id, so the exit sweep can walk THIS
+        # outcome's bid book for a realistic fill (W1 book-aware exits).
+        asset_raw = str(cand.get("asset") or "").replace(";", "").strip()
+        asset_note = f"asset={asset_raw}; " if asset_raw else ""
         notes = (
             "SHADOW MODE - NO ORDERS; "
-            f"{title_note}"
+            f"{title_note}{asset_note}"
             f"whale_convergence n={cand.get('n_target_holders')} "
             f"confidence={conf_score:.2f} ({conf_label}); "
             f"outcomeIndex={outcome_index}; "
@@ -899,6 +916,49 @@ def make_whale_price_fn(client: Any) -> Callable[[TradeRecord], Optional[float]]
         return _latest_price_for_outcome(client, record.market_id, outcome_index)
 
     return price_fn
+
+
+def make_whale_fill_fn(session: Any = None) -> Callable[[TradeRecord], Optional[float]]:
+    """Build ``fill_fn(record) -> Optional[float]``: the REALISTIC sell price.
+
+    Where :func:`make_whale_price_fn` returns the top-of-book *mark* (what the
+    position is theoretically worth), this returns the price you would actually
+    REALIZE liquidating the position now: it parses the ``asset=<token_id>``
+    marker from the record's notes, fetches that outcome's CLOB bid book, and
+    walks the bids for the position's units (``size / entry_price``) via
+    :func:`polymarket_market_data.vwap_sell_price`. On a thin book the fill is
+    well below the mark — which is exactly the honest exit number the take-profit
+    accounting was missing (W1).
+
+    Returns ``None`` — caller falls back to the mark — when the notes carry no
+    ``asset`` marker (e.g. a pre-W1 record), the entry price is unusable, the
+    book fetch fails, or the bid side is empty. Read-only; SHADOW.
+    """
+    try:  # Flat import under PYTHONPATH=src (matches the rest of the stack).
+        from exchanges import polymarket_market_data as pmd
+    except Exception:  # pragma: no cover - alternate layout shim.
+        from src.exchanges import polymarket_market_data as pmd  # type: ignore
+
+    def fill_fn(record: TradeRecord) -> Optional[float]:
+        match = _ASSET_RE.search(record.notes or "")
+        if match is None:
+            return None
+        token_id = match.group(1).strip()
+        entry = getattr(record, "entry_price", None)
+        size = getattr(record, "size", None)
+        if not token_id or not entry or entry <= 0 or not size or size <= 0:
+            return None
+        units = float(size) / float(entry)
+        try:
+            book = pmd.get_order_book(token_id, session=session)
+        except Exception:  # noqa: BLE001 - never let a pricing read crash the sweep.
+            return None
+        result = pmd.vwap_sell_price(book.get("bids") if isinstance(book, dict) else None, units)
+        if result is None:
+            return None
+        return result[0]
+
+    return fill_fn
 
 
 def _print_summary(candidates: List[Dict[str, Any]]) -> None:
@@ -1080,16 +1140,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # whale position to market (entry -> current). It re-prices via /trades using
     # the outcomeIndex marker in each record's notes; SHADOW/observability only.
     price_fn = make_whale_price_fn(client)
+    # W1 book-aware fill: prices an exit at the bid-book VWAP for the position's
+    # units (the price we'd actually realize), used for the realized P/L while
+    # price_fn (the mark) still drives the exit DECISION. SHADOW/read-only.
+    fill_fn = make_whale_fill_fn()
 
     # Early-exit sweep (ON unless --no-exit-rules): re-price each open position to
-    # the CURRENT mark and settle those past the stop-loss / take-profit at that
-    # mark — capping losers (instead of riding to $0) and locking winners.
-    # SHADOW-ONLY read + ledger bookkeeping; places NO orders.
+    # the CURRENT mark and settle those past the stop-loss / take-profit — capping
+    # losers (instead of riding to $0) and locking winners, booked at the realistic
+    # book-walked fill. SHADOW-ONLY read + ledger bookkeeping; places NO orders.
     exit_rules_enabled = not args.no_exit_rules
 
     def _apply_exit_rules() -> None:
-        """Sweep + early-exit open positions at the current mark. Never crashes
-        the loop (wrapped so a transient pricing error can't kill the scan)."""
+        """Sweep + early-exit open positions. Never crashes the loop (wrapped so a
+        transient pricing error can't kill the scan)."""
         if not exit_rules_enabled:
             return
         try:
@@ -1099,6 +1163,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 stop_loss_pct=args.stop_loss_pct,
                 take_profit_pct=args.take_profit_pct,
                 take_profit_price=args.take_profit_price,
+                fill_fn=fill_fn,
             )
             print(
                 f"exits: {res['stop_loss']} stop-loss / "

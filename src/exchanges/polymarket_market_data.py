@@ -78,6 +78,7 @@ __all__ = [
     "get_market_resolution",
     "best_ask",
     "best_bid",
+    "vwap_sell_price",
     "get_yes_no_best_asks",
 ]
 
@@ -314,6 +315,58 @@ def best_bid(book: Dict[str, Any]) -> Optional[float]:
         return None
     prices = _level_prices(book.get("bids"))
     return max(prices) if prices else None
+
+
+def vwap_sell_price(bids: Any, units: float) -> Optional[Tuple[float, float]]:
+    """Volume-weighted price of SELLING ``units`` into the bid side of a book.
+
+    Walks the ``bids`` levels from the HIGHEST price down (you sell into the best
+    bids first), filling up to ``units``, and returns ``(vwap, filled_units)`` —
+    the realistic price you would realize market-selling the position now, NOT
+    the top-of-book mark which assumes infinite depth at the best price. This is
+    the honest exit fill: on a thin book the VWAP is well below the best bid.
+
+    Each level is the CLOB ``{"price","size"}`` shape (or a bare ``[price, size]``
+    pair); malformed levels and out-of-range prices are skipped. ``filled_units <
+    units`` means the book is too thin to fully absorb the position (a liquidity
+    flag) — the VWAP returned is for the portion the book CAN absorb; the
+    unfillable tail is not modeled (so this is, if anything, optimistic on thin
+    books, still far more honest than the mark).
+
+    Returns ``None`` when ``units <= 0`` or there are no usable bids.
+    """
+    if units is None or units <= 0:
+        return None
+    levels: List[Tuple[float, float]] = []
+    if isinstance(bids, (list, tuple)):
+        for lvl in bids:
+            if isinstance(lvl, dict):
+                price = _coerce_price(lvl.get("price"))
+                size = _coerce_price(lvl.get("size"))
+            elif isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+                price = _coerce_price(lvl[0])
+                size = _coerce_price(lvl[1])
+            else:
+                price = size = None
+            if price is not None and size is not None and size > 0 and 0.0 <= price <= 1.0:
+                levels.append((price, size))
+    if not levels:
+        return None
+    levels.sort(key=lambda ps: ps[0], reverse=True)  # best (highest) bid first
+
+    remaining = float(units)
+    proceeds = 0.0
+    filled = 0.0
+    for price, size in levels:
+        take = remaining if remaining < size else size
+        proceeds += take * price
+        filled += take
+        remaining -= take
+        if remaining <= 1e-12:
+            break
+    if filled <= 0:
+        return None
+    return (proceeds / filled, filled)
 
 
 def _resolve_clob_token_ids(market: Any) -> Optional[Sequence[str]]:

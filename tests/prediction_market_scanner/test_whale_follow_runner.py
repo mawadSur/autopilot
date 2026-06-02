@@ -529,11 +529,12 @@ class ConvergenceFromPositionsTest(unittest.TestCase):
         self.assertEqual(cand["outcome"], "Yes")
         self.assertEqual(cand["n_target_holders"], 2)
         self.assertEqual(set(cand["wallets"]), {"0xT1", "0xT2"})
-        # Candidate shape is the find_convergence shape plus a ``title`` (carried
-        # from /positions so the do-not-trade blocklist can match on it).
+        # Candidate shape is the find_convergence shape plus ``title`` (for the
+        # do-not-trade blocklist) and ``asset`` (the CLOB outcome token id, for
+        # book-aware exit fills), both carried from /positions.
         self.assertEqual(
             set(cand),
-            {"conditionId", "outcomeIndex", "outcome", "title",
+            {"conditionId", "outcomeIndex", "outcome", "title", "asset",
              "n_target_holders", "wallets"},
         )
 
