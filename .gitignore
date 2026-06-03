@@ -71,3 +71,6 @@ nohup.out
 *.pid
 supervisor.pid
 .gstack/
+
+# Agent isolation worktrees (harness-managed)
+.claude/worktrees/
