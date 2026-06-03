@@ -594,6 +594,9 @@ def _log_candidates(
     min_entry_price: float = 0.0,
     max_entry_price: float = 1.0,
     require_directional: bool = False,
+    book_entry: bool = False,
+    max_book_frac: float = 0.0,
+    depth_band: float = 0.05,
 ) -> List[Dict[str, Any]]:
     """Score + log convergence candidates to the SHADOW ledger.
 
@@ -622,6 +625,22 @@ def _log_candidates(
         fee for ~zero upside (near-decided market); near $0 you're buying the
         losing side. Only enter where the outcome is genuinely uncertain and there
         is room to be right. Marked ``cand['skipped']='entry_out_of_band'``.
+      * ``max_book_frac`` (function default 0.0 = off; CLI 0.05) — per-market
+        DEPTH CAP (needs the candidate's ``asset`` + an ASK book). Compute the
+        available ASK depth in USD near mid (ask levels priced within
+        ``depth_band`` of the best ask) and SKIP a candidate whose ``size_usd``
+        exceeds ``max_book_frac`` of that depth — we could never exit a market too
+        thin to take our size. Marked ``cand['skipped']='thin_book'``. Fails OPEN:
+        a book read error never drops a candidate.
+
+    Book-aware ENTRY (``book_entry``, function default off; CLI on, needs
+    ``mark_entry`` + the candidate's ``asset``): instead of the last ``/trades``
+    mark, price the entry off the CURRENT ASK book — estimate the units we'd buy
+    (``size_usd / best_ask``) and take the ask VWAP for those units via
+    :func:`polymarket_market_data.vwap_buy_price` (the price we'd actually lift,
+    decision-time, NOT look-ahead). Falls back to the ``/trades`` mark on any
+    failure / missing ``asset`` / empty asks; the ENTRY-BAND still applies to
+    whatever entry results.
 
     For each surviving candidate: compute confidence, optionally fetch a real
     decision-time entry price (``mark_entry``), and append an OPEN
@@ -651,6 +670,20 @@ def _log_candidates(
         split_markets = {cid for cid, outs in outcomes_by_market.items() if len(outs) > 1}
 
     band_active = (min_entry_price > 0.0) or (max_entry_price < 1.0)
+    depth_cap_active = max_book_frac > 0.0
+
+    # Lazy import keeps the module importable in minimal/test envs; only loaded
+    # when book-aware entry or the depth cap is actually requested (both read the
+    # CLOB ASK book — SHADOW/read-only, no orders).
+    pmd = None
+    if book_entry or depth_cap_active:
+        try:  # Flat import under PYTHONPATH=src (matches the rest of the stack).
+            from exchanges import polymarket_market_data as pmd  # type: ignore
+        except Exception:  # pragma: no cover - alternate layout shim.
+            try:
+                from src.exchanges import polymarket_market_data as pmd  # type: ignore
+            except Exception:  # pragma: no cover - degrade to mark-only if missing.
+                pmd = None
 
     logged: List[Dict[str, Any]] = []
     n_blocked = 0
@@ -658,6 +691,7 @@ def _log_candidates(
     n_low_conf = 0
     n_split = 0
     n_band = 0
+    n_thin = 0
     for cand in candidates:
         outcome_label = cand.get("outcome")
         side = str(outcome_label) if outcome_label is not None else str(
@@ -731,12 +765,36 @@ def _log_candidates(
             n_low_conf += 1
             continue
 
+        asset_token = str(cand.get("asset") or "").strip()
+
         entry_price = 0.0
+        entry_source = "mark"  # which source set entry_price (for an honest note)
         if mark_entry and outcome_index is not None:
-            entry_price = (
+            mark = (
                 _latest_price_for_outcome(client, condition_id, outcome_index)
                 or 0.0
             )
+            entry_price = mark
+            # Book-aware ENTRY (W2): price off the CURRENT ask book — the price we'd
+            # actually lift — instead of the last /trades print. Estimate the units
+            # we'd buy from the best ask (fall back to the /trades mark for the unit
+            # estimate when the book has no asks), then take the ask VWAP for those
+            # units. Any failure / missing asset / empty asks FALLS BACK to the mark.
+            if book_entry and pmd is not None and asset_token:
+                try:
+                    book = pmd.get_order_book(asset_token)
+                    asks = book.get("asks") if isinstance(book, dict) else None
+                    best = pmd.best_ask(book) if isinstance(book, dict) else None
+                    unit_px = best if (best is not None and best > 0) else mark
+                    if unit_px and unit_px > 0 and size_usd > 0:
+                        units = float(size_usd) / float(unit_px)
+                        result = pmd.vwap_buy_price(asks, units)
+                        if result is not None:
+                            entry_price = result[0]
+                            entry_source = "book"
+                except Exception:  # noqa: BLE001 - never let a book read crash the scan.
+                    entry_price = mark
+                    entry_source = "mark"
 
         # ENTRY-BAND filter: only enter where the outcome is genuinely uncertain.
         # Outside [min, max] is fee-drag (near $1) or the losing side (near $0); an
@@ -747,8 +805,47 @@ def _log_candidates(
             n_band += 1
             continue
 
+        # Per-market DEPTH CAP (W2): refuse a market too thin to take our size — a
+        # convergence in a $300-liquidity market is untradeable at $100 (we could
+        # never exit). Sum the ASK depth in USD near mid (levels within depth_band
+        # of the best ask); skip when size_usd exceeds max_book_frac of it. Fails
+        # OPEN: a missing asset or any book error proceeds rather than dropping a
+        # candidate because a read failed.
+        if depth_cap_active and pmd is not None and asset_token and size_usd > 0:
+            try:
+                cap_book = pmd.get_order_book(asset_token)
+                cap_asks = cap_book.get("asks") if isinstance(cap_book, dict) else None
+                cap_best = pmd.best_ask(cap_book) if isinstance(cap_book, dict) else None
+                if cap_best is not None and isinstance(cap_asks, (list, tuple)):
+                    cutoff = cap_best + float(depth_band)
+                    depth_usd = 0.0
+                    for lvl in cap_asks:
+                        if isinstance(lvl, dict):
+                            px = lvl.get("price")
+                            sz = lvl.get("size")
+                        elif isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+                            px, sz = lvl[0], lvl[1]
+                        else:
+                            continue
+                        try:
+                            px_f = float(px)
+                            sz_f = float(sz)
+                        except (TypeError, ValueError):
+                            continue
+                        if not (0.0 <= px_f <= 1.0) or sz_f <= 0:
+                            continue
+                        if px_f <= cutoff:
+                            depth_usd += sz_f * px_f
+                    if depth_usd > 0 and float(size_usd) > max_book_frac * depth_usd:
+                        cand["skipped"] = "thin_book"
+                        n_thin += 1
+                        continue
+            except Exception:  # noqa: BLE001 - fail OPEN: a read error never drops a candidate.
+                pass
+
         if entry_price > 0:
-            price_note = f"entry_price={entry_price:.4f} (latest /trades mark)"
+            source_label = "ask-book VWAP" if entry_source == "book" else "latest /trades mark"
+            price_note = f"entry_price={entry_price:.4f} ({source_label})"
         else:
             price_note = "entry_price=0.0 (holders endpoint carries no price)"
         # Human market title (leaderboard mode carries it via /positions) so the
@@ -788,13 +885,14 @@ def _log_candidates(
         logged.append(cand)
 
     _print_summary(logged)
-    if n_blocked or n_dup or n_low_conf or n_split or n_band:
+    if n_blocked or n_dup or n_low_conf or n_split or n_band or n_thin:
         print(
             f"  (skipped {n_dup} already-open duplicate(s); "
             f"blocked {n_blocked} do-not-trade market(s); "
             f"skipped {n_low_conf} below-confidence; "
             f"{n_split} split-market (no directional read); "
-            f"{n_band} out-of-band entry)"
+            f"{n_band} out-of-band entry; "
+            f"{n_thin} thin-book (depth cap))"
         )
     return logged
 
@@ -816,6 +914,9 @@ def run_once(
     min_entry_price: float = 0.0,
     max_entry_price: float = 1.0,
     require_directional: bool = False,
+    book_entry: bool = False,
+    max_book_frac: float = 0.0,
+    depth_band: float = 0.05,
     candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Run one convergence scan and log each candidate to the SHADOW ledger.
@@ -850,6 +951,16 @@ def run_once(
                                 0.0 — shadow positions carry no real size).
         mark_entry:             When True, fetch a real decision-time entry price
                                 per candidate via the data-api ``/trades`` page.
+        book_entry:             When True (with ``mark_entry``), price the entry
+                                off the CURRENT ASK book (ask VWAP for the units
+                                we'd buy) instead of the last ``/trades`` mark;
+                                falls back to the mark on any failure. Default off.
+        max_book_frac:          Per-market DEPTH CAP (default 0.0 = off): skip a
+                                candidate whose ``size_usd`` exceeds this fraction
+                                of the near-mid ASK depth in USD (too thin to take
+                                our size / to exit). Fails open on a book error.
+        depth_band:             Price window (default 0.05) above the best ask used
+                                to sum near-mid ASK depth for ``max_book_frac``.
         min_confidence:         ENTRY filter (default 0.0 = off): only log
                                 candidates whose computed ``confidence`` is
                                 >= this floor, keeping the strongest convergences.
@@ -892,6 +1003,9 @@ def run_once(
         min_entry_price=min_entry_price,
         max_entry_price=max_entry_price,
         require_directional=require_directional,
+        book_entry=book_entry,
+        max_book_frac=max_book_frac,
+        depth_band=depth_band,
     )
 
 
@@ -1066,6 +1180,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="ENTRY-BAND ceiling (default 0.85): skip entries priced "
                         "above this — buying near $1 pays the full 2%% fee for ~zero "
                         "upside (near-decided market). Set 1.0 to disable.")
+    parser.add_argument("--no-book-entry", action="store_true",
+                        help="Disable book-aware entry pricing. Default (book entry "
+                        "ON) prices each entry off the CURRENT ASK book — the ask "
+                        "VWAP for the units we'd buy, the price we'd actually lift — "
+                        "instead of the last /trades print, falling back to the mark "
+                        "on any book error (SHADOW-ONLY read).")
+    parser.add_argument("--max-book-frac", type=float, default=0.05,
+                        help="Per-market DEPTH CAP (default 0.05 = 5%%): skip a "
+                        "candidate whose --size exceeds this fraction of the near-mid "
+                        "ASK depth (USD) — a market too thin to take our size we "
+                        "could never exit. Set 0.0 to disable.")
+    parser.add_argument("--depth-band", type=float, default=0.05,
+                        help="Price window (default 0.05) above the best ask used to "
+                        "sum near-mid ASK depth for --max-book-frac.")
     parser.add_argument("--allow-split-markets", action="store_true",
                         help="Disable the directional-read filter. Default (filter "
                         "ON) drops any market where convergence fired on >1 outcome "
@@ -1304,6 +1432,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 min_entry_price=args.min_entry_price,
                 max_entry_price=args.max_entry_price,
                 require_directional=not args.allow_split_markets,
+                book_entry=not args.no_book_entry,
+                max_book_frac=args.max_book_frac,
+                depth_band=args.depth_band,
                 candidates=candidates,
             )
         else:
@@ -1323,6 +1454,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 min_entry_price=args.min_entry_price,
                 max_entry_price=args.max_entry_price,
                 require_directional=not args.allow_split_markets,
+                book_entry=not args.no_book_entry,
+                max_book_frac=args.max_book_frac,
+                depth_band=args.depth_band,
             )
         # (4) Report.
         _report()

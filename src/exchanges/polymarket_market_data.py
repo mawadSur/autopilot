@@ -79,6 +79,7 @@ __all__ = [
     "best_ask",
     "best_bid",
     "vwap_sell_price",
+    "vwap_buy_price",
     "get_yes_no_best_asks",
 ]
 
@@ -367,6 +368,59 @@ def vwap_sell_price(bids: Any, units: float) -> Optional[Tuple[float, float]]:
     if filled <= 0:
         return None
     return (proceeds / filled, filled)
+
+
+def vwap_buy_price(asks: Any, units: float) -> Optional[Tuple[float, float]]:
+    """Volume-weighted price of BUYING ``units`` from the ask side of a book.
+
+    Mirror of :func:`vwap_sell_price` for the ENTRY side. Walks the ``asks``
+    levels from the LOWEST price up (you buy the cheapest asks first), filling up
+    to ``units``, and returns ``(vwap, filled_units)`` — the realistic price you
+    would pay market-buying into the position now, NOT the top-of-book best ask
+    which assumes infinite depth at the cheapest price. This is the honest entry
+    fill: on a thin book the VWAP is well above the best ask.
+
+    Each level is the CLOB ``{"price","size"}`` shape (or a bare ``[price, size]``
+    pair); malformed levels and out-of-range prices are skipped. ``filled_units <
+    units`` means the book is too thin to fully absorb the order (a liquidity
+    flag) — the VWAP returned is for the portion the book CAN absorb; the
+    unfillable tail is not modeled (so this is, if anything, optimistic on thin
+    books, still far more honest than the best ask).
+
+    Returns ``None`` when ``units <= 0`` or there are no usable asks.
+    """
+    if units is None or units <= 0:
+        return None
+    levels: List[Tuple[float, float]] = []
+    if isinstance(asks, (list, tuple)):
+        for lvl in asks:
+            if isinstance(lvl, dict):
+                price = _coerce_price(lvl.get("price"))
+                size = _coerce_price(lvl.get("size"))
+            elif isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+                price = _coerce_price(lvl[0])
+                size = _coerce_price(lvl[1])
+            else:
+                price = size = None
+            if price is not None and size is not None and size > 0 and 0.0 <= price <= 1.0:
+                levels.append((price, size))
+    if not levels:
+        return None
+    levels.sort(key=lambda ps: ps[0])  # best (lowest) ask first
+
+    remaining = float(units)
+    cost = 0.0
+    filled = 0.0
+    for price, size in levels:
+        take = remaining if remaining < size else size
+        cost += take * price
+        filled += take
+        remaining -= take
+        if remaining <= 1e-12:
+            break
+    if filled <= 0:
+        return None
+    return (cost / filled, filled)
 
 
 def _resolve_clob_token_ids(market: Any) -> Optional[Sequence[str]]:
