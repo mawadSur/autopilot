@@ -463,6 +463,23 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_exit_date(value: str):
+    """Parse an ISO-8601 ``exit_ts_utc`` into its UTC calendar ``date``.
+
+    Tolerates a trailing ``Z`` (treated as ``+00:00``) and naive timestamps
+    (assumed UTC), mirroring :func:`state.pnl_ledger._parse_iso8601`. Raises
+    :class:`ValueError` on anything unparseable so the daily-loss kill switch can
+    ignore a bad timestamp rather than mis-date its realized P/L (W3).
+    """
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).date()
+
+
 def _latest_price_for_outcome(
     client: Any,
     condition_id: str,
@@ -597,6 +614,8 @@ def _log_candidates(
     book_entry: bool = False,
     max_book_frac: float = 0.0,
     depth_band: float = 0.05,
+    max_total_exposure: float = 0.0,
+    daily_loss_limit: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """Score + log convergence candidates to the SHADOW ledger.
 
@@ -642,6 +661,21 @@ def _log_candidates(
     failure / missing ``asset`` / empty asks; the ENTRY-BAND still applies to
     whatever entry results.
 
+    RISK GATES (W3, additive — refuse entries; never weaken them, only add):
+      * ``daily_loss_limit`` (function default 0.0 = off; CLI 200.0) — DAILY-LOSS
+        KILL SWITCH. Sum today's (current UTC date) realized P/L over the ledger's
+        settled records; if that is ``<= -daily_loss_limit`` the switch is TRIPPED
+        and EVERY candidate this scan is refused (``cand['skipped']='kill_switch'``)
+        with a loud one-line warning. Stops a bad day from compounding.
+      * ``max_total_exposure`` (function default 0.0 = off; CLI 2000.0 USD) —
+        EXPOSURE CAP. Sum ``size`` over the ledger's open positions; before logging
+        each new entry, if ``current_exposure + size_usd`` would exceed the cap the
+        candidate is refused (``cand['skipped']='exposure_cap'``). A single scan
+        cannot blow the cap because each logged entry's ``size_usd`` is added to the
+        running exposure. Both gates SHADOW-only; a ledger read that raises degrades
+        to a safe default (``0.0`` exposure / no realized loss) rather than crashing
+        the scan.
+
     For each surviving candidate: compute confidence, optionally fetch a real
     decision-time entry price (``mark_entry``), and append an OPEN
     :class:`TradeRecord`. NO orders are placed — the client is read-only.
@@ -685,6 +719,57 @@ def _log_candidates(
             except Exception:  # pragma: no cover - degrade to mark-only if missing.
                 pmd = None
 
+    # RISK GATE — EXPOSURE CAP (W3): the total USD notional already at risk across
+    # all open positions. Each new entry adds its size_usd to this running total so
+    # a single scan can't blow past the cap. A ledger read that raises degrades to
+    # 0.0 (no false block) rather than crashing the scan.
+    exposure_cap_active = max_total_exposure > 0.0
+    current_exposure = 0.0
+    if exposure_cap_active:
+        try:
+            current_exposure = sum(
+                float(getattr(r, "size", 0.0) or 0.0)
+                for r in ledger.open_positions()
+            )
+        except Exception:  # pragma: no cover - never let a read break logging.
+            current_exposure = 0.0
+
+    # RISK GATE — DAILY-LOSS KILL SWITCH (W3): today's (current UTC date) realized
+    # P/L summed over the ledger's settled records. If it is <= -daily_loss_limit
+    # the switch trips and EVERY candidate this scan is refused. A ledger read that
+    # raises degrades to 0.0 realized (no false trip) rather than crashing the scan.
+    kill_switch_active = daily_loss_limit > 0.0
+    kill_switch_tripped = False
+    today_realized = 0.0
+    if kill_switch_active:
+        today = datetime.now(timezone.utc).date()
+        try:
+            for record in ledger.settled():
+                exit_ts = getattr(record, "exit_ts_utc", None)
+                if not exit_ts:
+                    continue
+                try:
+                    exit_dt = _parse_exit_date(str(exit_ts))
+                except (ValueError, TypeError):
+                    continue  # unparseable timestamp: ignore (stay honest, don't guess)
+                if exit_dt != today:
+                    continue
+                pnl = getattr(record, "realized_pnl_usd", None)
+                if pnl is None:
+                    continue
+                try:
+                    today_realized += float(pnl)
+                except (TypeError, ValueError):
+                    continue
+        except Exception:  # pragma: no cover - never let a read break logging.
+            today_realized = 0.0
+        kill_switch_tripped = today_realized <= -float(daily_loss_limit)
+        if kill_switch_tripped:
+            print(
+                f"KILL SWITCH TRIPPED: today realized ${today_realized:.2f} "
+                f"<= -${float(daily_loss_limit):.2f}; no new entries this scan"
+            )
+
     logged: List[Dict[str, Any]] = []
     n_blocked = 0
     n_dup = 0
@@ -692,7 +777,17 @@ def _log_candidates(
     n_split = 0
     n_band = 0
     n_thin = 0
+    n_exposure = 0
+    n_kill = 0
     for cand in candidates:
+        # RISK GATE — DAILY-LOSS KILL SWITCH (W3): FIRST check. If today's realized
+        # loss has hit the limit, refuse EVERY candidate this scan — stop a bad day
+        # from compounding into new entries.
+        if kill_switch_tripped:
+            cand["skipped"] = "kill_switch"
+            n_kill += 1
+            continue
+
         outcome_label = cand.get("outcome")
         side = str(outcome_label) if outcome_label is not None else str(
             cand.get("outcomeIndex")
@@ -842,6 +937,15 @@ def _log_candidates(
                         continue
             except Exception:  # noqa: BLE001 - fail OPEN: a read error never drops a candidate.
                 pass
+        # RISK GATE — EXPOSURE CAP (W3): refuse an entry that would push the total
+        # open notional past the cap. Checked LAST (after all other filters) so it
+        # only ever counts entries that would otherwise be logged, and the running
+        # current_exposure is bumped on each log below so a single scan can't blow
+        # the cap.
+        if exposure_cap_active and current_exposure + float(size_usd) > max_total_exposure:
+            cand["skipped"] = "exposure_cap"
+            n_exposure += 1
+            continue
 
         if entry_price > 0:
             source_label = "ask-book VWAP" if entry_source == "book" else "latest /trades mark"
@@ -882,17 +986,22 @@ def _log_candidates(
         )
         ledger.append(record)
         existing_open.add(key)
+        # Bump the running exposure so a single scan can't blow the cap: each
+        # logged entry's notional counts against the remaining headroom.
+        current_exposure += float(size_usd)
         logged.append(cand)
 
     _print_summary(logged)
-    if n_blocked or n_dup or n_low_conf or n_split or n_band or n_thin:
+    if n_blocked or n_dup or n_low_conf or n_split or n_band or n_thin or n_exposure or n_kill:
         print(
             f"  (skipped {n_dup} already-open duplicate(s); "
             f"blocked {n_blocked} do-not-trade market(s); "
             f"skipped {n_low_conf} below-confidence; "
             f"{n_split} split-market (no directional read); "
             f"{n_band} out-of-band entry; "
-            f"{n_thin} thin-book (depth cap))"
+            f"{n_thin} thin-book (depth cap); "
+            f"{n_exposure} over exposure cap; "
+            f"{n_kill} kill-switch)"
         )
     return logged
 
@@ -917,6 +1026,8 @@ def run_once(
     book_entry: bool = False,
     max_book_frac: float = 0.0,
     depth_band: float = 0.05,
+    max_total_exposure: float = 0.0,
+    daily_loss_limit: float = 0.0,
     candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Run one convergence scan and log each candidate to the SHADOW ledger.
@@ -964,6 +1075,12 @@ def run_once(
         min_confidence:         ENTRY filter (default 0.0 = off): only log
                                 candidates whose computed ``confidence`` is
                                 >= this floor, keeping the strongest convergences.
+        max_total_exposure:     RISK GATE — EXPOSURE CAP (default 0.0 = off): refuse
+                                a new entry once the total open notional + this
+                                position's ``size_usd`` would exceed the cap (USD).
+        daily_loss_limit:       RISK GATE — DAILY-LOSS KILL SWITCH (default 0.0 =
+                                off): refuse ALL new entries this scan once today's
+                                realized loss reaches ``daily_loss_limit`` (USD).
         candidates:             OPTIONAL precomputed candidate list (same shape
                                 :func:`find_convergence` returns). When provided
                                 (e.g. leaderboard mode passes the output of
@@ -1006,6 +1123,8 @@ def run_once(
         book_entry=book_entry,
         max_book_frac=max_book_frac,
         depth_band=depth_band,
+        max_total_exposure=max_total_exposure,
+        daily_loss_limit=daily_loss_limit,
     )
 
 
@@ -1194,6 +1313,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--depth-band", type=float, default=0.05,
                         help="Price window (default 0.05) above the best ask used to "
                         "sum near-mid ASK depth for --max-book-frac.")
+    parser.add_argument("--max-exposure", type=float, default=2000.0,
+                        help="RISK GATE — EXPOSURE CAP (default 2000.0 USD): refuse a "
+                        "new entry once the total open notional + its --size would "
+                        "exceed this. Caps how much capital the shadow book can have "
+                        "at risk at once. Set 0.0 to disable.")
+    parser.add_argument("--daily-loss-limit", type=float, default=200.0,
+                        help="RISK GATE — DAILY-LOSS KILL SWITCH (default 200.0 USD): "
+                        "refuse ALL new entries for the rest of the scan once today's "
+                        "realized loss reaches this — stop a bad day from compounding. "
+                        "Set 0.0 to disable.")
     parser.add_argument("--allow-split-markets", action="store_true",
                         help="Disable the directional-read filter. Default (filter "
                         "ON) drops any market where convergence fired on >1 outcome "
@@ -1435,6 +1564,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 book_entry=not args.no_book_entry,
                 max_book_frac=args.max_book_frac,
                 depth_band=args.depth_band,
+                max_total_exposure=args.max_exposure,
+                daily_loss_limit=args.daily_loss_limit,
                 candidates=candidates,
             )
         else:
@@ -1457,6 +1588,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 book_entry=not args.no_book_entry,
                 max_book_frac=args.max_book_frac,
                 depth_band=args.depth_band,
+                max_total_exposure=args.max_exposure,
+                daily_loss_limit=args.daily_loss_limit,
             )
         # (4) Report.
         _report()
