@@ -151,6 +151,17 @@ CEO review verdict: the whale-convergence signal is **−EV at resolution** — 
 
 Note: **T9 (the chosen market-neutral arbitrage edge) was never actually run** — `arb_detector.py`/`arb_shadow_runner.py` exist but no arb ledger is on disk; blocked by `fetch_active_markets()` returning markets without `clobTokenIds`. It remains the bounded-downside fallback if W4 kills whale-follow.
 
+### CURRENT DIRECTION — automate a known yield (CEO pivot 2026-06-04)
+
+Three edge-seeking strategies all died on execution constraints — crypto-1m (fees), Polymarket whale-follow (−EV), crypto funding-carry (hedge: of 44 net-clearing carries, **0 retail-harvestable** — `src/funding_hedge_feasibility.py`). Same shape every time: efficient markets leave no free money for a small retail bot. So the GOAL changed: stop trying to BEAT anyone; **COLLECT a structural stablecoin yield (supply USDC, earn the lending rate) and manage the risk.** No directional view, no edge needed.
+
+- **Y1 yield scanner** — ✅ DONE (`Y1 commit`). `src/yield_scanner.py` (READ-ONLY, DefiLlama `yields.llama.fi/pools`): ranks stablecoin pools by BASE apy, honest about the new risk (TVL tier, base-vs-incentive apy, established-protocol allowlist). LIVE: conservative tier (trusted protocols ≥$50M TVL) = **~4–10% base APY** — Morpho STEAKUSDC ($450M), Aave, sDAI, sUSDe ($1.7B), Fluid ~10%. Real, market-neutral, no IL. Risk shape: SMART-CONTRACT (exploit), DEPEG (stable breaks $1), CUSTODY (self-custody keys) — not fees/prediction.
+- **Y2 yield shadow runner** — P1 next. Pick the best risk-adjusted yield(s), shadow-track the accrued yield over time (reuse the carry runner pattern), + a depeg/TVL-drop/APY-collapse monitor (the risks that actually hurt). Validate the yield persists.
+- **Y3 access decision (gated)** — P1 fork: CeFi (Coinbase/Kraken earn — easy, lower yield ~4%, platform risk) vs DeFi self-custody (Aave/Morpho — higher yield, needs a wallet + gas + KEY MANAGEMENT, the real operational/security lift). Determines whether/how capital is ever deployed.
+- **Y4 tiny pilot (🔒 gated, real money, explicit opt-in)** — smallest real deposit to confirm the live yield + the operational flow, after Y2/Y3.
+
+The Polymarket loops are stopped; the funding-carry shadow runner may still be cron-supervised (`runs/funding_carry_runner.pid`) as a parked experiment.
+
 ---
 
 ## How to use this file
