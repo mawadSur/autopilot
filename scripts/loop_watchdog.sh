@@ -38,9 +38,12 @@ ensure() {
   echo "$(ts) [$name] started pid $(cat "$pidfile")" >> "$LOG"
 }
 
-# Crypto funding-carry SHADOW runner — hourly accrual of the top net carries.
-ensure funding_carry_runner runs/funding_carry_runner.pid \
-  $PY -u src/funding_carry_runner.py \
-    --exchange hyperliquid --period-hours 1 --interval 3600 \
-    --top 8 --min-net 0.15 --notional 1000 \
-    --ledger-path runs/funding_carry_ledger.jsonl
+# Stablecoin YIELD shadow runner — hourly accrual of a Kraken-earn-style yield +
+# live peg monitor on USDC/USDT/DAI, with Discord updates. SHADOW-only (public
+# ticker reads + arithmetic; no orders/keys/custody). --apy is operator-supplied
+# (verify on Kraken Earn). Supersedes the parked funding-carry runner.
+ensure yield_shadow_runner runs/yield_shadow_runner.pid \
+  $PY -u src/yield_shadow_runner.py \
+    --stablecoin USDC --stablecoin USDT --stablecoin DAI \
+    --apy 0.045 --notional 10000 --interval 3600 --depeg-threshold 0.005 \
+    --discord --ledger-path runs/yield_ledger.jsonl
