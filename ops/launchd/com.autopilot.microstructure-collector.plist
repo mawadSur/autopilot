@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Long-lived Coinbase WS microstructure collector. Subscribes to
+  level2 + market_trades for the symbols listed below, writes one
+  parquet per UTC day into data/crypto/<SYM>/microstructure_1m/.
+
+  This closes the bucket-2 feature gap: existing training parquets had
+  every microstructure column constant-zero because the historical
+  CoinDesk endpoints needed to backfill them don't exist on the free
+  tier. This daemon captures it going forward.
+
+  Install:
+    cp ops/launchd/com.autopilot.microstructure-collector.plist \
+       ~/Library/LaunchAgents/
+    launchctl load -w \
+       ~/Library/LaunchAgents/com.autopilot.microstructure-collector.plist
+
+  Verify it's running:
+    launchctl list | grep microstructure-collector
+
+  Watch a fresh day fill up:
+    tail -F /Users/mawad/Library/Logs/autopilot/microstructure-collector.stdout.log
+
+  Stop / unload:
+    launchctl unload -w \
+       ~/Library/LaunchAgents/com.autopilot.microstructure-collector.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.autopilot.microstructure-collector</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mawad/Desktop/autopilot/.venv/bin/python</string>
+        <string>-m</string>
+        <string>microstructure_collector</string>
+        <string>--symbols</string>
+        <string>ETH-USD,BTC-USD,SOL-USD</string>
+        <string>--out-root</string>
+        <string>/Users/mawad/Desktop/autopilot/data/crypto</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mawad/Desktop/autopilot</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/mawad/Desktop/autopilot/src</string>
+        <key>TZ</key>
+        <string>UTC</string>
+    </dict>
+
+    <!-- Long-lived: relaunch on crash, keep up across reboots. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Throttle relaunches if the WS endpoint is flapping. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mawad/Library/Logs/autopilot/microstructure-collector.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/mawad/Library/Logs/autopilot/microstructure-collector.stderr.log</string>
+</dict>
+</plist>

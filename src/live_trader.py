@@ -48,6 +48,7 @@ from utils import (
     fmt_money,
     FEATURE_COLUMNS_PROFITABLE,
     align_feature_columns,
+    DashboardClient,
 )
 from config import cfg
 try:
@@ -61,8 +62,9 @@ except ModuleNotFoundError:
     from simulator import SimulationConfig, PortfolioSimulator, Bar
 
 PROJECT = Path(__file__).resolve().parent
-MODEL_DIR = PROJECT / "model"
-DATA_DIR = PROJECT / "eth_1m_data"
+REPO_ROOT = PROJECT.parent
+MODEL_DIR = REPO_ROOT / cfg.model_dir
+DATA_DIR = REPO_ROOT / cfg.data_dir
 
 
 # ----------------------------
@@ -270,6 +272,7 @@ def run_loop() -> None:
         record_trades=True,
     )
     sim = PortfolioSimulator(sim_cfg)
+    dashboard = DashboardClient()
     prev_log_len = 0
 
     exchange = make_exchange(testnet=args.testnet)
@@ -388,6 +391,20 @@ def run_loop() -> None:
                     print(f"[ENTER {side}] price={price:.2f} tp={tr.get('tp'):.2f} sl={tr.get('sl'):.2f} eq={fmt_money(eq)}")
                 elif action == "EXIT":
                     print(f"[EXIT  {side}] price={price:.2f} pnl={pnl:.2f} ret={ret:.4f} reason={reason} eq={fmt_money(eq)}")
+
+        # Dashboard Telemetry
+        try:
+            dashboard.send(
+                timestamp=last_row.get("timestamp") or int(time.time()),
+                price=last_close,
+                equity=sim.last_equity,
+                probs=probs,
+                signal=signal,
+                position=sim.position,
+                recent_trades=sim.trade_log[-20:]
+            )
+        except Exception:
+            pass
 
         time.sleep(max(0.5, args.interval))
 

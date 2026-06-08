@@ -18,9 +18,59 @@ eth_1m_data
 eth_1s_data
 src/.env
 .venv\*
+venv\*
 .env
 model/
 *.pt
 model/
 model/
+
+# Crypto trading runtime state
+.shakedown.json
+.kill_switch
+
+# npm artifacts (Python repo; node_modules from MCP installs)
+node_modules/
+package.json
+package-lock.json
+runs/
+
+# Generated training artifacts (regen via scripts/retrain_all_crypto_models.sh
+# or rsync model_crypto/ between machines for the small 1.4MB bundle).
+# Datasets are 200MB+ and regen via backfill_ohlcv.py from Coinbase.
+data/crypto/datasets/*.parquet
+model_crypto/
+
+# Live microstructure collector output (per-minute parquet sidecars, regen by
+# running src/microstructure_collector.py against Coinbase Advanced Trade WS).
+data/crypto/*/microstructure_1m/
+
+# Regime memory stores (regen via `PYTHONPATH=src python -m regime_memory.backfill`)
+data/regime_stores/
+
+# Local logs from training, retrain, and supervisor smoke runs
+logs/
+
+# Scheduled-task lockfile from /loop's ScheduleWakeup
+.claude/scheduled_tasks.lock
+
+# Ruflo runtime/state (regenerable via `npx @claude-flow/cli init --preset standard`
+# + `daemon start` / `memory init` / `swarm init`).
+.claude-flow/
+.swarm/
+.claude/memory.db
+agentdb.rvf
+agentdb.rvf.lock
+ruvector.db
+
+# Polymarket scanner JSON exports
+output/
+
+# Supervisor runtime artifacts (nohup capture + pidfiles)
+nohup.out
+*.pid
+supervisor.pid
+.gstack/
+
+# Agent isolation worktrees (harness-managed)
 .claude/worktrees/

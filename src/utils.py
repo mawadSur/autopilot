@@ -19,6 +19,7 @@ import logging
 import json
 import math
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Sequence, Tuple
@@ -108,6 +109,134 @@ def set_seed(seed: int) -> None:
 
 def get_device_str() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ---------------------------
+# LLM JSON extraction
+# ---------------------------
+
+# Common keys we will try to recover via field-level regex when full JSON parsing fails.
+_FIELD_LEVEL_NUMERIC_KEYS = (
+    "clarity_score",
+    "narrative_momentum",
+    "confidence_score",
+    "xgboost_prob",
+    "calibrated_true_prob",
+    "llm_adjustment_pct_points",
+    "edge_vs_market",
+)
+_FIELD_LEVEL_STRING_KEYS = (
+    "reasoning",
+    "rationale",
+    "action",
+    "summary",
+    "classification",
+    "process_quality",
+    "outcome_quality",
+)
+_FIELD_LEVEL_BOOL_KEYS = ("ambiguous",)
+
+
+def _strip_code_fence(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json|JSON)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _regex_field_fallback(cleaned: str) -> Dict[str, Any]:
+    """Best-effort recovery: pull individual fields out of broken JSON via regex.
+
+    Returns whatever fields we managed to find. Caller decides whether the
+    result is empty.
+    """
+    found: Dict[str, Any] = {}
+
+    for key in _FIELD_LEVEL_NUMERIC_KEYS:
+        # Match e.g. "clarity_score": 87 or clarity score = 87 or clarity_score: 87.5
+        match = re.search(
+            rf'(?:"?{key}"?|{key.replace("_", " ")})\s*[:=]\s*(-?\d+(?:\.\d+)?)',
+            cleaned,
+            re.IGNORECASE,
+        )
+        if match:
+            value_str = match.group(1)
+            try:
+                value: Any = int(value_str) if "." not in value_str else float(value_str)
+            except ValueError:
+                value = value_str
+            found[key] = value
+
+    for key in _FIELD_LEVEL_BOOL_KEYS:
+        match = re.search(
+            rf'(?:"?{key}"?)\s*[:=]\s*(true|false|yes|no)',
+            cleaned,
+            re.IGNORECASE,
+        )
+        if match:
+            found[key] = match.group(1).strip().lower() in {"true", "yes"}
+
+    for key in _FIELD_LEVEL_STRING_KEYS:
+        # Capture either a quoted string or trailing free text up to the next field/end.
+        quoted = re.search(rf'"?{key}"?\s*[:=]\s*"((?:[^"\\]|\\.)*)"', cleaned, re.IGNORECASE)
+        if quoted:
+            found[key] = quoted.group(1).strip()
+            continue
+        loose = re.search(rf'"?{key}"?\s*[:=]\s*(.+)', cleaned, re.IGNORECASE | re.DOTALL)
+        if loose:
+            value = loose.group(1).strip()
+            value = re.sub(r'^[\s:,\-]+', '', value)
+            value = value.rstrip('}\"` \n')
+            if value:
+                found[key] = value
+
+    return found
+
+
+def extract_json_object(text: str) -> Dict[str, Any]:
+    """Extract a JSON object from possibly-noisy LLM output.
+
+    Tries, in order:
+    1. Direct ``json.loads`` after stripping Markdown code fences.
+    2. Bracket extraction (substring from the first ``{`` to the last ``}``).
+    3. Field-level regex fallback for the most common keys (``clarity_score``,
+       ``narrative_momentum``, ``reasoning``, etc.).
+
+    Raises:
+        ValueError: if the input is None/empty, or if no JSON-like content
+            can be recovered. Always returns a non-empty ``dict`` on success.
+    """
+    if text is None:
+        raise ValueError("extract_json_object received None")
+    if not isinstance(text, str):
+        raise TypeError(f"extract_json_object expected str, got {type(text)!r}")
+
+    cleaned = _strip_code_fence(text)
+    if not cleaned:
+        raise ValueError("extract_json_object received empty input")
+
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict) and parsed:
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(cleaned[start : end + 1])
+            if isinstance(parsed, dict) and parsed:
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    fallback = _regex_field_fallback(cleaned)
+    if not fallback:
+        raise ValueError("Could not extract a JSON object from the input")
+    return fallback
 
 
 # ---------------------------
@@ -1478,6 +1607,48 @@ def load_model_bundle(model_dir: str):
     return model.eval(), scaler, meta
 
 
+def is_xgboost_model_dir(model_dir: str) -> bool:
+    """Return True iff model_dir contains an XGBoost bundle (model.joblib + meta.json)."""
+    p = Path(model_dir)
+    return (p / "model.joblib").exists() and (p / "meta.json").exists()
+
+
+def load_inference_bundle(model_dir: str):
+    """Load either a LegacyTransformer or XGBoost bundle.
+
+    Returns (kind, model, scaler_or_None, meta_dict) where kind in {"legacy", "xgboost"}.
+    Callers should branch on kind; downstream inference is model-type-specific.
+    """
+    if is_xgboost_model_dir(model_dir):
+        import joblib
+        # On macOS with Apple Silicon, torch + XGBoost OpenMP clash causes SIGABRT.
+        # Pin OMP_NUM_THREADS=1 before the joblib load to avoid the crash.
+        _prev_omp = os.environ.get("OMP_NUM_THREADS")
+        os.environ["OMP_NUM_THREADS"] = "1"
+        try:
+            p = Path(model_dir)
+            with (p / "meta.json").open() as fh:
+                meta = json.load(fh)
+            model = joblib.load(p / "model.joblib")
+            scaler_path = p / "scaler.joblib"
+            scaler = joblib.load(scaler_path) if scaler_path.exists() else None
+        finally:
+            if _prev_omp is None:
+                os.environ.pop("OMP_NUM_THREADS", None)
+            else:
+                os.environ["OMP_NUM_THREADS"] = _prev_omp
+        if scaler is not None and hasattr(scaler, "feature_names_in_"):
+            expected = list(meta.get("feature_cols") or [])
+            actual = list(scaler.feature_names_in_)
+            if actual != expected:
+                raise ValueError(
+                    f"XGBoost scaler column order mismatch: scaler={actual[:5]} meta={expected[:5]}"
+                )
+        return "xgboost", model, scaler, meta
+    model, scaler, meta = load_model_bundle(model_dir)
+    return "legacy", model, scaler, meta
+
+
 # ---------------------------
 # Simple binary label helper (optional)
 # ---------------------------
@@ -1597,6 +1768,60 @@ class SignalGenerator:
         return {"probability": prob, "confidence": prob, "signal": signal, "threshold": threshold}
 
 
+# ---------------------------
+# Dashboard Client
+# ---------------------------
+
+class DashboardClient:
+    """Non-blocking client to send telemetry to the dashboard server."""
+    def __init__(self, url: str = "http://localhost:8000/api/telemetry"):
+        self.url = url
+        self.enabled = True
+        try:
+            import requests
+            self.session = requests.Session()
+        except ImportError:
+            self.enabled = False
+
+    def send(
+        self,
+        timestamp: Any,
+        price: float,
+        equity: float,
+        probs: np.ndarray,
+        signal: int,
+        position: int,
+        recent_trades: List[Dict[str, Any]] = None
+    ) -> None:
+        if not self.enabled:
+            return
+
+        # probabilities: [short, hold, long]
+        p_list = [float(x) for x in probs.flatten().tolist()]
+        p_short = p_list[0] if len(p_list) >= 1 else 0.0
+        p_hold = p_list[1] if len(p_list) >= 2 else 0.0
+        p_long = p_list[2] if len(p_list) >= 3 else (p_list[1] if len(p_list) == 2 else 0.0)
+
+        payload = {
+            "timestamp": str(timestamp),
+            "price": float(price),
+            "equity": float(equity),
+            "p_short": p_short,
+            "p_hold": p_hold,
+            "p_long": p_long,
+            "signal": int(signal),
+            "position": int(position),
+            "recent_trades": recent_trades or []
+        }
+
+        try:
+            # Short timeout to avoid blocking the trading loop
+            self.session.post(self.url, json=payload, timeout=0.05)
+        except Exception:
+            # Silent fail if dashboard server is down
+            pass
+
+
 __all__ = [
     # defaults
     "DEFAULT_SEQ_LENS", "DEFAULT_SEQ_LEN", "FEATURE_COLUMNS", "FEATURE_COLUMNS_PROFITABLE",
@@ -1621,7 +1846,8 @@ __all__ = [
     # formatting
     "fmt_money", "fmt_pct",
     # meta/model
-    "load_meta", "load_model_bundle", "SignalGenerator",
+    "load_meta", "load_model_bundle", "load_inference_bundle", "is_xgboost_model_dir", "SignalGenerator",
     # labels
     "binary_label_next_bar_up",
+    "DashboardClient",
 ]

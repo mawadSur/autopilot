@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
+import glob
+import os
 from pathlib import Path
 from typing import Any, Callable, Deque, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
@@ -12,6 +14,38 @@ from utils import compute_features, normalize_headers
 LabelFn = Callable[[pd.DataFrame], Sequence]
 SourceLike = Union[str, Path]
 SourceListLike = Sequence[SourceLike]
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _resolve_repo_path(path: SourceLike) -> Path:
+    raw = Path(path).expanduser()
+    if raw.is_absolute():
+        return raw.resolve()
+
+    candidates: List[Path] = []
+    if raw.parts and raw.parts[0] == REPO_ROOT.name:
+        candidates.append(REPO_ROOT.parent / raw)
+        if len(raw.parts) > 1:
+            candidates.append(REPO_ROOT / Path(*raw.parts[1:]))
+        else:
+            candidates.append(REPO_ROOT)
+    else:
+        candidates.append(REPO_ROOT / raw)
+    candidates.append(raw.resolve())
+
+    seen: set[Path] = set()
+    unique_candidates: List[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_candidates.append(resolved)
+
+    for candidate in unique_candidates:
+        if candidate.exists():
+            return candidate
+    return unique_candidates[0]
 
 
 class KlineStreamer:
@@ -110,13 +144,13 @@ class KlineStreamer:
 
         # Case A: directory or single file
         if isinstance(self.source, (str, Path)):
-            files = self._list_csvs(Path(self.source))
+            files = self._list_csvs(self.source)
 
         # Case B: explicit list/tuple of CSV paths
         elif isinstance(self.source, Sequence) and not isinstance(self.source, (bytes, bytearray)):
             # treat as list of CSV paths if elements look like paths (str/Path)
             if len(self.source) > 0 and all(isinstance(x, (str, Path)) for x in self.source):
-                files = [Path(x) for x in self.source]
+                files = [_resolve_repo_path(x) for x in self.source]
             else:
                 files = None
 
@@ -163,12 +197,25 @@ class KlineStreamer:
             )
 
     @staticmethod
-    def _list_csvs(path: Path) -> List[Path]:
-        if path.is_dir():
-            files = sorted(path.glob("*.csv"))
-            if not files:
-                raise FileNotFoundError(f"No CSV files found in directory: {path}")
+    def _list_csvs(path: SourceLike) -> List[Path]:
+        path = _resolve_repo_path(path)
+        path_str = os.fspath(path)
+
+        if os.path.exists(path_str):
+            if os.path.isdir(path_str):
+                files = sorted(Path(p).resolve() for p in glob.glob(os.path.join(path_str, "*.csv")))
+                if not files:
+                    raise FileNotFoundError(f"No CSV files found in directory: {path}")
+                return files
+            if path.suffix.lower() == ".csv":
+                return [path.resolve()]
+
+        files = sorted(
+            Path(p).resolve()
+            for p in glob.glob(path_str)
+            if str(p).lower().endswith(".csv")
+        )
+        if files:
             return files
-        if path.suffix.lower() != ".csv":
-            raise ValueError(f"Expected a .csv file or directory, got: {path}")
-        return [path]
+
+        raise FileNotFoundError(f"No CSV files found for path: {path}")

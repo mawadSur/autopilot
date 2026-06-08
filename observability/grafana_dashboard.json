@@ -1,0 +1,321 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "v0 dashboard — operator may need to adjust target queries / data source after import. Built around Phase-16 metrics emitted by src/observability/monitoring.py and src/live_supervisor.py. Default data source is the operator's Prometheus instance; rename via Grafana variables if your setup uses a different label.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Tick duration (autopilot_tick_duration_s)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Per-symbol tick duration. p50/p95/p99 lines are histogram quantiles over a 5m window. Heatmap variant available — duplicate this panel and switch type to 'heatmap' if you want bucket density.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {"mode": "palette-classic"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi"}
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(autopilot_tick_duration_s_bucket[5m])) by (le, symbol))",
+          "legendFormat": "p50 {{symbol}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(autopilot_tick_duration_s_bucket[5m])) by (le, symbol))",
+          "legendFormat": "p95 {{symbol}}",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(autopilot_tick_duration_s_bucket[5m])) by (le, symbol))",
+          "legendFormat": "p99 {{symbol}}",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Model confidence (autopilot_model_confidence)",
+      "type": "heatmap",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Histogram heatmap of per-tick model confidence by symbol. Use to spot regime shifts (the heat band drifting up or down over time).",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "fieldConfig": {
+        "defaults": {"unit": "short"},
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "yAxis": {"unit": "short"}
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(autopilot_model_confidence_bucket[5m])) by (le)",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Order latency p99 (autopilot_order_latency_s)",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "p99 fill latency by symbol over 5m. Anything > 2s warrants investigation.",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1.0},
+              {"color": "red", "value": 2.0}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(autopilot_order_latency_s_bucket[5m])) by (le, symbol))",
+          "legendFormat": "{{symbol}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Daily PnL by symbol (autopilot_daily_pnl_usd_by_symbol)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Per-symbol daily PnL gauge in USD. The unlabeled aggregate lives at autopilot_daily_pnl_usd; use this panel to drill in.",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "color": {"mode": "palette-classic"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi"}
+      },
+      "targets": [
+        {
+          "expr": "autopilot_daily_pnl_usd_by_symbol",
+          "legendFormat": "{{symbol}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Shakedown clean-days (autopilot_shakedown_clean_days)",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Per-symbol clean paper-day counter. Symbol unlocks for live mode at >= 14. Color thresholds at 7 (yellow) and 14 (green).",
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 14},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 7},
+              {"color": "green", "value": 14}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      },
+      "targets": [
+        {
+          "expr": "autopilot_shakedown_clean_days",
+          "legendFormat": "{{symbol}}",
+          "refId": "A"
+        },
+        {
+          "expr": "autopilot_paper_days_clean",
+          "legendFormat": "{{symbol}} (paper_days_clean alias)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Kill switch + auto-trip + auto-pause",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Operator killers. kill_switch_active=1 means manual halt or auto-trip. auto_trip_total counts process-latched auto-trips since boot. auto_pause_total counts daily-loss + low-confidence trips.",
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 14},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      },
+      "targets": [
+        {
+          "expr": "autopilot_kill_switch_active",
+          "legendFormat": "kill_switch_active",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(autopilot_auto_trip_total)",
+          "legendFormat": "auto_trip_total",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(autopilot_auto_pause_total) by (reason)",
+          "legendFormat": "auto_pause_total[{{reason}}]",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Reconciliation health (orphans + ghosts + drift)",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Per-run reconciliation gauges. Orphans = positions in the store but not on the exchange. Ghosts = positions on the exchange but not in the store. Drift = size mismatch beyond tolerance. All three should normally be 0.",
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 20},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1},
+              {"color": "red", "value": 5}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      },
+      "targets": [
+        {
+          "expr": "autopilot_reconciliation_orphans",
+          "legendFormat": "orphans",
+          "refId": "A"
+        },
+        {
+          "expr": "autopilot_reconciliation_ghosts",
+          "legendFormat": "ghosts",
+          "refId": "B"
+        },
+        {
+          "expr": "autopilot_reconciliation_drift_count",
+          "legendFormat": "drift_count",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(autopilot_reconciliation_run_total)",
+          "legendFormat": "run_total",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Open positions / orphan positions",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Live positions count vs orphans gauge. Diverging series = reconciliation issue brewing.",
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 26},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi"}
+      },
+      "targets": [
+        {
+          "expr": "autopilot_open_positions_count",
+          "legendFormat": "open_positions_count",
+          "refId": "A"
+        },
+        {
+          "expr": "autopilot_orphan_positions",
+          "legendFormat": "orphan_positions",
+          "refId": "B"
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["autopilot", "phase-16", "v0"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "Autopilot — Phase 16 SLO board",
+  "uid": "autopilot-phase16-v0",
+  "version": 1,
+  "weekStart": ""
+}

@@ -1,0 +1,58 @@
+[project]
+name = "autopilot"
+version = "0.1.0"
+description = "Local-first prediction-market research + paper-trading bot."
+readme = "Readme.md"
+requires-python = ">=3.11"
+
+# No build-system table — this is a research workspace, not a packaged app.
+# Dependencies live in requirements.txt; this is a soft mirror so tooling
+# works.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "main.py"]
+extend-exclude = [
+    ".venv",
+    "model_sanity",
+    "eth_1m_data",
+    "data",
+    "output",
+    "logs",
+    "trade_execution_*.json",
+    "performance_audit.json",
+]
+
+[tool.ruff.lint]
+# Start permissive: pyflakes errors + isort + obvious bugs only. Avoid
+# blanket pep8/style enforcement until the team opts in.
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear (likely bugs)
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",  # line too long — line-length is advisory; many existing lines exceed
+    "B008",  # function call in default argument (FastAPI uses this idiomatically)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "calibration_agent", "data_quality_auditor", "execution_reviewer",
+    "iterative_improver", "news_research_agent", "outcome_review_agent",
+    "reddit_research_agent", "risk_management_agent", "synthesis_agent",
+]
+
+[tool.pytest.ini_options]
+# Repo uses unittest discover. This is a soft pointer so `pytest tests/`
+# works for the legacy test_core.py + test_compute_features.py files;
+# the unittest suite under tests/prediction_market_scanner is run via
+# `python -m unittest discover` (see Readme.md).
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*", "*Tests"]
+python_functions = ["test_*"]

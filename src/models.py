@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, Optional, Union, List, Tuple
 
 
@@ -34,6 +35,75 @@ import warnings
 warnings.filterwarnings("ignore")
 
 PROFIT_MODEL_VERSION = "profit_v3"
+
+
+def _coerce_optional_market_float(value: Any) -> Optional[float]:
+    if value in (None, "", "null"):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class Market:
+    market_id: str
+    title: str
+    category: str
+    implied_prob: float
+    bid_price: float
+    ask_price: float
+    volume_24h: float
+    price_history: Dict[str, float]
+    open_interest: float
+    resolution_date: Union[datetime, str]
+    rules_text: str
+    avg_volume_7d: Optional[float] = None
+    volume_change_1h: Optional[float] = None
+    category_avg_spread: Optional[float] = None
+    # Raw Gamma ``clobTokenIds`` ([YES_token, NO_token] as a JSON-string or
+    # list), retained so the read-only CLOB order-book reader can resolve the
+    # two outcome tokens for intra-market arbitrage. ``None`` for non-binary or
+    # not-yet-CLOB-listed markets. Consumed by
+    # ``exchanges.polymarket_market_data.get_yes_no_best_asks``.
+    clob_token_ids: Optional[Any] = None
+    spread: float = field(init=False)
+    days_to_resolution: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.implied_prob = float(self.implied_prob)
+        self.bid_price = float(self.bid_price)
+        self.ask_price = float(self.ask_price)
+        self.volume_24h = float(self.volume_24h)
+        self.open_interest = float(self.open_interest)
+        self.avg_volume_7d = _coerce_optional_market_float(self.avg_volume_7d)
+        self.volume_change_1h = _coerce_optional_market_float(self.volume_change_1h)
+        self.category_avg_spread = _coerce_optional_market_float(self.category_avg_spread)
+        self.price_history = {
+            window: float(self.price_history.get(window, 0.0))
+            for window in ("1h", "6h", "24h")
+        }
+        if isinstance(self.resolution_date, str):
+            normalized = self.resolution_date.strip()
+            if normalized.endswith("Z"):
+                normalized = normalized[:-1] + "+00:00"
+            self.resolution_date = datetime.fromisoformat(normalized)
+        if self.resolution_date.tzinfo is None:
+            self.resolution_date = self.resolution_date.replace(tzinfo=timezone.utc)
+        self.refresh_derived_fields()
+
+    def refresh_derived_fields(self, now: Optional[datetime] = None) -> None:
+        self.spread = max(0.0, self.ask_price - self.bid_price)
+        current_time = now or datetime.now(timezone.utc)
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        else:
+            current_time = current_time.astimezone(timezone.utc)
+        resolution_time = self.resolution_date.astimezone(timezone.utc)
+        delta = resolution_time - current_time
+        self.days_to_resolution = max(0.0, delta.total_seconds() / 86400.0)
+
 
 # ----------------------------
 # Model definition
