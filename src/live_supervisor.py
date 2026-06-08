@@ -3461,6 +3461,20 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--hyperliquid-symbols",
+        type=str,
+        required=False,
+        default="",
+        help=(
+            "Comma-separated Hyperliquid perp symbols (e.g. 'ETH,BTC'). "
+            "Each symbol is wrapped in a HyperliquidTradeable bound to a "
+            "shared HyperliquidExchange and added to the tick loop "
+            "alongside any --symbols / --polymarket-markets entries. "
+            "Paper-mode only: HyperliquidTradeable write methods raise "
+            "NotImplementedError until EIP-712 signing is wired."
+        ),
+    )
+    p.add_argument(
         "--mode",
         choices=("paper", "live"),
         default="paper",
@@ -3691,21 +3705,37 @@ def main(argv: Optional[List[str]] = None) -> int:
             continue
         seen_pm.add(mid)
         polymarket_market_ids.append(mid)
-    if not symbols and not polymarket_market_ids:
+
+    raw_hyperliquid = [
+        s.strip() for s in (getattr(args, "hyperliquid_symbols", "") or "").split(",") if s.strip()
+    ]
+    hyperliquid_symbols: List[str] = []
+    seen_hl: set[str] = set()
+    for sym in raw_hyperliquid:
+        if sym in seen_hl:
+            LOGGER.warning(
+                "supervisor: dropping duplicate symbol %r from --hyperliquid-symbols",
+                sym,
+            )
+            continue
+        seen_hl.add(sym)
+        hyperliquid_symbols.append(sym)
+
+    if not symbols and not polymarket_market_ids and not hyperliquid_symbols:
         # Preserve the legacy error string so existing CLI consumers /
         # tests that key off the substring "--symbols must contain at
         # least one entry" continue to work. We additionally surface
-        # the polymarket option for operators who want the union.
+        # the polymarket + hyperliquid options for operators who want the union.
         print(
             "error: --symbols must contain at least one entry "
-            "(or pass --polymarket-markets)",
+            "(or pass --polymarket-markets / --hyperliquid-symbols)",
             file=sys.stderr,
         )
         return 2
 
-    # Build PolymarketTradeable instances up-front so SupervisorConfig
-    # validation sees the union of (symbols, tradeables) and the
-    # supervisor's __init__ wires them into the iteration list.
+    # Build PolymarketTradeable + HyperliquidTradeable instances up-front so
+    # SupervisorConfig validation sees the union of (symbols, tradeables)
+    # and the supervisor's __init__ wires them into the iteration list.
     tradeables: List[Any] = []
     if polymarket_market_ids:
         from exchanges.adapters import PolymarketTradeable
@@ -3713,6 +3743,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         for mid in polymarket_market_ids:
             tradeables.append(PolymarketTradeable(mid, polymarket_fetcher))
+    if hyperliquid_symbols:
+        # Single shared HyperliquidExchange client backing every
+        # HyperliquidTradeable — connection pooling + balance lookups stay
+        # cheap. Live writes still raise NotImplementedError; this path is
+        # paper-mode-only until EIP-712 signing is wired.
+        from exchanges.adapters import HyperliquidTradeable
+        from exchanges.hyperliquid import HyperliquidExchange
+
+        hyperliquid_client = HyperliquidExchange()
+        for sym in hyperliquid_symbols:
+            tradeables.append(HyperliquidTradeable(hyperliquid_client, sym))
 
     config = SupervisorConfig(
         symbols=symbols,
@@ -3816,11 +3857,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         confidence_history=confidence_history,
     )
 
-    # Include polymarket market ids in the run-dir name when set so the
-    # log path makes the heterogeneous tradeables list legible.
-    run_dir_label_symbols = list(symbols) + [
-        f"polymarket-{mid}" for mid in polymarket_market_ids
-    ]
+    # Include polymarket + hyperliquid ids in the run-dir name when set so
+    # the log path makes the heterogeneous tradeables list legible.
+    run_dir_label_symbols = (
+        list(symbols)
+        + [f"polymarket-{mid}" for mid in polymarket_market_ids]
+        + [f"hyperliquid-{sym}" for sym in hyperliquid_symbols]
+    )
     run_dir = _setup_run_dir(args.log_dir, symbols=run_dir_label_symbols)
 
     if args.once:

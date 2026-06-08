@@ -76,6 +76,36 @@ except ModuleNotFoundError:
     except ModuleNotFoundError:
         from streamer import KlineStreamer
 from config import cfg
+import os
+
+
+# Venue toggle for the simulator fee schedule. The crypto 1m directional
+# stack defaults to Hyperliquid because at Coinbase the +20 bps target is
+# arithmetically smaller than the ~120 bps round-trip cost (see
+# ``docs/CRYPTO_1M_KILL.md``). At Hyperliquid the round-trip is ~10 bps
+# taker / ~4 bps maker, so the same model can plausibly clear the gate.
+# Override with ``BACKTEST_FEE_VENUE=coinbase`` to fall back to the
+# historical Coinbase fees (kept available for non-crypto callers and
+# regression checks).
+_BACKTEST_FEE_VENUE = os.environ.get("BACKTEST_FEE_VENUE", "hyperliquid").strip().lower()
+
+
+def _build_sim_config(**kwargs) -> SimulationConfig:
+    """Build a SimulationConfig using the venue selected by env var.
+
+    Honors ``BACKTEST_FEE_VENUE`` (default ``hyperliquid``). The Coinbase
+    path is preserved so legacy backtests remain reproducible; the new
+    Hyperliquid path is the production default for the crypto stack per
+    the retarget in ``docs/CRYPTO_HYPERLIQUID_RETARGET.md``.
+    """
+    if _BACKTEST_FEE_VENUE in ("coinbase", "coinbase_advanced"):
+        return SimulationConfig.from_coinbase_fees(**kwargs)
+    if _BACKTEST_FEE_VENUE in ("hyperliquid", "hl", "hyperliquid_perp"):
+        return SimulationConfig.from_hyperliquid_fees(**kwargs)
+    raise ValueError(
+        f"Unknown BACKTEST_FEE_VENUE={_BACKTEST_FEE_VENUE!r}. "
+        "Use 'hyperliquid' (default) or 'coinbase'."
+    )
 
 # -------------------------
 # CSV helper
@@ -236,13 +266,14 @@ class ProfitOptimizedBacktester:
         else:
             window_size = int(cfg.window_size or meta.get("window_size", DEFAULT_SEQ_LEN))
 
-        # HONEST COSTS: use the *real* Coinbase Advanced retail fee schedule
-        # (taker 60 bps / maker 40 bps) that the live adapter charges, instead of
-        # the old fictional 7.5 bps. The previous ``fee_pct = 0.00075`` understated
-        # round-trip cost by ~16x and left the maker path unwired, making every
-        # backtest fictional. ``from_coinbase_fees()`` wires BOTH sides.
-        # See trading/simulator.py COINBASE_*_FEE_PCT and
-        # src/exchanges/adapters/coinbase_tradeable.py _DEFAULT_COINBASE_FEE_MODEL.
+        # HONEST COSTS: the simulator wires the fee schedule of the chosen
+        # venue. Default is Hyperliquid perps (taker ~5 bps / maker ~2 bps)
+        # because the crypto 1m directional stack was killed at Coinbase
+        # (round-trip ~120 bps > +20 bps target — see ``docs/CRYPTO_1M_KILL.md``)
+        # but clears comfortably at Hyperliquid (~10 bps taker round-trip).
+        # The Coinbase path is preserved via env ``BACKTEST_FEE_VENUE=coinbase``.
+        # See trading/simulator.py {COINBASE,HYPERLIQUID}_*_FEE_PCT and
+        # src/exchanges/adapters/*_tradeable.py for the live FeeModel sources.
         tp_pct = float(meta.get("tp_pct", cfg.tp_pct))
         sl_pct = float(meta.get("sl_pct", cfg.sl_pct))
 
@@ -255,7 +286,7 @@ class ProfitOptimizedBacktester:
 
         overlap_rows = max(window_size + 5, 2000)
 
-        sim_cfg = SimulationConfig.from_coinbase_fees(
+        sim_cfg = _build_sim_config(
             start_capital=float(cfg.capital),
             tp_pct=tp_pct,
             sl_pct=sl_pct,
@@ -526,9 +557,18 @@ class ProfitOptimizedBacktester:
             "gate_max_drawdown_pct": gate_max_drawdown_pct,
             "gate_passed": (not gate_rejected),
             "gate_verdict": "REJECTED" if gate_rejected else "ACCEPTED",
+            "fee_venue": _BACKTEST_FEE_VENUE,
         }
+        # Persist a venue-tagged copy so the Hyperliquid retarget result is
+        # not silently overwritten the next time the Coinbase fee path runs
+        # against the same model dir. The legacy ``profit_report.json`` name
+        # is preserved for back-compat.
         report_path = Path(self.model_dir) / "profit_report.json"
         report_path.write_text(json.dumps(report, indent=2))
+        venue_report_path = (
+            Path(self.model_dir) / f"profit_report.{_BACKTEST_FEE_VENUE}.json"
+        )
+        venue_report_path.write_text(json.dumps(report, indent=2))
 
         if gate_rejected:
             print("UNPROFITABLE - REJECTED")

@@ -24,6 +24,18 @@ from utils import fmt_money, fmt_pct
 COINBASE_TAKER_FEE_PCT: float = 0.0060  # 60 bps per side
 COINBASE_MAKER_FEE_PCT: float = 0.0040  # 40 bps per side
 
+# Hyperliquid perp fee schedule (default tier). These mirror
+# ``src/exchanges/adapters/hyperliquid_tradeable.py``
+# (``_DEFAULT_HYPERLIQUID_FEE_MODEL``, ``FeeModel(maker=0.0002, taker=0.0005)``)
+# and the published Hyperliquid perp fees (~3.5 bps taker / ~1 bps maker).
+# Round-trip cost under this schedule:
+#   * taker-in + taker-out = 2 * 5 = ~10 bps  (default-tier; published 7 bps)
+#   * maker-in + maker-out = 2 * 1 = ~2 bps
+# A +20 bps directional target comfortably clears either, which is the
+# whole point of the venue retarget — see docs/CRYPTO_HYPERLIQUID_RETARGET.md.
+HYPERLIQUID_TAKER_FEE_PCT: float = 0.0005  # 5 bps per side (conservative default tier)
+HYPERLIQUID_MAKER_FEE_PCT: float = 0.0002  # 2 bps per side
+
 
 # ----------------------------
 # Data containers
@@ -130,6 +142,38 @@ class SimulationConfig:
         return cls.from_coinbase_fees(
             taker_fee_pct=float(fee_model.taker),
             maker_fee_pct=float(fee_model.maker),
+            **kwargs,
+        )
+
+    @classmethod
+    def from_hyperliquid_fees(
+        cls,
+        *,
+        taker_fee_pct: float = HYPERLIQUID_TAKER_FEE_PCT,
+        maker_fee_pct: float = HYPERLIQUID_MAKER_FEE_PCT,
+        **kwargs: Any,
+    ) -> "SimulationConfig":
+        """Build a config wired to Hyperliquid perp fees (default tier).
+
+        Mirrors :meth:`from_coinbase_fees` but with the Hyperliquid maker/taker
+        schedule. The crypto 1m directional stack was killed at Coinbase
+        (round-trip ~120 bps vs +20 bps target — see
+        ``docs/CRYPTO_1M_KILL.md``). At Hyperliquid the same +20 bps target
+        clears comfortably:
+
+          * taker-in + taker-out  = 2 * 5 = ~10 bps
+          * maker-in + maker-out  = 2 * 2 = ~4 bps
+          * taker-in + maker-out  = 5 + 2 = ~7 bps
+
+        See :class:`~exchanges.adapters.hyperliquid_tradeable.HyperliquidTradeable`
+        for the live adapter's authoritative ``FeeModel`` and
+        ``docs/CRYPTO_HYPERLIQUID_RETARGET.md`` for the retarget arithmetic.
+        """
+        kwargs.pop("fee_pct", None)
+        kwargs.pop("maker_fee_pct", None)
+        return cls(
+            fee_pct=float(taker_fee_pct),
+            maker_fee_pct=float(maker_fee_pct),
             **kwargs,
         )
 
