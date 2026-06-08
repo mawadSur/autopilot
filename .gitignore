@@ -23,3 +23,4 @@ model/
 *.pt
 model/
 model/
+.claude/worktrees/
