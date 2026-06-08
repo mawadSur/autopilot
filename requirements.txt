@@ -25,6 +25,10 @@ pydantic-settings
 ccxt
 python-binance
 cryptography
+
+# Equity data for the multi-asset pooled-LSTM pipeline (src/multi_asset/).
+# Free, no API key; loaded lazily by multi_asset.sources.StockSource.
+yfinance
 requests
 feedparser
 aiohttp
