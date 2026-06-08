@@ -32,10 +32,12 @@ __all__ = [
     "net_carry_annual",
     "normalize_funding_rates",
     "scan_carry",
+    "rank_persistent",
     "DEFAULT_PERIOD_HOURS",
     "DEFAULT_ROUND_TRIP_BPS",
     "DEFAULT_HOLD_DAYS",
     "DEFAULT_BASIS_BUFFER_ANNUAL",
+    "DEFAULT_CARRY_UNIVERSE",
 ]
 
 # Hyperliquid funds HOURLY. Other venues differ (Binance/Bybit 8h) — pass the
@@ -52,6 +54,11 @@ DEFAULT_HOLD_DAYS = 14.0
 # Annualized haircut for basis drift / slippage / funding compression over the
 # hold. Conservative; refine from shadow data.
 DEFAULT_BASIS_BUFFER_ANNUAL = 0.05  # 5%/yr
+# Rung-1 carry universe: only the two deepest, most liquid perps. The strategy
+# research (docs/STRATEGY_RESEARCH_2026_06_04.md) found the fat snapshot carries
+# on thin alts are not retail-harvestable; BTC/ETH funding is what actually
+# persists, so we restrict the harvestable set to these.
+DEFAULT_CARRY_UNIVERSE = ["BTC/USDC:USDC", "ETH/USDC:USDC"]
 
 
 @dataclass
@@ -180,6 +187,44 @@ def scan_carry(
         ))
     rows.sort(key=lambda c: c.net_annual, reverse=True)
     return rows
+
+
+def rank_persistent(
+    backtests: Sequence[Any],
+    *,
+    min_window_days: float = 7.0,
+    min_favorable_pct: float = 0.60,
+    min_net_annual: float = 0.0,
+) -> List[Any]:
+    """Filter + rank backtests by REALIZED persistence (not a snapshot spike).
+
+    A snapshot carry can be a one-period mirage; this ranks on the actual paid
+    funding history instead. Operates DUCK-TYPED on the row attributes
+    ``.symbol .side .net_annual .favorable_pct .window_days .gross_annual`` so
+    the scanner need NOT import the backtest module (avoids the import cycle).
+
+    Keeps a row iff it cleared a long-enough window, was favorable often enough,
+    and still earned a positive net carry::
+
+        window_days >= min_window_days AND
+        favorable_pct >= min_favorable_pct AND
+        net_annual > min_net_annual
+
+    Returns the kept rows sorted by ``net_annual`` descending.
+    """
+    kept: List[Any] = []
+    for bt in backtests:
+        if bt is None:
+            continue
+        if float(bt.window_days) < min_window_days:
+            continue
+        if float(bt.favorable_pct) < min_favorable_pct:
+            continue
+        if float(bt.net_annual) <= min_net_annual:
+            continue
+        kept.append(bt)
+    kept.sort(key=lambda b: float(b.net_annual), reverse=True)
+    return kept
 
 
 def _fetch_live(exchange_id: str = "hyperliquid", period_hours: float = DEFAULT_PERIOD_HOURS):
