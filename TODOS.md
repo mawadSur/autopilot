@@ -46,8 +46,10 @@ Last updated: 2026-05-08 (post-Wave-1 + Lane D in flight + E4 regime memory part
   - `src/regime_memory/{store,lookup,backfill}.py` landed at `45d642c` / `107e96e` / `98d425d`. Integration into `predictor.py` landed at `54e3c1d` (see Closed note below). See `src/regime_memory/INTEGRATION.md`.
   - Closed 2026-05-30: the real public API is `RegimeLookup.resolve_params()` (not `resolve()`), wired into `XGBoostPredictor._resolve_threshold()` — consulted from `predict_full()` and applied only when `_regime_confidence >= 0.5` — with a 232-line test file (`tests/prediction_market_scanner/test_predictor.py`; 51 predictor tests pass, regime-override + low-confidence/broken-store/mid-predict-raise fallbacks all covered). `MultiSymbolXGBoostPredictor.predict_full()` routes to the per-symbol predictor, so it inherits the integration. Remaining open sub-items are doc caveats only (encoder VERSION stamp in the `.npz` + RiskCalculator-side override per `INTEGRATION.md`); the path is inert until `REGIME_STORE_PATH` is set, and `optimal_threshold`/`regime_label` are still v0 synthetic heuristics — do not enable on weak evidence without a real per-symbol threshold sweep.
 
-- **P3 stocks adapter (Alpaca / IBKR)** — P2, depends on Lane D D1 + D2.
+- **P3 stocks adapter (Alpaca / IBKR)** — P2, depends on Lane D D1 + D2. **Alpaca leg shipped (paper).**
   - Lane D ships the Tradeable Protocol; once that's stable, a Stocks adapter is a 2-day brief instead of a 2-week port. Lower priority than crypto + Polymarket because the legal review is heavier.
+  - Closed (Alpaca, paper): `src/exchanges/alpaca.py` + `src/exchanges/adapters/alpaca_tradeable.py` implement the `Tradeable` protocol with asset_class `SPOT_EQUITY`; the supervisor accepts `--alpaca-symbols AAPL,MSFT`, constructs an `AlpacaExchange` from `ALPACA_API_KEY` / `ALPACA_API_SECRET` (paper API by default), and `_dispatch_tick` routes spot-equity to a Tradeable-driven handler. Writes are 🔒 gated by `ALPACA_TRADING_ENABLED` at the connector layer. Tests: 41 in `tests/stocks/test_alpaca_tradeable.py` + 45 in `tests/prediction_market_scanner/test_alpaca_*.py`. Doc: `docs/STOCKS_ALPACA_ADAPTER.md`.
+  - Open: real predictor + risk gate for equities, market-hours skip, short-borrow check before sell orders, IBKR backend.
 
 ---
 

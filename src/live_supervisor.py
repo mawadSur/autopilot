@@ -1287,13 +1287,21 @@ class Supervisor:
     # Per-symbol tick
     # ------------------------------------------------------------------
     def _dispatch_tick(self, symbol: str) -> SupervisorTick:
-        """Route a tick to crypto or binary tick handler by asset_class."""
+        """Route a tick to crypto, binary, or spot-equity tick handler by
+        asset_class. Spot crypto stays on the legacy ``_tick_symbol`` path
+        (driven by ``self.exchange.get_ticker``); spot equity goes through
+        a minimal Tradeable-driven path so the supervisor's Coinbase
+        exchange is never asked to quote an Alpaca symbol.
+        """
         tradeable = self._tradeables_by_symbol.get(symbol)
         if tradeable is not None:
             asset_class = getattr(tradeable, "asset_class", None)
             # String compare avoids importing AssetClass here.
-            if str(getattr(asset_class, "value", "")) == "prediction_binary":
+            ac_value = str(getattr(asset_class, "value", ""))
+            if ac_value == "prediction_binary":
                 return self._tick_prediction_binary(tradeable)
+            if ac_value == "spot_equity":
+                return self._tick_spot_equity(tradeable)
         return self._tick_symbol(symbol)
 
     def _tick_prediction_binary(self, tradeable: "Tradeable") -> SupervisorTick:
@@ -1337,6 +1345,61 @@ class Supervisor:
             model_confidence=None,
             action_taken="allowed",
             notes="prediction_binary",
+        )
+
+    def _tick_spot_equity(self, tradeable: "Tradeable") -> SupervisorTick:
+        """Minimal tick for Alpaca-style equity symbols.
+
+        Mirrors :meth:`_tick_prediction_binary` shape:
+          * Respects the kill switch (force-flat + force_flatted verdict).
+          * Reads the ticker through the adapter (NEVER ``self.exchange``,
+            which is Coinbase-only).
+          * Records ticker errors via ``_handle_tick_error`` so the per-
+            symbol error counter advances and the auto-trip logic fires
+            on persistent venue outages.
+          * Returns an ``allowed`` verdict on a successful tick.
+
+        No order placement is performed here — write paths on the Alpaca
+        adapter are gated by ``ALPACA_TRADING_ENABLED`` at the connector
+        layer, and a real model + risk integration is a follow-up.
+        """
+        symbol = tradeable.symbol
+        now = self._now()
+        if self.circuit_breakers.is_kill_switch_tripped():
+            self._kill_switch_trips_today += 1
+            return SupervisorTick(
+                tick_at_utc=now.isoformat(),
+                symbol=symbol,
+                verdict=CircuitBreakerVerdict(
+                    allow=False,
+                    tripped=["kill_switch"],
+                    reason="kill switch active",
+                    recommended_action="force_flat",
+                    details={},
+                ),
+                model_confidence=None,
+                action_taken="force_flatted",
+                notes="spot_equity kill_switch",
+            )
+        try:
+            tradeable.get_ticker()
+        except Exception as exc:  # noqa: BLE001 - venue errors are non-fatal
+            self._handle_tick_error(symbol)
+            return SupervisorTick(
+                tick_at_utc=now.isoformat(),
+                symbol=symbol,
+                verdict=self._allow_verdict(),
+                model_confidence=None,
+                action_taken="errored",
+                notes=f"alpaca_ticker: {exc!r}",
+            )
+        return SupervisorTick(
+            tick_at_utc=now.isoformat(),
+            symbol=symbol,
+            verdict=self._allow_verdict(),
+            model_confidence=None,
+            action_taken="allowed",
+            notes="spot_equity",
         )
 
     def _tick_symbol(self, symbol: str) -> SupervisorTick:
@@ -3461,6 +3524,19 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--alpaca-symbols",
+        type=str,
+        required=False,
+        default="",
+        help=(
+            "Comma-separated US-equity tickers (e.g. 'AAPL,MSFT'). "
+            "Each is wrapped in an AlpacaTradeable bound to an "
+            "AlpacaExchange constructed from ALPACA_API_KEY / "
+            "ALPACA_API_SECRET (paper API by default; live writes "
+            "require ALPACA_TRADING_ENABLED=true)."
+        ),
+    )
+    p.add_argument(
         "--mode",
         choices=("paper", "live"),
         default="paper",
@@ -3664,6 +3740,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     raw_polymarket = [
         s.strip() for s in (args.polymarket_markets or "").split(",") if s.strip()
     ]
+    raw_alpaca = [
+        s.strip().upper()
+        for s in (getattr(args, "alpaca_symbols", "") or "").split(",")
+        if s.strip()
+    ]
     # Dedupe preserving first-seen order. Duplicates are usually a config typo
     # (eg. ``--symbols ETH/USD,ETH/USD``) and would otherwise spawn two
     # supervisor entries fighting over the same Redis position keys + the
@@ -3691,21 +3772,32 @@ def main(argv: Optional[List[str]] = None) -> int:
             continue
         seen_pm.add(mid)
         polymarket_market_ids.append(mid)
-    if not symbols and not polymarket_market_ids:
+    alpaca_symbols: List[str] = []
+    seen_ap: set[str] = set()
+    for tkr in raw_alpaca:
+        if tkr in seen_ap:
+            LOGGER.warning(
+                "supervisor: dropping duplicate ticker %r from --alpaca-symbols",
+                tkr,
+            )
+            continue
+        seen_ap.add(tkr)
+        alpaca_symbols.append(tkr)
+    if not symbols and not polymarket_market_ids and not alpaca_symbols:
         # Preserve the legacy error string so existing CLI consumers /
         # tests that key off the substring "--symbols must contain at
         # least one entry" continue to work. We additionally surface
-        # the polymarket option for operators who want the union.
+        # the polymarket + alpaca options for operators who want the union.
         print(
             "error: --symbols must contain at least one entry "
-            "(or pass --polymarket-markets)",
+            "(or pass --polymarket-markets / --alpaca-symbols)",
             file=sys.stderr,
         )
         return 2
 
-    # Build PolymarketTradeable instances up-front so SupervisorConfig
-    # validation sees the union of (symbols, tradeables) and the
-    # supervisor's __init__ wires them into the iteration list.
+    # Build PolymarketTradeable / AlpacaTradeable instances up-front so
+    # SupervisorConfig validation sees the union of (symbols, tradeables)
+    # and the supervisor's __init__ wires them into the iteration list.
     tradeables: List[Any] = []
     if polymarket_market_ids:
         from exchanges.adapters import PolymarketTradeable
@@ -3713,6 +3805,26 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         for mid in polymarket_market_ids:
             tradeables.append(PolymarketTradeable(mid, polymarket_fetcher))
+    if alpaca_symbols:
+        from exchanges.adapters import AlpacaTradeable
+        from exchanges.alpaca import AlpacaExchange
+
+        # Construct ONE AlpacaExchange shared across every ticker. Paper
+        # mode is the default — operators must explicitly pass live=true
+        # via ALPACA_BASE_URL or flip ALPACA_TRADING_ENABLED before any
+        # write path can fire.
+        alpaca_paper = (
+            os.getenv("ALPACA_PAPER", "true").strip().lower()
+            not in ("false", "0", "no", "off")
+        )
+        alpaca_exchange = AlpacaExchange(
+            api_key=os.getenv("ALPACA_API_KEY", ""),
+            api_secret=os.getenv("ALPACA_API_SECRET", ""),
+            paper=alpaca_paper,
+            base_url=os.getenv("ALPACA_BASE_URL") or None,
+        )
+        for ticker in alpaca_symbols:
+            tradeables.append(AlpacaTradeable(alpaca_exchange, ticker))
 
     config = SupervisorConfig(
         symbols=symbols,
@@ -3816,11 +3928,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         confidence_history=confidence_history,
     )
 
-    # Include polymarket market ids in the run-dir name when set so the
-    # log path makes the heterogeneous tradeables list legible.
-    run_dir_label_symbols = list(symbols) + [
-        f"polymarket-{mid}" for mid in polymarket_market_ids
-    ]
+    # Include polymarket market ids + alpaca tickers in the run-dir name
+    # when set so the log path makes the heterogeneous tradeables list
+    # legible.
+    run_dir_label_symbols = (
+        list(symbols)
+        + [f"polymarket-{mid}" for mid in polymarket_market_ids]
+        + [f"alpaca-{tkr}" for tkr in alpaca_symbols]
+    )
     run_dir = _setup_run_dir(args.log_dir, symbols=run_dir_label_symbols)
 
     if args.once:
