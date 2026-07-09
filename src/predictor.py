@@ -533,6 +533,15 @@ class XGBoostPredictor:
         self._last_resolved_kelly_pct: Optional[float] = None
         self._maybe_init_regime_lookup()
 
+        # Optional DETERMINISTIC regime router (``USE_REGIME_ROUTER=1``). Unlike
+        # the k-NN store above (synthetic-v0 metadata), this is a transparent
+        # rule over ``adx`` / ``close_over_ema_50`` that the post-fee branch
+        # audit can validate directly. When enabled it takes precedence over the
+        # k-NN lookup in ``_resolve_threshold``; default OFF (see branch audit:
+        # routing did not turn post-fee expectancy positive on current data, so
+        # it ships wired-but-off until a model with edge > round-trip cost).
+        self.regime_router: Optional[Any] = self._maybe_init_regime_router()
+
         LOGGER.info(
             "XGBoostPredictor ready: dir=%s features=%d thr_long=%.3f (src=%s) "
             "regime_lookup=%s",
@@ -542,6 +551,27 @@ class XGBoostPredictor:
             self._thr_source,
             "on" if self.regime_lookup is not None else "off",
         )
+
+    def _maybe_init_regime_router(self) -> Optional[Any]:
+        """Construct a deterministic :class:`regime_router.RegimeRouter` when
+        ``USE_REGIME_ROUTER`` is truthy. Optional ``REGIME_ROUTER_CONFIG`` points
+        at a JSON file with per-regime overrides (see ``RegimeRouter.from_config``).
+        Never raises out — a bad config just disables routing."""
+        flag = os.getenv("USE_REGIME_ROUTER", "").strip().lower()
+        if flag not in ("1", "true", "yes", "on"):
+            return None
+        try:
+            from regime_router import RegimeRouter  # local import: path-robust
+            cfg_path = os.getenv("REGIME_ROUTER_CONFIG", "").strip()
+            cfg = None
+            if cfg_path and Path(cfg_path).expanduser().exists():
+                cfg = json.loads(Path(cfg_path).expanduser().read_text())
+            router = RegimeRouter.from_config(cfg)
+            LOGGER.info("regime_router enabled (config=%s)", cfg_path or "defaults")
+            return router
+        except Exception as exc:  # noqa: BLE001 - never block construction
+            LOGGER.warning("regime_router init failed: %r; routing disabled", exc)
+            return None
 
     def _maybe_init_regime_lookup(self) -> None:
         """Best-effort load of a RegimeLookup from ``REGIME_STORE_PATH``.
@@ -659,6 +689,20 @@ class XGBoostPredictor:
         feature rows (whatever the predictor used for inference). Passing
         ``None`` or any non-DataFrame falls back to static.
         """
+
+        # Deterministic router takes precedence when enabled. It reads the most
+        # recent feature row (``adx`` / ``close_over_ema_50``) and returns a
+        # per-regime long threshold; when the regime is disabled it returns a
+        # blocking threshold (> 1) so ``proba >= thr`` can never fire.
+        router = getattr(self, "regime_router", None)
+        if router is not None and feature_window is not None:
+            try:
+                row = feature_window.iloc[-1] if hasattr(feature_window, "iloc") else feature_window
+                enabled, thr, _regime = router.route(row)
+                self._last_resolved_kelly_pct = None
+                return float(thr) if enabled else 1.01
+            except Exception as exc:  # noqa: BLE001 - degrade to static/k-NN path
+                LOGGER.warning("regime_router raised mid-predict: %r; falling back", exc)
 
         lookup = self.regime_lookup
         if lookup is None or feature_window is None:
