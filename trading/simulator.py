@@ -190,6 +190,25 @@ def print_portfolio_report(report: dict, currency: str = "$") -> None:
 
 
 # ----------------------------
+# Signal convention helpers
+# ----------------------------
+
+_CLASS_TO_RAW = {0: -1, 1: 0, 2: 1}
+
+
+def class_to_raw(cls_sig: int) -> int:
+    """Map a class-style signal to the raw signal the simulator expects.
+
+    Class-style (StrategyGate / ConsensusFilter): ``0`` short, ``1`` hold, ``2`` long.
+    Raw (simulator):                              ``-1`` short, ``0`` flat, ``+1`` long.
+    """
+    try:
+        return _CLASS_TO_RAW[int(cls_sig)]
+    except (KeyError, ValueError, TypeError):
+        raise ValueError(f"class_to_raw expects class-style 0/1/2, got {cls_sig!r}")
+
+
+# ----------------------------
 # Core simulator
 # ----------------------------
 
@@ -217,6 +236,7 @@ class PortfolioSimulator:
         self.cash = float(self.config.start_capital)
         self.pos = 0  # -1 short, 0 flat, +1 long
         self.entry_price: Optional[float] = None
+        self.entry_fee: float = 0.0  # fee paid entering the OPEN position (USD)
         self.tp_price: Optional[float] = None
         self.sl_price: Optional[float] = None
         self.position_size: float = 0.0  # notional exposure (pre-leverage)
@@ -491,17 +511,26 @@ class PortfolioSimulator:
             })
 
     def _normalize_signal(self, sig: Optional[int]) -> int:
+        """Validate a RAW simulator signal: ``-1`` short / ``0`` flat / ``+1`` long.
+
+        This used to try to accept BOTH raw ``-1/0/1`` and class-style ``0/1/2``
+        in one function — but those overlap on 0 and 1, so a class-style HOLD
+        (``1``) was silently normalized to LONG (``+1``) and a class-style SHORT
+        (``0``) to FLAT. The simulator now speaks ONE unambiguous language (raw);
+        callers holding class-style signals must convert via :func:`class_to_raw`
+        first (the ``simulate_trades_with_tp_sl*`` wrappers and ``backtest.py``
+        do). Anything outside ``{-1, 0, 1}`` raises rather than mis-trading.
+        """
         if sig is None:
             return 0
-        if sig in (-1, 0, 1):
-            return int(sig)
-        if sig == 2:
-            return 1
-        if sig == 0:
-            return -1
-        if sig == 1:
-            return 0
-        raise ValueError(f"Unsupported signal value: {sig}")
+        s = int(sig)
+        if s in (-1, 0, 1):
+            return s
+        raise ValueError(
+            f"Unsupported raw signal {sig!r}; expected -1/0/+1. If this is a "
+            "class-style 0/1/2 (short/hold/long) signal, convert it with "
+            "class_to_raw() before calling step()/run_batch()."
+        )
 
     def _apply_filters(self, sig: int, bar: Bar) -> int:
         sig_out = sig
@@ -641,6 +670,7 @@ class PortfolioSimulator:
 
         self.pos = side
         self.entry_price = entry
+        self.entry_fee = float(fee_in)
         self.tp_price = tp
         self.sl_price = sl
         self.position_size = position_notional
@@ -684,19 +714,30 @@ class PortfolioSimulator:
             exit_exec = self._market_fill_price(order_side, bar, float(exit_price), qty_base)
 
         if self.pos > 0:
-            ret = (exit_exec / self.entry_price) - 1.0
+            gross_ret = (exit_exec / self.entry_price) - 1.0
         else:
-            ret = (self.entry_price / exit_exec) - 1.0
+            gross_ret = (self.entry_price / exit_exec) - 1.0
 
-        pnl = ret * self.position_size * self.config.leverage
-        cash_before = self.cash
-        self.cash += pnl
+        notional = self.position_size * self.config.leverage
+        gross_pnl = gross_ret * notional
+        self.cash += gross_pnl
         fee_out = self._fee_pct_for_role(liquidity_role) * self.position_size * self.config.leverage
         self.cash -= fee_out
         if liquidity_role == "maker":
             self.maker_fills += 1
         else:
             self.taker_fills += 1
+
+        # HONEST POST-FEE ACCOUNTING: the realized P/L booked against this trade
+        # nets BOTH legs' fees (entry fee paid at open + this exit fee). Prior
+        # behavior logged the GROSS price P/L here while quietly deducting fees
+        # from cash, so ``trade_log['ret']`` / ``['pnl']`` — and therefore
+        # ``profitability.compute_profitability_metrics`` expectancy / profit
+        # factor and this sim's own ``report()`` PF — were pre-fee. Equity-curve
+        # metrics were already net; now the per-trade metrics agree with them.
+        fees = float(self.entry_fee) + float(fee_out)
+        pnl = gross_pnl - fees
+        ret = pnl / max(1e-12, notional)
 
         hold_bars = (self.bar_index - (self.entry_index or self.bar_index) + 1)
         self.hold_bars_sum += hold_bars
@@ -718,8 +759,11 @@ class PortfolioSimulator:
                 "side": "long" if self.pos > 0 else "short",
                 "action": "exit",
                 "price": exit_exec,
-                "pnl": pnl,
-                "ret": ret,
+                "pnl": pnl,           # net of entry + exit fees
+                "ret": ret,           # net-of-fee return on notional
+                "gross_pnl": gross_pnl,
+                "gross_ret": gross_ret,
+                "fees": fees,
                 "win": bool(win),
                 "reason": reason,
                 "liquidity_role": liquidity_role,
@@ -731,6 +775,7 @@ class PortfolioSimulator:
         # Reset position
         self.pos = 0
         self.entry_price = None
+        self.entry_fee = 0.0
         self.tp_price = None
         self.sl_price = None
         self.position_size = 0.0
@@ -859,7 +904,10 @@ def simulate_trades_with_tp_sl(
     )
     bars = _bars_from_arrays(opens, highs, lows, closes, atr=atr, regime=regime)
     sim = PortfolioSimulator(cfg)
-    report, curve = sim.run_batch(bars, classes)
+    # ``classes`` are class-style (0 short / 1 hold / 2 long); the simulator
+    # speaks raw (-1/0/+1). Convert at this boundary (see class_to_raw).
+    raw_signals = [class_to_raw(int(c)) for c in classes]
+    report, curve = sim.run_batch(bars, raw_signals)
     return report, curve
 
 
@@ -914,5 +962,8 @@ def simulate_trades_with_tp_sl_more_aggressive(
     )
     bars = _bars_from_arrays(opens, highs, lows, closes, atr=atr, regime=regime)
     sim = PortfolioSimulator(cfg)
-    report, curve = sim.run_batch(bars, classes)
+    # ``classes`` are class-style (0 short / 1 hold / 2 long); the simulator
+    # speaks raw (-1/0/+1). Convert at this boundary (see class_to_raw).
+    raw_signals = [class_to_raw(int(c)) for c in classes]
+    report, curve = sim.run_batch(bars, raw_signals)
     return report, curve

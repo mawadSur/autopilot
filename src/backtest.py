@@ -55,6 +55,7 @@ try:
         SimulationConfig,
         PortfolioSimulator,
         print_portfolio_report,
+        class_to_raw,
     )
     try:
         from src.streamer import KlineStreamer
@@ -70,6 +71,7 @@ except ModuleNotFoundError:
         SimulationConfig,
         PortfolioSimulator,
         print_portfolio_report,
+        class_to_raw,
     )
     try:
         from src.streamer import KlineStreamer
@@ -319,7 +321,7 @@ class ProfitOptimizedBacktester:
                 sig = consensus_filter.step(raw_sig)
                 atr = float(bar.atr) if bar.atr is not None and np.isfinite(bar.atr) else None
                 sim.config.slippage_pct = (0.5 * atr / max(1e-12, float(bar.close))) if atr is not None else 0.0
-                sim.step(bar, signal=sig)
+                sim.step(bar, signal=class_to_raw(sig))
                 total_pred += 1
             X_batch.clear()
             bar_batch.clear()
@@ -351,7 +353,7 @@ class ProfitOptimizedBacktester:
                     sig = 2 if ret >= float(cfg.up_thr) else (0 if ret <= -float(cfg.down_thr) else 1)
                     atr = float(bar.atr) if bar.atr is not None and np.isfinite(bar.atr) else None
                     sim.config.slippage_pct = (0.5 * atr / max(1e-12, float(bar.close))) if atr is not None else 0.0
-                    sim.step(bar, signal=sig)
+                    sim.step(bar, signal=class_to_raw(sig))
                     total_pred += 1
             else:
                 logits = out / temperature if abs(temperature - 1.0) > 1e-6 else out
@@ -369,7 +371,7 @@ class ProfitOptimizedBacktester:
                     sig = consensus_filter.step(raw_sig)
                     atr = float(bar.atr) if bar.atr is not None and np.isfinite(bar.atr) else None
                     sim.config.slippage_pct = (0.5 * atr / max(1e-12, float(bar.close))) if atr is not None else 0.0
-                    sim.step(bar, signal=sig)
+                    sim.step(bar, signal=class_to_raw(sig))
                     total_pred += 1
 
             X_batch.clear()
