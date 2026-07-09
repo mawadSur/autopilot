@@ -10,7 +10,8 @@ regime-aware routing (one model, per-regime thresholds/gating). No retrain._
 |---|---|
 | `src/crypto_training/branch_audit.py` | Execution-aware, post-fee **ablation harness**. Baseline + one-branch-flipped runs + threshold sweep + per-regime EV + combined recommendation. Writes `<model-dir>/branch_audit.json`. |
 | `src/regime_router.py` | Deterministic, auditable regime router (trend-up/down/chop from `adx` + `close_over_ema_50`) → per-regime long threshold + enable flag. |
-| `src/predictor.py` (wiring) | `XGBoostPredictor` consults the router when `USE_REGIME_ROUTER=1` (optional `REGIME_ROUTER_CONFIG=<json>`), taking precedence over the k-NN store. **Default OFF.** |
+| `src/dynamic_threshold.py` | Cost-aware **dynamic entry threshold**: raises `thr_long` when expected execution cost is high — volatility via `atrp_14` (live), liquidity via spread/depth/imbalance (inert until the book is backfilled). Sign-tunable, clipped; composes on top of the regime/base threshold. |
+| `src/predictor.py` (wiring) | `XGBoostPredictor` consults the router when `USE_REGIME_ROUTER=1` and the dynamic threshold when `USE_DYNAMIC_THRESHOLD=1` (applied *after* regime routing; a disabled regime stays blocked). Optional `REGIME_ROUTER_CONFIG` / `DYNAMIC_THRESHOLD_CONFIG` JSON. **Both default OFF.** |
 | `tests/test_branch_audit.py` | 11 dependency-light unit tests (classifier, verdicts, honest post-fee reconstruction, consensus). |
 
 ### Method / honest-costs notes
@@ -35,6 +36,7 @@ OOS test slice ≈ 2026-05-09 → 2026-05-22 (~13.5 days, ~19.4k bars per symbol
 
 - **`consensus` (require N consecutive signals): incompatible with these models — remove.** The models fire on ~0.2% of bars as *isolated* single bars; `consensus=2` needs two consecutive fires, which essentially never happens → it silences the model to **0 trades**. (This is the legacy 3-class-transformer default leaking onto a sparse binary model.) The `XGBoostPredictor` path correctly does not use it; keep it off.
 - **`regime_filter` / `regime_routing`: their "improvement" is mostly *trading less*.** On this slice they cut trades toward zero; since every trade is a net loser, not trading trivially raises EV toward 0. The **per-regime EV breakdown shows every regime is negative** (SOL: chop −106, trend_down −129, trend_up −144 bps). So routing **cannot rescue** the strategy on current data — it ships **wired but OFF**.
+- **`dynamic_threshold` (cost-aware entry threshold): does not pay on current data — wired but OFF.** Default (cost-aware, `s_vol=+0.06`: demand more conviction in high vol) worsens post-fee EV on all three symbols (ETH −18, BTC −2, SOL −6 bps) by over-thinning to a handful of trades. The volatility-sign sweep confirms neither direction rescues it (ETH: `+0.12→−147bps`/2 trades, `−0.12→−121bps`/32 trades — more trades, still negative). Only the **volatility** term moves today; the **liquidity** term (spread/depth/imbalance) is structurally wired but inert because those columns are all 0. Like regime routing, this is a shaping lever with no post-fee edge to shape until a model clears round-trip cost (or the book is backfilled to activate the liquidity term).
 - **`dynamic_slippage` (cost model, always-on): ~25–42 bps/trade.** Turning it off "improves" EV only by fabricating optimistic fills. Reported for cost sensitivity, never auto-cut.
 - **`market_depth` (cost model): inert here** — no book data, so it falls back to top-of-book/ATR. Cannot be validated until datasets are rebuilt with L2.
 - **`post_only` (maker vs taker): unvalidated** — maker fills need book data we don't have; the harness flags it heuristic. Real leverage exists here (maker-only round-trip ≈ 80 bps vs 120 bps taker) but still exceeds the model's edge.
@@ -68,4 +70,7 @@ env PYTHONPATH=src ./.venv/bin/python -m unittest tests.test_branch_audit
 
 # Enable deterministic regime routing live (default off)
 USE_REGIME_ROUTER=1 [REGIME_ROUTER_CONFIG=path/to/router.json] ...
+
+# Enable cost-aware dynamic entry threshold live (default off; set per-symbol ref_atrp)
+USE_DYNAMIC_THRESHOLD=1 [DYNAMIC_THRESHOLD_CONFIG=path/to/dyn.json] ...
 ```

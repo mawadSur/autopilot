@@ -62,6 +62,7 @@ import joblib  # noqa: E402
 from trading.simulator import Bar, PortfolioSimulator, SimulationConfig  # noqa: E402
 from strategy_gate import StrategyGate  # noqa: E402
 from regime_router import RegimeRouter  # noqa: E402
+from dynamic_threshold import DynamicThreshold, DynamicThresholdConfig  # noqa: E402
 
 # Class-style signal constants (StrategyGate / ConsensusFilter convention).
 CLS_SHORT, CLS_HOLD, CLS_LONG = 0, 1, 2
@@ -119,6 +120,7 @@ class BranchConfig:
     use_min_atr: bool = False
     min_atr_pct: float = 0.001
     use_regime_routing: bool = False   # NEW: per-regime threshold/enable
+    use_dynamic_threshold: bool = False  # NEW: cost-aware (vol+liq) thr adjust
     # --- Execution/exit branches: default ON, audited as "remove" ------------
     use_post_only: bool = True         # maker entries (heuristic: no book data)
     use_market_depth: bool = True      # book-walk fills  (heuristic: no book data)
@@ -239,6 +241,7 @@ def run_branch(
     feature_cols: List[str],
     start_capital: float = 10_000.0,
     return_sim: bool = False,
+    dyn: Optional[DynamicThreshold] = None,
 ):
     """Run the execution simulator under one branch config; return post-fee metrics."""
     sim_cfg = SimulationConfig.from_coinbase_fees(
@@ -267,6 +270,7 @@ def run_branch(
     )
     consensus = ConsensusFilter(bc.consensus if bc.use_consensus else 1)
     router = RegimeRouter() if bc.use_regime_routing else None
+    dynamic = dyn if (bc.use_dynamic_threshold and dyn is not None) else None
 
     for k, bar in enumerate(bars):
         p = float(p_long[k])
@@ -275,6 +279,8 @@ def run_branch(
         enabled = True
         if router is not None:
             enabled, thr, _reg = router.route(row)
+        if dynamic is not None:
+            thr = dynamic.adjust(thr, row)  # cost-aware bump on the base thr
         cls_sig = CLS_LONG if (enabled and p >= thr) else CLS_HOLD
         # Confluence hard gate (long-only): may demote LONG -> HOLD.
         if bc.use_hard_gate and cls_sig == CLS_LONG:
@@ -380,6 +386,7 @@ _ABLATIONS = [
     ("regime_filter", dict(use_regime_filter=True), "add"),
     ("min_atr_filter", dict(use_min_atr=True), "add"),
     ("regime_routing", dict(use_regime_routing=True), "add"),
+    ("dynamic_threshold", dict(use_dynamic_threshold=True), "add"),
     # Execution/exit STRATEGY choices — baseline ON, flip OFF; KEEP if removing hurts.
     ("post_only_maker", dict(use_post_only=False), "remove"),
     ("atr_stops", dict(use_atr_stops=False), "remove"),
@@ -427,9 +434,15 @@ def audit_model(
         default_thr = float(meta.get("optimal_threshold") or 0.5)
     baseline = BranchConfig(thr_long=float(default_thr))
 
+    # Reference volatility for the dynamic threshold = median atrp of THIS slice
+    # (a dispersion scale, not a fitted-on-outcomes parameter). Live uses config.
+    atrp = np.asarray(sl["atrp_14"], dtype=float) if "atrp_14" in sl.columns else np.array([])
+    ref_atrp = float(np.nanmedian(atrp)) if atrp.size and np.isfinite(np.nanmedian(atrp)) else 0.0008
+    dyn = DynamicThreshold(DynamicThresholdConfig(ref_atrp=ref_atrp))
+
     base_metrics, base_sim = run_branch(
         baseline, p_long=p_long, bars=bars, feature_rows=feature_rows,
-        feature_cols=feature_cols, start_capital=start_capital, return_sim=True)
+        feature_cols=feature_cols, start_capital=start_capital, return_sim=True, dyn=dyn)
     base_exp = base_metrics["post_fee_expectancy"]
 
     # Per-regime post-fee EV of baseline trades (the real regime-routing test).
@@ -441,7 +454,7 @@ def audit_model(
     for name, override, kind in _ABLATIONS:
         bc = replace(baseline, **override)
         m = run_branch(bc, p_long=p_long, bars=bars, feature_rows=feature_rows,
-                       feature_cols=feature_cols, start_capital=start_capital)
+                       feature_cols=feature_cols, start_capital=start_capital, dyn=dyn)
         branches.append({
             "branch": name, "kind": kind,
             "delta_expectancy": m["post_fee_expectancy"] - base_exp,
@@ -462,6 +475,18 @@ def audit_model(
     tradeable = [s for s in sweep if s["n_trades"] >= 10] or sweep
     best_thr = max(tradeable, key=lambda s: s["post_fee_expectancy"])["thr_long"]
 
+    # Dynamic-threshold volatility-SIGN sweep: does demanding MORE conviction in
+    # high vol (s_vol>0, cost/noise-aware) or LESS (s_vol<0, opportunity view)
+    # help post-fee EV? Let the data pick the sign instead of asserting it.
+    dyn_sign_sweep = []
+    for s_vol in (0.12, 0.06, -0.06, -0.12):
+        d = DynamicThreshold(DynamicThresholdConfig(ref_atrp=ref_atrp, s_vol=float(s_vol)))
+        m = run_branch(replace(baseline, use_dynamic_threshold=True), p_long=p_long, bars=bars,
+                       feature_rows=feature_rows, feature_cols=feature_cols,
+                       start_capital=start_capital, dyn=d)
+        dyn_sign_sweep.append({"s_vol": s_vol, "post_fee_expectancy": m["post_fee_expectancy"],
+                               "n_trades": m["n_trades"], "net_return_pct": m["net_return_pct"]})
+
     # Combined config: apply every CUT + adopt routing if KEEP, at best thr.
     combo = replace(baseline, thr_long=float(best_thr))
     for b in branches:
@@ -473,7 +498,7 @@ def audit_model(
         ):
             combo = replace(combo, **dict(_ABLATIONS_MAP[name]))
     combo_metrics = run_branch(combo, p_long=p_long, bars=bars, feature_rows=feature_rows,
-                               feature_cols=feature_cols, start_capital=start_capital)
+                               feature_cols=feature_cols, start_capital=start_capital, dyn=dyn)
 
     return {
         "model_dir": str(model_dir),
@@ -489,6 +514,7 @@ def audit_model(
         "branches": branches,
         "threshold_sweep": sweep,
         "best_thr_long": best_thr,
+        "dynamic_threshold": {"ref_atrp": ref_atrp, "sign_sweep": dyn_sign_sweep},
         "recommended_config": vars(combo),
         "recommended_metrics": combo_metrics,
         "caveats": [
@@ -498,6 +524,9 @@ def audit_model(
             "with L2 book data to validate those two branches for real.",
             "Post-fee per-trade returns are reconstructed from the equity curve "
             "(cross-check); the simulator now also nets fees into trade_log ret/pnl.",
+            "dynamic_threshold: only its VOLATILITY term moves on current data; the "
+            "LIQUIDITY term (spread/depth/imbalance) is inert until the L2 book is "
+            "backfilled (those columns are all 0).",
             "Intrabar TP/SL uses real high/low from the OHLC join.",
         ],
     }
@@ -555,6 +584,13 @@ def _fmt(res: Dict) -> str:
     lines.append("THRESHOLD SWEEP (EV/trade bps @ thr): " +
                  "  ".join(f"{s['thr_long']:.2f}:{s['post_fee_expectancy']*1e4:+.1f}" for s in sw))
     lines.append(f"  -> best thr_long = {res['best_thr_long']:.2f}")
+    dt = res.get("dynamic_threshold", {})
+    if dt.get("sign_sweep"):
+        lines.append(f"DYNAMIC THRESHOLD (ref_atrp={dt.get('ref_atrp'):.5f}) vol-sign sweep "
+                     "(EV/trade bps @ s_vol):")
+        lines.append("    " + "  ".join(
+            f"{s['s_vol']:+.2f}:{s['post_fee_expectancy']*1e4:+.1f}(n={s['n_trades']})"
+            for s in dt["sign_sweep"]))
     r = res["recommended_metrics"]
     lines.append("-" * 92)
     lines.append(f"RECOMMENDED (best thr + all CUTs + routing-if-kept): "

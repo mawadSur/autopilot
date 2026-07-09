@@ -542,6 +542,12 @@ class XGBoostPredictor:
         # it ships wired-but-off until a model with edge > round-trip cost).
         self.regime_router: Optional[Any] = self._maybe_init_regime_router()
 
+        # Optional cost-aware dynamic entry threshold (``USE_DYNAMIC_THRESHOLD=1``).
+        # Applied ON TOP of whatever base threshold the static/regime path resolves
+        # — it raises the bar when expected execution cost (volatility, and once
+        # book data exists, liquidity) is high. Default OFF.
+        self.dynamic_threshold: Optional[Any] = self._maybe_init_dynamic_threshold()
+
         LOGGER.info(
             "XGBoostPredictor ready: dir=%s features=%d thr_long=%.3f (src=%s) "
             "regime_lookup=%s",
@@ -572,6 +578,42 @@ class XGBoostPredictor:
         except Exception as exc:  # noqa: BLE001 - never block construction
             LOGGER.warning("regime_router init failed: %r; routing disabled", exc)
             return None
+
+    def _maybe_init_dynamic_threshold(self) -> Optional[Any]:
+        """Construct a :class:`dynamic_threshold.DynamicThreshold` when
+        ``USE_DYNAMIC_THRESHOLD`` is truthy. Optional ``DYNAMIC_THRESHOLD_CONFIG``
+        points at a JSON file (see ``DynamicThreshold.from_config``; set a
+        per-symbol ``ref_atrp`` there). Never raises out."""
+        flag = os.getenv("USE_DYNAMIC_THRESHOLD", "").strip().lower()
+        if flag not in ("1", "true", "yes", "on"):
+            return None
+        try:
+            from dynamic_threshold import DynamicThreshold  # local import: path-robust
+            cfg_path = os.getenv("DYNAMIC_THRESHOLD_CONFIG", "").strip()
+            cfg = None
+            if cfg_path and Path(cfg_path).expanduser().exists():
+                cfg = json.loads(Path(cfg_path).expanduser().read_text())
+            dt = DynamicThreshold.from_config(cfg)
+            LOGGER.info("dynamic_threshold enabled (config=%s)", cfg_path or "defaults")
+            return dt
+        except Exception as exc:  # noqa: BLE001 - never block construction
+            LOGGER.warning("dynamic_threshold init failed: %r; disabled", exc)
+            return None
+
+    def _resolve_entry_threshold(self, feature_window: Any) -> float:
+        """Base threshold (static / regime / k-NN) with the optional cost-aware
+        dynamic adjustment layered on top. A regime-*disabled* bar (base >= 1.0)
+        is left blocked — the dynamic layer must never re-enable it."""
+        base = self._resolve_threshold(feature_window)
+        dyn = getattr(self, "dynamic_threshold", None)
+        if dyn is None or feature_window is None or base >= 1.0:
+            return base
+        try:
+            row = feature_window.iloc[-1] if hasattr(feature_window, "iloc") else feature_window
+            return float(dyn.adjust(base, row))
+        except Exception as exc:  # noqa: BLE001 - degrade to base threshold
+            LOGGER.warning("dynamic_threshold raised mid-predict: %r; using base", exc)
+            return base
 
     def _maybe_init_regime_lookup(self) -> None:
         """Best-effort load of a RegimeLookup from ``REGIME_STORE_PATH``.
@@ -662,7 +704,7 @@ class XGBoostPredictor:
         # Resolve threshold via regime lookup if available — falls back to
         # static ``self.thr_long`` when lookup is None, returns low
         # confidence, or raises mid-prediction.
-        effective_thr_long = self._resolve_threshold(feature_window)
+        effective_thr_long = self._resolve_entry_threshold(feature_window)
         if proba >= effective_thr_long:
             side, conf = _validated_decision("buy", float(proba))
         else:

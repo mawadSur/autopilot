@@ -19,6 +19,9 @@ for _p in (os.path.join(_ROOT, "src"), _ROOT):
         sys.path.insert(0, _p)
 
 from regime_router import RegimeRouter, Regime, classify_regime  # noqa: E402
+from dynamic_threshold import (  # noqa: E402
+    DynamicThreshold, DynamicThresholdConfig, vol_signal, liq_signal,
+)
 from crypto_training.branch_audit import (  # noqa: E402
     ConsensusFilter, _verdict, _post_fee_metrics, _regime_breakdown,
     CLS_LONG, CLS_HOLD,
@@ -113,6 +116,73 @@ class TestPostFeeReconstruction(unittest.TestCase):
         self.assertGreater(out[Regime.TREND_UP]["post_fee_expectancy"], 0.0)
         self.assertEqual(out[Regime.CHOP]["n_trades"], 1)
         self.assertLess(out[Regime.CHOP]["post_fee_expectancy"], 0.0)
+
+
+class TestDynamicThreshold(unittest.TestCase):
+    def _dt(self, **kw):
+        base = dict(ref_atrp=0.0008, s_vol=0.06, thr_min=0.30, thr_max=0.90)
+        base.update(kw)
+        return DynamicThreshold(DynamicThresholdConfig(**base))
+
+    def test_identity_at_reference_vol(self):
+        dt = self._dt()
+        self.assertAlmostEqual(dt.adjust(0.55, {"atrp_14": 0.0008}), 0.55, places=6)
+
+    def test_high_vol_raises_threshold(self):
+        dt = self._dt()  # s_vol > 0
+        # atrp = 2x ref -> vol_signal = +1 -> +0.06
+        self.assertAlmostEqual(dt.adjust(0.55, {"atrp_14": 0.0016}), 0.61, places=6)
+
+    def test_negative_svol_lowers_in_high_vol(self):
+        dt = self._dt(s_vol=-0.06)
+        self.assertAlmostEqual(dt.adjust(0.55, {"atrp_14": 0.0016}), 0.49, places=6)
+
+    def test_clip_bounds(self):
+        dt = self._dt(s_vol=0.5, vol_clip=3.0, thr_max=0.90)
+        self.assertLessEqual(dt.adjust(0.80, {"atrp_14": 0.01}), 0.90)
+        dt2 = self._dt(s_vol=-0.5, thr_min=0.30)
+        self.assertGreaterEqual(dt2.adjust(0.35, {"atrp_14": 0.01}), 0.30)
+
+    def test_missing_vol_is_no_op(self):
+        dt = self._dt()
+        self.assertAlmostEqual(dt.adjust(0.55, {}), 0.55, places=6)
+        self.assertEqual(vol_signal({"atrp_14": float("nan")}, ref_atrp=0.0008, vol_clip=3.0), 0.0)
+
+    def test_liquidity_inert_without_book_but_active_with_spread(self):
+        # spread_pct == 0 (current data) -> no stress
+        self.assertEqual(liq_signal({"spread_pct": 0.0}, ref_spread_bps=2.0, liq_clip=5.0), 0.0)
+        # a wide 6 bps spread (3x ref) -> positive stress
+        self.assertGreater(liq_signal({"spread_pct": 0.0006}, ref_spread_bps=2.0, liq_clip=5.0), 0.0)
+
+    def test_from_config_override(self):
+        dt = DynamicThreshold.from_config({"ref_atrp": 0.001, "s_vol": 0.1})
+        self.assertAlmostEqual(dt.cfg.ref_atrp, 0.001)
+        self.assertAlmostEqual(dt.cfg.s_vol, 0.1)
+
+
+class TestPredictorThresholdComposition(unittest.TestCase):
+    """The dynamic layer must never re-enable a regime-disabled (base>=1.0) bar."""
+
+    def test_blocked_base_is_left_untouched(self):
+        import types
+        from predictor import XGBoostPredictor
+        fake = types.SimpleNamespace(
+            dynamic_threshold=DynamicThreshold(DynamicThresholdConfig()),
+        )
+        fake._resolve_threshold = lambda fw: 1.01  # regime disabled
+        resolve = XGBoostPredictor.__dict__["_resolve_entry_threshold"]
+        row = {"atrp_14": 0.01}  # high vol would otherwise clip to 0.90
+        self.assertEqual(resolve(fake, row), 1.01)
+
+    def test_dynamic_applied_on_tradeable_base(self):
+        import types
+        from predictor import XGBoostPredictor
+        fake = types.SimpleNamespace(
+            dynamic_threshold=DynamicThreshold(DynamicThresholdConfig(ref_atrp=0.0008, s_vol=0.06)),
+        )
+        fake._resolve_threshold = lambda fw: 0.55
+        resolve = XGBoostPredictor.__dict__["_resolve_entry_threshold"]
+        self.assertAlmostEqual(resolve(fake, {"atrp_14": 0.0016}), 0.61, places=6)
 
 
 class TestConsensusFilter(unittest.TestCase):
