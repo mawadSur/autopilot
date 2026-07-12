@@ -4209,13 +4209,14 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--halal-mode",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=None,
         help=(
             "Halal (Shariah-compliant) trading: long-only + spot-only. Blocks "
             "any short entry and fail-closes any live order routed to a "
-            "non-spot venue (perps/leverage/funding). When omitted, defaults "
-            "to the HALAL_MODE env var (default off)."
+            "non-spot venue (perps/leverage/funding). ON by default; pass "
+            "--no-halal-mode to disable for this run (or set HALAL_MODE=0). "
+            "When omitted, follows the HALAL_MODE env var (default on)."
         ),
     )
     p.add_argument(

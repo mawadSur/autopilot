@@ -79,9 +79,10 @@ class TradingConfig(BaseSettings):
     # non-compliant order: no shorts (selling an asset you don't own), no
     # perpetual-futures / leverage / funding-rate venues (riba + gharar). The
     # Polymarket prediction-market stack (maisir/gambling) is scan-and-advise
-    # only and is never routed to the trading engine. Default False to preserve
-    # legacy behavior; set HALAL_MODE=1 (or pass --halal-mode) to activate.
-    HALAL_MODE: bool = Field(False, env="HALAL_MODE")
+    # only and is never routed to the trading engine. Default ON — this is the
+    # operational default for every CLI run of the bot. Disable per-run with
+    # --no-halal-mode, or globally with HALAL_MODE=0 in the environment.
+    HALAL_MODE: bool = Field(True, env="HALAL_MODE")
     risk_pct_per_trade: float = Field(0.004, env="RISK_PCT_PER_TRADE")
     csv_path: str = Field("", env="CSV_PATH")
     testnet: bool = Field(True, env="TESTNET")
