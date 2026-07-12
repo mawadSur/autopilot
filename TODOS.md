@@ -10,10 +10,10 @@ Last updated: 2026-05-08 (post-Wave-1 + Lane D in flight + E4 regime memory part
 
 ## Lane D follow-ups (multi-symbol multiprocess supervisor)
 
-- **D2 Polymarket tradeable + supervisor wiring** — P1, currently in flight as `D2-rerun`.
+- **D2 Polymarket tradeable + supervisor wiring** — ✅ DONE (`0ac448d` adapter + `live_supervisor.py` wiring; 25 unit tests pass).
   - Brief: `autopilot_lane_d_launch_briefs_2026_05_08.md` ("Sub-agent D2").
   - Adds `PolymarketTradeable` adapter + `SupervisorConfig.tradeables` field so Polymarket binary markets tick alongside crypto symbols in the same loop.
-  - Next action: wait for D2-rerun to land, review, push, then launch D3.
+  - Closed 2026-05-30: adapter + `SupervisorConfig.tradeables` + `--polymarket-markets` CLI flag + the symbols-OR-tradeables config validation all landed and pass `tests.prediction_market_scanner.test_polymarket_tradeable` (25 tests OK). The 3 broker follow-ups in the adapter header (`get_balances` / limit+cancel orders / single-market `get_ticker`) are demoted to the P2 broker backlog — they are NOT part of D2 closure. D3 (multiprocessing-per-symbol) remains the open Lane D item.
 
 - **D3 multiprocessing-per-symbol supervisor refactor** — P1, ~3 engineering days, pending D2.
   - Spawn one child process per Tradeable via `mp.get_context("spawn")`. Daily-close leader election via Redis SETNX. Crash respawn with 5s backoff, 3/hr cap.
@@ -42,9 +42,9 @@ Last updated: 2026-05-08 (post-Wave-1 + Lane D in flight + E4 regime memory part
   - Build a feedback loop where Gemini proposes new feature definitions / position sizing tweaks based on the postmortem corpus, then those proposals are fed into E2's harness for backtesting before any human review.
   - Adversarial guard: the LLM must propose with a structured "hypothesis + null + falsifier" frame, not raw "increase XYZ by N%".
 
-- **E4 regime memory** — P1, in progress (X1-cont).
-  - `src/regime_memory/{store,lookup,backfill}.py` already landed at `45d642c` / `107e96e` / `98d425d`. Integration into `predictor.py` (so a fresh tick can resolve "what params worked last time we saw this regime?") is a follow-up PR. See `src/regime_memory/INTEGRATION.md` for the wiring stub.
-  - Suggested next action: open a separate PR that wires `RegimeLookup.resolve()` into `MultiSymbolXGBoostPredictor.predict_full()` after the current X1-cont session lands.
+- **E4 regime memory** — ✅ DONE (predictor integration `54e3c1d`).
+  - `src/regime_memory/{store,lookup,backfill}.py` landed at `45d642c` / `107e96e` / `98d425d`. Integration into `predictor.py` landed at `54e3c1d` (see Closed note below). See `src/regime_memory/INTEGRATION.md`.
+  - Closed 2026-05-30: the real public API is `RegimeLookup.resolve_params()` (not `resolve()`), wired into `XGBoostPredictor._resolve_threshold()` — consulted from `predict_full()` and applied only when `_regime_confidence >= 0.5` — with a 232-line test file (`tests/prediction_market_scanner/test_predictor.py`; 51 predictor tests pass, regime-override + low-confidence/broken-store/mid-predict-raise fallbacks all covered). `MultiSymbolXGBoostPredictor.predict_full()` routes to the per-symbol predictor, so it inherits the integration. Remaining open sub-items are doc caveats only (encoder VERSION stamp in the `.npz` + RiskCalculator-side override per `INTEGRATION.md`); the path is inert until `REGIME_STORE_PATH` is set, and `optimal_threshold`/`regime_label` are still v0 synthetic heuristics — do not enable on weak evidence without a real per-symbol threshold sweep.
 
 - **P3 stocks adapter (Alpaca / IBKR)** — P2, depends on Lane D D1 + D2.
   - Lane D ships the Tradeable Protocol; once that's stable, a Stocks adapter is a 2-day brief instead of a 2-week port. Lower priority than crypto + Polymarket because the legal review is heavier.

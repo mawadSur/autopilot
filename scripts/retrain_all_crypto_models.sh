@@ -15,14 +15,25 @@
 #   way to populate the fields.
 #
 # Prerequisites
-#   1. Datasets must exist:
-#        data/crypto/datasets/eth_usd_v2.parquet
-#        data/crypto/datasets/btc_usd_v1.parquet
-#        data/crypto/datasets/sol_usd_v1.parquet
+#   1. Datasets must exist (the real on-disk CSVs, not the old .parquet
+#      names this script used to reference):
+#        data/crypto/datasets/eth_usd_1m.csv
+#        data/crypto/datasets/btc_usd_1m.csv
+#        data/crypto/datasets/sol_usd_1m.csv
 #   2. .venv exists at repo root (the trainer is heavy: xgboost,
 #      sklearn, pandas, joblib).
 #   3. ~30-60 minutes of developer-machine wall-clock time. XGBoost +
 #      isotonic CalibratedClassifierCV(cv="prefit") is the bottleneck.
+#
+# IMPORTANT — which model trio?  (operator decision, has money impact)
+#   This script RETRAINS IN PLACE and overwrites model.joblib + meta.json
+#   in the target dirs. It regenerates the whole model (not just the new
+#   feature_means/feature_stds stats), so spot-check AUC/reliability_slope
+#   against the prior bundle — the bundles are git-tracked, so `git checkout`
+#   restores them if the numbers drift. The SYMBOLS array below defaults to
+#   the +10bps sigmoid trio (eth_usd_v3_sigmoid / btc_usd_v2_sigmoid /
+#   sol_usd_v1), the set diagnosed as usable. If your production set is the
+#   +20bps Tier-2 trio instead, switch to the commented-out block below.
 #
 # Usage
 #   chmod +x scripts/retrain_all_crypto_models.sh
@@ -53,12 +64,21 @@ fi
 PYTHON="${PYTHON:-./.venv/bin/python}"
 TRAINER="src/crypto_training/train_xgboost.py"
 
-# (dataset_path, output_dir) tuples for each crypto symbol.
+# (symbol; dataset_path; output_dir) tuples for each crypto symbol.
+# Default: +10bps sigmoid trio (the set diagnosed as usable on 2026-05-30).
 SYMBOLS=(
-    "ETH/USD;data/crypto/datasets/eth_usd_v2.parquet;model_crypto/eth_usd_v2/"
-    "BTC/USD;data/crypto/datasets/btc_usd_v1.parquet;model_crypto/btc_usd_v1/"
-    "SOL/USD;data/crypto/datasets/sol_usd_v1.parquet;model_crypto/sol_usd_v1/"
+    "ETH/USD;data/crypto/datasets/eth_usd_1m.csv;model_crypto/eth_usd_v3_sigmoid/"
+    "BTC/USD;data/crypto/datasets/btc_usd_1m.csv;model_crypto/btc_usd_v2_sigmoid/"
+    "SOL/USD;data/crypto/datasets/sol_usd_1m.csv;model_crypto/sol_usd_v1/"
 )
+
+# Alternative: +20bps Tier-2 trio. Uncomment (and comment the block above)
+# if the +20bps models are your production set.
+# SYMBOLS=(
+#     "ETH/USD;data/crypto/datasets/eth_usd_1m_20bps.csv;model_crypto/eth_usd_v4_20bps_sigmoid/"
+#     "BTC/USD;data/crypto/datasets/btc_usd_1m_20bps.csv;model_crypto/btc_usd_v3_20bps_sigmoid/"
+#     "SOL/USD;data/crypto/datasets/sol_usd_1m_20bps.csv;model_crypto/sol_usd_v2_20bps_sigmoid/"
+# )
 
 # Per-symbol summary rows accumulated during the run; printed at the end.
 SUMMARY_ROWS=()

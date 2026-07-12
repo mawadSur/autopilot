@@ -100,12 +100,20 @@ class Ticker(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def mid(self) -> float:
-        return (self.bid + self.ask) / 2.0
+        # Coinbase's public /products endpoint returns `price` reliably but
+        # omits best_bid / best_ask. Without this fallback, every paper-mode
+        # fill records entry_price=1.0 (the supervisor's hard fallback) and
+        # Redis-based PnL is junk.
+        if self.bid > 0 and self.ask > 0:
+            return (self.bid + self.ask) / 2.0
+        return float(self.last)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def spread_bps(self) -> float:
-        mid = self.mid
+        if self.bid <= 0 or self.ask <= 0:
+            return 0.0
+        mid = (self.bid + self.ask) / 2.0
         if mid <= 0:
             return 0.0
         return ((self.ask - self.bid) / mid) * 10_000.0

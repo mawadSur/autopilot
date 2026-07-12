@@ -107,8 +107,12 @@ class DecisionMappingTests(unittest.TestCase):
         p = self._make_predictor()
         side, conf = p._probs_to_decision(np.array([0.40, 0.30, 0.30]))
         # Neutral: long not above 0.55 and short not above 0.60.
+        # Confidence must be 0.0 (not 0.5) so any reasonable supervisor
+        # --min-confidence filters neutrals. With the old 0.5 sentinel,
+        # lowering --min-confidence below 0.5 to let real low-prob triggers
+        # through caused every neutral tick to fire a trade.
         self.assertEqual(side, "buy")
-        self.assertAlmostEqual(conf, 0.5, places=6)
+        self.assertAlmostEqual(conf, 0.0, places=6)
 
     def test_dominant_long_breaks_tie_against_short(self) -> None:
         # p_long == p_short, both above threshold -> long-dominant rule wins.
@@ -129,11 +133,21 @@ class DecisionMappingTests(unittest.TestCase):
         self.assertEqual(side, "buy")
         self.assertAlmostEqual(conf, 0.70, places=6)
 
+    def test_neutral_sentinel_is_below_any_sensible_min_confidence(self) -> None:
+        # Regression contract: the predictor's neutral signal must be lower
+        # than any --min-confidence an operator would reasonably pass to the
+        # supervisor. 0.0 ensures the supervisor filters neutrals regardless
+        # of the chosen entry threshold.
+        from predictor import _NEUTRAL_RESULT
+        side, conf = _NEUTRAL_RESULT
+        self.assertEqual(side, "buy")
+        self.assertEqual(conf, 0.0)
+
     def test_empty_input_returns_neutral(self) -> None:
         p = self._make_predictor()
         side, conf = p._probs_to_decision(np.array([]))
         self.assertEqual(side, "buy")
-        self.assertAlmostEqual(conf, 0.5, places=6)
+        self.assertAlmostEqual(conf, 0.0, places=6)
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +328,10 @@ class XGBoostPredictorIntegrationTests(unittest.TestCase):
             model_dir = Path(td) / "model_xgb"
             self._train_tiny_model(model_dir)
             # Set thr_long very high so almost no real prediction can clear
-            # it -- we expect the safe-default neutral.
+            # it -- we expect the safe-default neutral. A *valid* prediction
+            # below threshold returns _NEUTRAL_RESULT (0.0), the sentinel that
+            # any sensible --min-confidence filters out (see b4e31c4). This is
+            # distinct from the warmup/error path, which returns 0.5.
             predictor = XGBoostPredictor(
                 model_dir=str(model_dir),
                 exchange=ex,
@@ -323,7 +340,7 @@ class XGBoostPredictorIntegrationTests(unittest.TestCase):
             )
             fake_ticker = mock.MagicMock(symbol="ETH/USD")
             side, conf = predictor("ETH/USD", fake_ticker)
-        self.assertEqual((side, conf), ("buy", 0.5))
+        self.assertEqual((side, conf), ("buy", 0.0))
 
     def test_xgb_predictor_returns_neutral_on_insufficient_history(self) -> None:
         from predictor import XGBoostPredictor
@@ -387,6 +404,62 @@ class MultiSymbolMapParseTests(unittest.TestCase):
         self.assertEqual(_parse_crypto_model_map("  "), {})
 
 
+class EntryFilterTests(unittest.TestCase):
+    """Verify CRYPTO_ENTRY_FILTER env parsing + filter rejection path."""
+
+    def test_unset_env_returns_no_filter(self) -> None:
+        from predictor import _build_entry_filter_from_env
+        os.environ.pop("CRYPTO_ENTRY_FILTER", None)
+        fn, name = _build_entry_filter_from_env()
+        self.assertIsNone(fn)
+        self.assertEqual(name, "")
+
+    def test_none_value_returns_no_filter(self) -> None:
+        from predictor import _build_entry_filter_from_env
+        os.environ["CRYPTO_ENTRY_FILTER"] = "none"
+        try:
+            fn, name = _build_entry_filter_from_env()
+            self.assertIsNone(fn)
+            self.assertEqual(name, "")
+        finally:
+            os.environ.pop("CRYPTO_ENTRY_FILTER")
+
+    def test_vol_proxy_filter_built(self) -> None:
+        from predictor import _build_entry_filter_from_env
+        os.environ["CRYPTO_ENTRY_FILTER"] = "vol_proxy:1.5"
+        try:
+            fn, name = _build_entry_filter_from_env()
+            self.assertIsNotNone(fn)
+            self.assertEqual(name, "vol_proxy(1.5)")
+            # Below-MA bar (vol_log=0 -> expm1=0 < 100 * 1.5) rejected.
+            self.assertFalse(fn({"vol_log": 0.0, "vol_ma_20": 100.0}))
+            # Above-MA bar accepted.
+            self.assertTrue(fn({"vol_log": 7.0, "vol_ma_20": 100.0}))  # expm1(7)~1095
+        finally:
+            os.environ.pop("CRYPTO_ENTRY_FILTER")
+
+    def test_combined_filter_anded(self) -> None:
+        from predictor import _build_entry_filter_from_env
+        os.environ["CRYPTO_ENTRY_FILTER"] = "vol_proxy:1.5,atr:80"
+        try:
+            fn, name = _build_entry_filter_from_env()
+            self.assertIsNotNone(fn)
+            self.assertIn("vol_proxy", name)
+            self.assertIn("atr", name)
+        finally:
+            os.environ.pop("CRYPTO_ENTRY_FILTER")
+
+    def test_unknown_gate_warned_and_dropped(self) -> None:
+        from predictor import _build_entry_filter_from_env
+        os.environ["CRYPTO_ENTRY_FILTER"] = "nonsense:42"
+        try:
+            fn, name = _build_entry_filter_from_env()
+            self.assertIsNone(fn)
+            self.assertEqual(name, "")
+        finally:
+            os.environ.pop("CRYPTO_ENTRY_FILTER")
+
+
 class MultiSymbolPredictorRoutingTests(unittest.TestCase):
     """Test that the multi-symbol predictor routes to the right per-symbol model."""
 
@@ -422,7 +495,7 @@ class MultiSymbolPredictorRoutingTests(unittest.TestCase):
 
         multi = MultiSymbolXGBoostPredictor(model_map={"ETH/USD": object()})
         side, conf = multi("DOGE/USD", None)
-        self.assertEqual((side, conf), ("buy", 0.5))
+        self.assertEqual((side, conf), ("buy", 0.0))
 
     def test_empty_map_raises(self) -> None:
         from predictor import MultiSymbolXGBoostPredictor

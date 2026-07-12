@@ -28,13 +28,13 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 
 LOGGER = logging.getLogger(__name__)
 
-_NEUTRAL_RESULT: Tuple[Literal["buy", "sell"], float] = ("buy", 0.5)
+_NEUTRAL_RESULT: Tuple[Literal["buy", "sell"], float] = ("buy", 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +387,7 @@ class LegacyTransformerPredictor:
         For 3-class output ordering ``[short, hold, long]``:
           * Long if ``p_long >= thr_long`` and ``p_long >= p_short``.
           * Short if ``p_short >= thr_short`` and ``p_short > p_long``.
-          * Otherwise neutral (returns ``("buy", 0.5)``).
+          * Otherwise neutral (returns ``_NEUTRAL_RESULT`` = ``("buy", 0.0)``).
 
         Confidence is the chosen side's probability so the supervisor's
         ``min_confidence_to_trade`` gate is meaningful.
@@ -426,8 +426,8 @@ class XGBoostPredictor:
     profitable)`` and:
 
       * map ``proba >= thr_long`` -> ``("buy", proba)``
-      * everything else -> neutral ``("buy", 0.5)`` (below the supervisor's
-        confidence floor, so no order is placed).
+      * everything else -> neutral ``_NEUTRAL_RESULT`` = ``("buy", 0.0)``
+        (below the supervisor's confidence floor, so no order is placed).
 
     There is no ``short`` side -- the binary head doesn't predict it. If you
     want shorts, train a 3-class model.
@@ -445,6 +445,8 @@ class XGBoostPredictor:
         thr_long: Optional[float] = None,
         warmup_bars: int = 350,
         max_buffer_bars: int = 5000,
+        entry_filter: Optional[Callable[[Any], bool]] = None,
+        entry_filter_name: str = "",
     ) -> None:
         # Lazy heavy imports.
         import joblib
@@ -457,6 +459,10 @@ class XGBoostPredictor:
         self.exchange = exchange
         self.warmup_bars = int(warmup_bars)
         self.max_buffer_bars = int(max_buffer_bars)
+        # entry_filter wiring (confluence gating). thr_long itself is set
+        # by the threshold-precedence block below, which tolerates None.
+        self.entry_filter = entry_filter
+        self.entry_filter_name = str(entry_filter_name or ("custom" if entry_filter else ""))
 
         meta_path = Path(self.model_dir) / "meta.json"
         model_path = Path(self.model_dir) / "model.joblib"
@@ -876,6 +882,28 @@ class XGBoostPredictor:
 
         if latest.isna().any().any():
             latest = latest.fillna(0.0)
+        # Entry filter (confluence gate) runs on the full feature row before
+        # the model fires, so a rejected bar costs only feature compute, not
+        # predict_proba. Filter sees ALL columns produced by compute_features,
+        # not just self.feature_cols — gates like volume_above_ma need
+        # `vol_log` / `vol_ma_20` which the model also consumes.
+        entry_filter = getattr(self, "entry_filter", None)
+        if entry_filter is not None:
+            full_row = feats.iloc[-1]
+            try:
+                passed = bool(entry_filter(full_row))
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "xgb predictor: %s entry_filter %r raised %s; treating as PASS",
+                    symbol, self.entry_filter_name, exc,
+                )
+                passed = True
+            if not passed:
+                LOGGER.info(
+                    "xgb predictor: %s gate=%s rejected (filter-killed)",
+                    symbol, self.entry_filter_name or "filter",
+                )
+                return None
         proba = float(self.model.predict_proba(latest.to_numpy())[0, 1])
         # Defensive: a corrupted booster or numerically unstable feature row
         # could yield NaN / inf. Returning ``None`` makes ``__call__`` map
@@ -1130,6 +1158,54 @@ def _parse_crypto_model_map(raw: str) -> Dict[str, Tuple[str, Optional[float]]]:
     return out
 
 
+def _build_entry_filter_from_env() -> Tuple[Optional[Callable[[Any], bool]], str]:
+    """Parse CRYPTO_ENTRY_FILTER env into a (callable, name) pair.
+
+    Formats:
+        ""                          -> (None, "")
+        "vol_proxy:1.5"             -> volume-above-MA proxy at 1.5x multiplier
+        "vol_proxy:1.5,atr:80"      -> AND of vol_proxy + atr_not_extreme(80th pctile)
+    Unknown gates log a warning and are dropped. If all gates are unknown,
+    returns (None, "") so the predictor runs unfiltered.
+    """
+    raw = os.getenv("CRYPTO_ENTRY_FILTER", "").strip().lower()
+    if not raw or raw == "none":
+        return None, ""
+    try:
+        from confluence_filters import (
+            gate_volume_above_ma_proxy, gate_atr_not_extreme, gate_all,
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("CRYPTO_ENTRY_FILTER set but confluence_filters import failed: %s", exc)
+        return None, ""
+    gates: List[Callable[[Any], bool]] = []
+    names: List[str] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, _, arg = entry.partition(":")
+        try:
+            if name == "vol_proxy":
+                mult = float(arg) if arg else 1.5
+                gates.append(lambda row, m=mult: gate_volume_above_ma_proxy(row, multiplier=m))
+                names.append(f"vol_proxy({mult})")
+            elif name == "atr":
+                pctile = float(arg) if arg else 80.0
+                gates.append(lambda row, p=pctile: gate_atr_not_extreme(row, percentile_cap=p))
+                names.append(f"atr({pctile})")
+            else:
+                LOGGER.warning("CRYPTO_ENTRY_FILTER: unknown gate %r, skipping", name)
+        except ValueError as exc:
+            LOGGER.warning("CRYPTO_ENTRY_FILTER: bad arg for %r: %s", entry, exc)
+    if not gates:
+        return None, ""
+    if len(gates) == 1:
+        return gates[0], names[0]
+    combined = lambda row: gate_all(row, gates)  # noqa: E731
+    return combined, "+".join(names)
+
+
 def build_default_predict_fn(exchange: Any) -> Optional[Any]:
     """Predictor selection priority:
     1. ``CRYPTO_MODEL_MAP`` -- multi-symbol XGBoost (one model per symbol)
@@ -1137,9 +1213,15 @@ def build_default_predict_fn(exchange: Any) -> Optional[Any]:
     3. ``LEGACY_MODEL_DIR`` -- transformer in ``model_sanity/``
     4. ``None`` -- supervisor falls back to its neutral placeholder.
 
-    The supervisor wires this in ``main()`` and never crashes on load
-    failures; it falls back to the placeholder if every option fails.
+    All XGBoost paths honour ``CRYPTO_ENTRY_FILTER`` to layer a confluence
+    gate on top of the entry signal. The supervisor wires this in
+    ``main()`` and never crashes on load failures; it falls back to the
+    placeholder if every option fails.
     """
+    entry_filter, filter_name = _build_entry_filter_from_env()
+    if entry_filter is not None:
+        LOGGER.info("predictor: entry filter active: %s", filter_name)
+
     # 1. Multi-symbol XGBoost map.
     raw_map = os.getenv("CRYPTO_MODEL_MAP", "").strip()
     if raw_map:
@@ -1155,7 +1237,8 @@ def build_default_predict_fn(exchange: Any) -> Optional[Any]:
                     f"not exist on disk. Fix the path or remove the entry."
                 )
             loaded[sym] = XGBoostPredictor(
-                model_dir=path, exchange=exchange, thr_long=thr
+                model_dir=path, exchange=exchange, thr_long=thr,
+                entry_filter=entry_filter, entry_filter_name=filter_name,
             )
         if loaded:
             return MultiSymbolXGBoostPredictor(model_map=loaded)
@@ -1183,7 +1266,8 @@ def build_default_predict_fn(exchange: Any) -> Optional[Any]:
             thr_long if thr_long is not None else "from-meta-or-default",
         )
         return XGBoostPredictor(
-            model_dir=crypto_dir, exchange=exchange, thr_long=thr_long
+            model_dir=crypto_dir, exchange=exchange, thr_long=thr_long,
+            entry_filter=entry_filter, entry_filter_name=filter_name,
         )
 
     # 2. Legacy transformer (model_sanity/) as fallback.

@@ -70,3 +70,8 @@ output/
 # via launchd/com.autopilot.loss-postmortem.plist). The .gitkeep tracks
 # the directory itself.
 docs/digests/*.md
+
+# Supervisor runtime artifacts (nohup capture + pidfiles)
+nohup.out
+*.pid
+supervisor.pid
