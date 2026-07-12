@@ -74,6 +74,14 @@ class TradingConfig(BaseSettings):
     starting_cash: float = Field(10_000.0, env="STARTING_CASH")
     allow_shorts: bool = Field(False, env="ALLOW_SHORTS")
     max_leverage: float = Field(1.0, env="MAX_LEVERAGE")
+    # Halal (Shariah-compliant) trading mode. When True, the live supervisor
+    # hard-enforces LONG-ONLY + SPOT-ONLY execution and fail-closes on any
+    # non-compliant order: no shorts (selling an asset you don't own), no
+    # perpetual-futures / leverage / funding-rate venues (riba + gharar). The
+    # Polymarket prediction-market stack (maisir/gambling) is scan-and-advise
+    # only and is never routed to the trading engine. Default False to preserve
+    # legacy behavior; set HALAL_MODE=1 (or pass --halal-mode) to activate.
+    HALAL_MODE: bool = Field(False, env="HALAL_MODE")
     risk_pct_per_trade: float = Field(0.004, env="RISK_PCT_PER_TRADE")
     csv_path: str = Field("", env="CSV_PATH")
     testnet: bool = Field(True, env="TESTNET")

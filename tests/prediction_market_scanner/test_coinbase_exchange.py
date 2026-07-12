@@ -576,5 +576,12 @@ class SafetyTests(unittest.TestCase):
         self.assertIs(ctx.exception.__cause__, boom)
 
 
+class MarketTypeMarkerTests(unittest.TestCase):
+    def test_coinbase_is_spot(self) -> None:
+        # Consumed by the halal-mode spot-only gate. Coinbase Advanced Trade
+        # is spot, so this connector is Shariah-compliant for long-only use.
+        self.assertEqual(CoinbaseExchange.MARKET_TYPE, "spot")
+
+
 if __name__ == "__main__":
     unittest.main()

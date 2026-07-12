@@ -362,12 +362,29 @@ _ActionTaken = Literal[
     "halted_breaker",
     "force_flatted",
     "errored",
+    # Halal mode: a would-be entry was blocked because it was not
+    # Shariah-compliant (a short entry, i.e. selling an asset not owned).
+    # Exits are never blocked. See SupervisorConfig.halal_mode.
+    "skipped_halal",
     # Sprint 1 Wave 2: a tick where the exit policy closed one or more
     # positions for the symbol BEFORE any new entry was considered. The
     # supervisor never reopens on the same tick — the "exited" tick is
     # terminal for that symbol.
     "exited",
 ]
+
+
+def _exchange_is_spot(exchange: Any) -> bool:
+    """Fail-closed spot check for halal mode.
+
+    Returns ``True`` only when the exchange *explicitly* declares
+    ``MARKET_TYPE == "spot"``. A perp/margin connector (which declares
+    ``"perp"``) or any exchange that doesn't declare a market type at all
+    returns ``False`` — so under halal mode a non-compliant or unknown venue
+    can never receive a live order. Deliberately conservative: silence means
+    "not proven spot", not "assume spot".
+    """
+    return str(getattr(exchange, "MARKET_TYPE", "")).strip().lower() == "spot"
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +416,12 @@ class SupervisorConfig(BaseModel):
     shakedown_state_path: Path
     risk_pct_per_trade: float = 0.005
     min_confidence_to_trade: float = 0.6
+    # Halal (Shariah-compliant) trading mode. When True, the supervisor only
+    # opens LONG entries (a short means selling an asset you don't own) and
+    # fail-closes any live order routed to a non-spot venue (perps/leverage/
+    # funding = riba + gharar). Exits are never blocked — closing a long is a
+    # permissible sale of an owned asset. Mirrors cfg.HALAL_MODE / --halal-mode.
+    halal_mode: bool = False
     # Exit rule applied to open positions at the top of every tick. Syntax:
     #   "none"                              - never close (legacy behavior)
     #   "time:5m"                           - close after 5 minutes
@@ -1691,6 +1714,31 @@ class Supervisor:
                 ),
             )
 
+        # 5b-Halal. Long-only gate. When halal_mode is on, only long entries
+        # are permitted — opening a short means selling an asset you don't own,
+        # which is not Shariah-compliant. This is enforced in BOTH paper and
+        # live so a paper "validation" run reflects halal behavior too. Exits
+        # are unaffected (closing a long is a permissible sale of an owned
+        # asset, handled on the exit path, never here).
+        if self.config.halal_mode and side != "buy":
+            LOGGER.info(
+                "halal_mode: blocking non-long entry for %s (side=%s, "
+                "confidence=%.3f)",
+                symbol,
+                side,
+                confidence,
+            )
+            return SupervisorTick(
+                tick_at_utc=now.isoformat(),
+                symbol=symbol,
+                verdict=verdict,
+                model_confidence=confidence,
+                raw_max_prob=raw_max_prob,
+                raw_probs=raw_probs,
+                action_taken="skipped_halal",
+                notes=f"halal_mode: short entry blocked (side={side})",
+            )
+
         # 5a-Kelly. Sprint 1 Wave 2: re-size the proposed notional from the
         # predictor's resolved Kelly fraction now that the predict call has
         # populated ``_last_resolved_kelly_pct``. Falls back to the flat
@@ -1851,6 +1899,19 @@ class Supervisor:
         regime_label: Optional[str] = None,
     ) -> None:
         """Place a real market order. Raises ExchangeError on failure."""
+        # Halal spot-only fail-close. This is the last line of defence before a
+        # real order hits the venue: under halal mode we refuse to trade
+        # through anything not explicitly declared spot (perps/leverage/funding
+        # = riba + gharar). Fail-closed — an undeclared/unknown exchange is
+        # rejected too. Only the OPEN path is gated here; exits go through their
+        # own close path so a position can always be liquidated.
+        if self.config.halal_mode and not _exchange_is_spot(self.exchange):
+            raise ExchangeError(
+                "halal_mode: refusing live order on non-spot venue "
+                f"{type(self.exchange).__name__} "
+                f"(MARKET_TYPE={getattr(self.exchange, 'MARKET_TYPE', None)!r}); "
+                "only spot exchanges are Shariah-compliant"
+            )
         order_start = time.monotonic()
         try:
             order: OrderResult = self.exchange.place_market_order(
@@ -4147,6 +4208,17 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--halal-mode",
+        action="store_true",
+        default=None,
+        help=(
+            "Halal (Shariah-compliant) trading: long-only + spot-only. Blocks "
+            "any short entry and fail-closes any live order routed to a "
+            "non-spot venue (perps/leverage/funding). When omitted, defaults "
+            "to the HALAL_MODE env var (default off)."
+        ),
+    )
+    p.add_argument(
         "--once",
         action="store_true",
         help="Run a single iteration and exit (cron-friendly).",
@@ -4335,9 +4407,40 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 2
 
+    # Resolve halal mode: an explicit --halal-mode wins; otherwise fall back to
+    # the HALAL_MODE env var (via the config singleton). Under halal mode the
+    # prediction-market (Polymarket) stack is refused outright — betting on
+    # event outcomes is maisir (gambling), which no spot/long-only gate can
+    # make Shariah-compliant.
+    if args.halal_mode is None:
+        try:
+            from config import cfg as _halal_cfg  # noqa: WPS433 - lazy import
+
+            halal_mode = bool(getattr(_halal_cfg, "HALAL_MODE", False))
+        except Exception:  # noqa: BLE001 - config import must never crash boot
+            halal_mode = False
+    else:
+        halal_mode = bool(args.halal_mode)
+
+    if halal_mode and polymarket_market_ids:
+        print(
+            "error: halal_mode is on but --polymarket-markets was passed; "
+            "prediction markets are maisir (gambling) and are not permitted. "
+            "Remove --polymarket-markets or disable halal mode.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if halal_mode:
+        LOGGER.info(
+            "HALAL_MODE active: long-only + spot-only enforced; shorts, "
+            "perps/leverage/funding, and prediction markets are blocked."
+        )
+
     # Build PolymarketTradeable instances up-front so SupervisorConfig
     # validation sees the union of (symbols, tradeables) and the
-    # supervisor's __init__ wires them into the iteration list.
+    # supervisor's __init__ wires them into the iteration list. (Empty under
+    # halal mode — the refusal above returns before we get here.)
     tradeables: List[Any] = []
     if polymarket_market_ids:
         from exchanges.adapters import PolymarketTradeable
@@ -4357,6 +4460,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         risk_pct_per_trade=args.risk_pct,
         min_confidence_to_trade=args.min_confidence,
         exit_rule=args.exit_rule,
+        halal_mode=halal_mode,
     )
 
     # Optional Sentry init -- a no-op if SENTRY_DSN is unset.

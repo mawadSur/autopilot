@@ -296,6 +296,12 @@ class CoinbaseExchange:
         ccxt_module: Injected for testability. Defaults to importing `ccxt`.
     """
 
+    #: Market-type marker consumed by the halal-mode spot-only gate
+    #: (``live_supervisor._exchange_is_spot``). Coinbase Advanced Trade orders
+    #: placed here are SPOT — a buy/sell of the actual asset with no leverage
+    #: or funding — so this connector is Shariah-compliant for long-only use.
+    MARKET_TYPE = "spot"
+
     def __init__(
         self,
         *,
