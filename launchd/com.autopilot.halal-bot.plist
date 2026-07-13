@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.autopilot.halal-bot</string>
+
+    <!-- Halal paper trading bot: long-only + spot-only, 3 crypto symbols,
+         voln_v2 models + regime lookup, 5-minute time-stop exits. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mawad/Desktop/autopilot/.venv/bin/python</string>
+        <string>/Users/mawad/Desktop/autopilot/src/live_supervisor.py</string>
+        <string>--mode</string><string>paper</string>
+        <string>--symbols</string><string>ETH/USD,BTC/USD,SOL/USD</string>
+        <string>--min-confidence</string><string>0.50</string>
+        <string>--exit-rule</string><string>time:5m</string>
+        <string>--interval</string><string>5</string>
+        <string>--log-dir</string><string>/Users/mawad/Desktop/autopilot/runs</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mawad/Desktop/autopilot</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/mawad/Desktop/autopilot/src</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>HALAL_MODE</key>
+        <string>1</string>
+        <key>CRYPTO_MODEL_MAP</key>
+        <string>ETH/USD=model_crypto/eth_usd_voln_v2_blend09_alt,BTC/USD=model_crypto/btc_usd_voln_v2,SOL/USD=model_crypto/sol_usd_voln_v2</string>
+        <key>REGIME_STORE_PATH_ETH_USD</key>
+        <string>data/regime_stores/eth_usd.npz</string>
+        <key>REGIME_STORE_PATH_BTC_USD</key>
+        <string>data/regime_stores/btc_usd.npz</string>
+        <key>REGIME_STORE_PATH_SOL_USD</key>
+        <string>data/regime_stores/sol_usd.npz</string>
+    </dict>
+
+    <!-- Start on load/boot and keep it alive: restart if the process ever
+         exits. launchd throttles restarts to >=10s so a crash-loop (e.g.
+         Redis briefly unavailable) can't spin. Stop it with:
+             launchctl unload ~/Library/LaunchAgents/com.autopilot.halal-bot.plist -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mawad/Desktop/autopilot/runs/halal_bot_launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mawad/Desktop/autopilot/runs/halal_bot_launchd.out</string>
+</dict>
+</plist>
