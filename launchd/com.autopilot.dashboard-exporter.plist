@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TEMPLATE — do not load this copy directly (it has placeholder secrets).
+
+  Install with your real values:
+    1. cp this file to ~/Library/LaunchAgents/com.autopilot.dashboard-exporter.plist
+    2. replace __DASHBOARD_INGEST_URL__ with https://<your-app>.vercel.app/api/ingest
+    3. replace __DASHBOARD_EXPORTER_SECRET__ with the EXPORTER_SECRET set in Vercel
+    4. launchctl load ~/Library/LaunchAgents/com.autopilot.dashboard-exporter.plist
+
+  Never commit the installed copy — it contains the exporter secret.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.autopilot.dashboard-exporter</string>
+
+    <!-- Reads the bot's local Redis and publishes a snapshot to the Vercel
+         dashboard every 30s. Bot is never touched. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mawad/Desktop/autopilot/.venv/bin/python</string>
+        <string>/Users/mawad/Desktop/autopilot/scripts/dashboard_exporter.py</string>
+        <string>--interval</string><string>30</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mawad/Desktop/autopilot</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/mawad/Desktop/autopilot/src</string>
+        <key>DASHBOARD_INGEST_URL</key>
+        <string>__DASHBOARD_INGEST_URL__</string>
+        <key>DASHBOARD_EXPORTER_SECRET</key>
+        <string>__DASHBOARD_EXPORTER_SECRET__</string>
+        <key>DASHBOARD_BANKROLL_USD</key>
+        <string>10000</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mawad/Desktop/autopilot/runs/dashboard_exporter_launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mawad/Desktop/autopilot/runs/dashboard_exporter_launchd.out</string>
+</dict>
+</plist>
