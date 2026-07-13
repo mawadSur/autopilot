@@ -26,14 +26,21 @@ function loadEnvLocal() {
       const text = readFileSync(path, "utf8");
       for (const line of text.split("\n")) {
         const t = line.trim();
-        if (!t || t.startsWith("#") || !t.includes("=")) continue;
-        const idx = t.indexOf("=");
-        const key = t.slice(0, idx).trim();
-        let val = t.slice(idx + 1).trim();
+        if (!t || t.startsWith("#")) continue;
+        // Only accept lines that are a real KEY=VALUE where KEY is a valid env
+        // identifier. This skips continuation lines of multi-line quoted values
+        // (e.g. VERCEL_GIT_COMMIT_MESSAGE) that `vercel env pull` writes, which
+        // otherwise corrupted parsing.
+        const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(t);
+        if (!m) continue;
+        const key = m[1];
+        let val = m[2].trim();
         if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
           val = val.slice(1, -1);
         }
-        if (!(key in process.env)) process.env[key] = val;
+        // Vercel exposes the Redis creds under a few names; the app reads
+        // KV_REST_API_*. Later real assignments win over earlier ones.
+        process.env[key] = val;
       }
     } catch {
       /* file may not exist — fine */
