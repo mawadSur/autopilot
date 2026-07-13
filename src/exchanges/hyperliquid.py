@@ -178,6 +178,13 @@ class HyperliquidExchange:
         timeout_s:      Per-request timeout in seconds (default 10s).
     """
 
+    #: Market-type marker consumed by the halal-mode spot-only gate. Hyperliquid
+    #: is PERPETUAL FUTURES (leverage + funding rate), which is not Shariah-
+    #: compliant (riba + gharar). Under halal mode the supervisor refuses to
+    #: place a live order through this connector — see
+    #: ``live_supervisor._exchange_is_spot``.
+    MARKET_TYPE = "perp"
+
     def __init__(
         self,
         *,

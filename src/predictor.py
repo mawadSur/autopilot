@@ -387,7 +387,7 @@ class LegacyTransformerPredictor:
         For 3-class output ordering ``[short, hold, long]``:
           * Long if ``p_long >= thr_long`` and ``p_long >= p_short``.
           * Short if ``p_short >= thr_short`` and ``p_short > p_long``.
-          * Otherwise neutral (returns ``("buy", 0.5)``).
+          * Otherwise neutral (returns ``_NEUTRAL_RESULT`` = ``("buy", 0.0)``).
 
         Confidence is the chosen side's probability so the supervisor's
         ``min_confidence_to_trade`` gate is meaningful.
@@ -426,8 +426,8 @@ class XGBoostPredictor:
     profitable)`` and:
 
       * map ``proba >= thr_long`` -> ``("buy", proba)``
-      * everything else -> neutral ``("buy", 0.5)`` (below the supervisor's
-        confidence floor, so no order is placed).
+      * everything else -> neutral ``_NEUTRAL_RESULT`` = ``("buy", 0.0)``
+        (below the supervisor's confidence floor, so no order is placed).
 
     There is no ``short`` side -- the binary head doesn't predict it. If you
     want shorts, train a 3-class model.
@@ -531,6 +531,12 @@ class XGBoostPredictor:
         # ``src/regime_memory/INTEGRATION.md``.
         self.regime_lookup: Optional[Any] = None
         self._last_resolved_kelly_pct: Optional[float] = None
+        # Sprint 2.6: mirror the kelly cache for the resolved regime label so
+        # the supervisor can forward it onto the synthesized Position
+        # (``regime_label``) without re-running the regime lookup. None when
+        # the lookup is off, confidence < 0.5, or the resolver didn't surface
+        # a label — matches the Kelly contract exactly.
+        self._last_resolved_regime_label: Optional[str] = None
         self._maybe_init_regime_lookup()
 
         LOGGER.info(
@@ -573,13 +579,24 @@ class XGBoostPredictor:
                 "optimal_threshold": float(self.thr_long),
                 "kelly_size_pct": 0.0,
             }
+            # Sprint 2 #6: best-effort OutcomeAdjuster wiring. When
+            # REDIS_URL is set we construct a Redis client + adjuster and
+            # pass it to the lookup; on any failure (no env var, redis
+            # unreachable, import error) we skip wiring and the lookup
+            # behaves identically to today (no new keys in resolve_params,
+            # no threshold nudges). Keeps the zero-redis dev path working.
+            adjuster = self._maybe_init_outcome_adjuster()
             self.regime_lookup = RegimeLookup(
-                store=store, encoder=encoder, defaults=defaults
+                store=store,
+                encoder=encoder,
+                defaults=defaults,
+                outcome_adjuster=adjuster,
             )
             LOGGER.info(
-                "regime_lookup initialised from %s (size=%d)",
+                "regime_lookup initialised from %s (size=%d, outcome_adjuster=%s)",
                 store_path,
                 len(store),
+                "on" if adjuster is not None else "off",
             )
         except Exception as exc:  # noqa: BLE001 - never crash on regime store issues
             LOGGER.warning(
@@ -588,6 +605,44 @@ class XGBoostPredictor:
                 exc,
             )
             self.regime_lookup = None
+
+    def _maybe_init_outcome_adjuster(self) -> Optional[Any]:
+        """Construct an :class:`OutcomeAdjuster` from ``REDIS_URL``, or None.
+
+        Returns ``None`` (no adjuster wired) when:
+        * ``REDIS_URL`` is unset / empty,
+        * ``redis``/``OutcomeAdjuster`` cannot be imported,
+        * the client cannot connect.
+
+        Never raises — a missing adjuster degrades the lookup to its
+        un-adjusted behavior, which is the same as today's runtime.
+        """
+        redis_url = os.getenv("REDIS_URL", "").strip()
+        if not redis_url:
+            return None
+        try:
+            import redis  # type: ignore[import-not-found]
+
+            from regime_memory.outcome_adjuster import OutcomeAdjuster
+        except ImportError as exc:
+            LOGGER.warning(
+                "outcome_adjuster: import failed (%r); skipping wiring",
+                exc,
+            )
+            return None
+        try:
+            client = redis.Redis.from_url(redis_url, decode_responses=True)
+            # Cheap connectivity probe; if redis is down we don't wire so
+            # the lookup's hot path stays exception-free.
+            client.ping()
+        except Exception as exc:  # noqa: BLE001 - any transport hiccup
+            LOGGER.warning(
+                "outcome_adjuster: redis connect/ping failed (%r); skipping wiring",
+                exc,
+            )
+            return None
+        namespace = os.getenv("REDIS_NAMESPACE", "autopilot").strip() or "autopilot"
+        return OutcomeAdjuster(client, namespace=namespace)
 
     def __call__(
         self, symbol: str, ticker: Any
@@ -663,6 +718,7 @@ class XGBoostPredictor:
         lookup = self.regime_lookup
         if lookup is None or feature_window is None:
             self._last_resolved_kelly_pct = None
+            self._last_resolved_regime_label = None
             return self.thr_long
         try:
             resolved = lookup.resolve_params(feature_window, k=10)
@@ -673,15 +729,18 @@ class XGBoostPredictor:
                 exc,
             )
             self._last_resolved_kelly_pct = None
+            self._last_resolved_regime_label = None
             return self.thr_long
         try:
             confidence = float(resolved.get("_regime_confidence", 0.0))
         except (TypeError, ValueError):
             self._last_resolved_kelly_pct = None
+            self._last_resolved_regime_label = None
             return self.thr_long
         if confidence < 0.5:
             # Low-match → soft prior at most. Static path stays in charge.
             self._last_resolved_kelly_pct = None
+            self._last_resolved_regime_label = None
             return self.thr_long
         try:
             new_thr = float(resolved.get("optimal_threshold", self.thr_long))
@@ -696,13 +755,27 @@ class XGBoostPredictor:
             )
         except (TypeError, ValueError):
             self._last_resolved_kelly_pct = None
+        # Sprint 2.6: cache the resolved regime label next to the kelly
+        # fraction. ``resolve_params`` adds ``_regime_label`` (per
+        # ``regime_memory/lookup.py``) when the OutcomeAdjuster is wired; it
+        # may be absent when an older lookup is in play, so default to None.
+        raw_label = resolved.get("_regime_label")
+        if raw_label is None:
+            self._last_resolved_regime_label = None
+        else:
+            try:
+                label_str = str(raw_label).strip()
+            except (TypeError, ValueError):
+                label_str = ""
+            self._last_resolved_regime_label = label_str or None
         LOGGER.info(
-            "regime_lookup: confidence=%.3f -> thr=%.4f kelly=%s",
+            "regime_lookup: confidence=%.3f -> thr=%.4f kelly=%s label=%s",
             confidence,
             new_thr,
             f"{self._last_resolved_kelly_pct:.4f}"
             if self._last_resolved_kelly_pct is not None
             else "n/a",
+            self._last_resolved_regime_label or "n/a",
         )
         return new_thr
 
@@ -896,6 +969,16 @@ class MultiSymbolXGBoostPredictor:
                         f"is missing required attribute {attr!r}"
                     )
         self.model_map = model_map
+        # The supervisor reads ``self._last_resolved_kelly_pct`` and
+        # ``self._last_resolved_regime_label`` directly off the predict_fn
+        # to size positions and stamp regime labels. The per-symbol child
+        # predictors set those caches on themselves during ``__call__`` /
+        # ``predict_full``; we mirror the most-recently-called child's
+        # values onto self so the supervisor's getattr lookups resolve to
+        # real values instead of None. Initialise to None so a read
+        # before the first predict still gets the safe sentinel.
+        self._last_resolved_kelly_pct: Optional[float] = None
+        self._last_resolved_regime_label: Optional[str] = None
         # Optional per-symbol regime-store override. The global
         # ``REGIME_STORE_PATH`` was applied during each per-symbol predictor's
         # __init__; here we honour the per-symbol form
@@ -957,8 +1040,22 @@ class MultiSymbolXGBoostPredictor:
                 "multi-symbol predictor: no model wired for %s; returning neutral",
                 symbol,
             )
+            self._last_resolved_kelly_pct = None
+            self._last_resolved_regime_label = None
             return _NEUTRAL_RESULT
-        return predictor(symbol, ticker)
+        result = predictor(symbol, ticker)
+        # Mirror per-symbol child caches onto self so the supervisor's
+        # ``getattr(self.model_predict_fn, "_last_resolved_kelly_pct", None)``
+        # and ``..._last_resolved_regime_label`` reads resolve to the value
+        # the child just set during this predict, not the always-None
+        # default on the Multi wrapper.
+        self._last_resolved_kelly_pct = getattr(
+            predictor, "_last_resolved_kelly_pct", None
+        )
+        self._last_resolved_regime_label = getattr(
+            predictor, "_last_resolved_regime_label", None
+        )
+        return result
 
     def predict_full(
         self, symbol: str, ticker: Any
@@ -982,9 +1079,21 @@ class MultiSymbolXGBoostPredictor:
         # may only expose __call__. Route accordingly.
         rich = getattr(predictor, "predict_full", None)
         if callable(rich):
-            return rich(symbol, ticker)
-        side, conf = predictor(symbol, ticker)
-        return PredictorResult(side=side, confidence=conf)
+            result = rich(symbol, ticker)
+        else:
+            side, conf = predictor(symbol, ticker)
+            result = PredictorResult(side=side, confidence=conf)
+        # Mirror per-symbol child caches onto self (see __call__ above
+        # for rationale). predict_full is the rich path used by Lane E
+        # signal forensics; the supervisor's sizing path uses __call__
+        # but mirroring here too keeps the two seams symmetric.
+        self._last_resolved_kelly_pct = getattr(
+            predictor, "_last_resolved_kelly_pct", None
+        )
+        self._last_resolved_regime_label = getattr(
+            predictor, "_last_resolved_regime_label", None
+        )
+        return result
 
     def model_meta_for(self, symbol: str) -> Dict[str, Any]:
         """Return the per-symbol meta blob for the given symbol or ``{}``.

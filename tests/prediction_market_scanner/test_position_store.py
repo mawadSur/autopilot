@@ -116,6 +116,31 @@ class PositionSchemaTests(unittest.TestCase):
                 opened_at_utc=datetime.now(timezone.utc).isoformat(),
             )
 
+    def test_position_default_bars_held_and_high_water_mark(self) -> None:
+        """Sprint 1 Wave 2: ``bars_held`` defaults to 0 and
+        ``high_water_mark`` defaults to None. Legacy positions in Redis
+        that predate these fields still validate cleanly thanks to the
+        defaults — this is the backward-compat guarantee for Wave 2."""
+        position = Position(
+            position_id="legacy",
+            exchange="coinbase",
+            symbol="ETH/USDT",
+            side="long",
+            status="open",
+            entry_price=100.0,
+            entry_quote_usd=100.0,
+            base_size=1.0,
+            opened_at_utc=datetime.now(timezone.utc).isoformat(),
+        )
+        self.assertEqual(position.bars_held, 0)
+        self.assertIsNone(position.high_water_mark)
+        # Round-trip via model_dump_json → model_validate_json must
+        # preserve the defaults exactly so a Redis re-read does the right
+        # thing for a legacy blob.
+        roundtrip = Position.model_validate_json(position.model_dump_json())
+        self.assertEqual(roundtrip.bars_held, 0)
+        self.assertIsNone(roundtrip.high_water_mark)
+
 
 class PositionStoreTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -373,6 +398,46 @@ class PositionStoreTests(unittest.TestCase):
             store_b.increment_error("ETH/USD")
         self.assertEqual(self.store.errors_today("ETH/USD"), 8)
         self.assertEqual(store_b.errors_today("ETH/USD"), 8)
+
+    # ------------------------------------------------------------------
+    # Sprint 1 Wave 2: update_runtime_fields round-trip
+    # ------------------------------------------------------------------
+    def test_update_runtime_fields_persists_bars_held_and_hwm(self) -> None:
+        """``update_runtime_fields`` is the per-tick seam ExitPolicy uses
+        to keep ``bars_held`` + ``high_water_mark`` fresh across ticks and
+        across supervisor restarts. The Redis blob must reflect the patch
+        atomically — a re-read via ``get`` returns the new values."""
+        pos = self.store.record_open(
+            _new_position(entry_price=100.0, base_size=1.0)
+        )
+        # Initial values reflect the schema defaults.
+        self.assertEqual(pos.bars_held, 0)
+        self.assertIsNone(pos.high_water_mark)
+        updated = self.store.update_runtime_fields(
+            pos.position_id, bars_held=5, high_water_mark=110.0
+        )
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated.bars_held, 5)
+        self.assertEqual(updated.high_water_mark, 110.0)
+        # Round-trip via get() — proves the write hit Redis, not just the
+        # in-memory local.
+        roundtrip = self.store.get(pos.position_id)
+        self.assertIsNotNone(roundtrip)
+        self.assertEqual(roundtrip.bars_held, 5)
+        self.assertEqual(roundtrip.high_water_mark, 110.0)
+
+    def test_update_runtime_fields_returns_none_for_unknown_id(self) -> None:
+        result = self.store.update_runtime_fields(
+            "ghost", bars_held=1, high_water_mark=1.0
+        )
+        self.assertIsNone(result)
+
+    def test_update_runtime_fields_noop_when_both_args_none(self) -> None:
+        pos = self.store.record_open(_new_position(entry_price=100.0))
+        # Calling with no patch returns the existing position unchanged.
+        result = self.store.update_runtime_fields(pos.position_id)
+        self.assertEqual(result.position_id, pos.position_id)
+        self.assertEqual(result.bars_held, 0)
 
 
 class PostmortemTriggerGateTests(unittest.TestCase):
@@ -701,6 +766,235 @@ class StructuredFillMetadataTests(unittest.TestCase):
         self.assertIsNone(revived.rejection_reason)
         self.assertIsNone(revived.stop_trigger_price)
         self.assertEqual(revived.notes, "some-legacy-note")
+
+
+class PositionSprint25AttributionTests(unittest.TestCase):
+    """Sprint 2.5: entry_confidence + resolved_kelly_pct round-trip + writer."""
+
+    def setUp(self) -> None:
+        self.fake = fakeredis.FakeRedis(decode_responses=True)
+        self.store = PositionStore(redis_client=self.fake, namespace="test")
+
+    def test_position_entry_attribution_defaults_none(self) -> None:
+        position = _new_position()
+        # Fresh construction leaves both attribution fields None so that
+        # diagnose_calibration_drift's resolve_confidence falls through
+        # to the snapshot path (the legacy behaviour).
+        self.assertIsNone(position.entry_confidence)
+        self.assertIsNone(position.resolved_kelly_pct)
+        # JSON round-trip preserves None for both fields.
+        roundtrip = Position.model_validate_json(position.model_dump_json())
+        self.assertIsNone(roundtrip.entry_confidence)
+        self.assertIsNone(roundtrip.resolved_kelly_pct)
+
+    def test_position_legacy_blob_without_attribution_round_trips(self) -> None:
+        # A blob serialised before the new fields existed must still
+        # deserialize cleanly thanks to pydantic v2's default fill-in.
+        legacy_blob = (
+            '{"position_id":"legacy-attr","exchange":"coinbase",'
+            '"symbol":"ETH/USDT","side":"long","status":"open",'
+            '"entry_price":100.0,"entry_quote_usd":100.0,"base_size":1.0,'
+            '"opened_at_utc":"2026-04-01T00:00:00+00:00","fees_usd":0.0,'
+            '"model_meta":{},"notes":null}'
+        )
+        revived = Position.model_validate_json(legacy_blob)
+        self.assertIsNone(revived.entry_confidence)
+        self.assertIsNone(revived.resolved_kelly_pct)
+
+    def test_record_entry_attribution_atomic_patch(self) -> None:
+        pos = self.store.record_open(_new_position())
+        self.assertIsNone(pos.entry_confidence)
+        self.assertIsNone(pos.resolved_kelly_pct)
+        updated = self.store.record_entry_attribution(
+            pos.position_id,
+            entry_confidence=0.83,
+            resolved_kelly_pct=0.04,
+        )
+        assert updated is not None
+        self.assertAlmostEqual(float(updated.entry_confidence), 0.83)
+        self.assertAlmostEqual(float(updated.resolved_kelly_pct), 0.04)
+        # Persisted to the blob in Redis, not just the local model_copy.
+        rehydrated = self.store.get(pos.position_id)
+        assert rehydrated is not None
+        self.assertAlmostEqual(float(rehydrated.entry_confidence), 0.83)
+        self.assertAlmostEqual(float(rehydrated.resolved_kelly_pct), 0.04)
+
+    def test_record_entry_attribution_unknown_position_returns_none(self) -> None:
+        self.assertIsNone(
+            self.store.record_entry_attribution(
+                "nope", entry_confidence=0.7, resolved_kelly_pct=0.02
+            )
+        )
+
+    def test_record_entry_attribution_partial_kwargs(self) -> None:
+        # Calling with only entry_confidence updates only that field;
+        # the kelly_pct stays None on the position record.
+        pos = self.store.record_open(_new_position())
+        updated = self.store.record_entry_attribution(
+            pos.position_id, entry_confidence=0.71
+        )
+        assert updated is not None
+        self.assertAlmostEqual(float(updated.entry_confidence), 0.71)
+        self.assertIsNone(updated.resolved_kelly_pct)
+
+    def test_position_regime_label_round_trips(self) -> None:
+        # Sprint 2.6: Position.regime_label defaults None and survives a
+        # Redis save+load round-trip + a record_entry_attribution patch.
+        # Mirrors the Sprint 2.5 entry_confidence/resolved_kelly_pct
+        # pattern: backward-compatible default so legacy blobs round-trip.
+        position = _new_position()
+        self.assertIsNone(position.regime_label)
+        # JSON round-trip preserves None.
+        roundtrip = Position.model_validate_json(position.model_dump_json())
+        self.assertIsNone(roundtrip.regime_label)
+        # Legacy blob without the field (pre-Sprint-2.6) still deserializes.
+        legacy_blob = (
+            '{"position_id":"legacy-regime","exchange":"coinbase",'
+            '"symbol":"ETH/USDT","side":"long","status":"open",'
+            '"entry_price":100.0,"entry_quote_usd":100.0,"base_size":1.0,'
+            '"opened_at_utc":"2026-04-01T00:00:00+00:00","fees_usd":0.0,'
+            '"model_meta":{},"notes":null}'
+        )
+        revived = Position.model_validate_json(legacy_blob)
+        self.assertIsNone(revived.regime_label)
+        # record_entry_attribution can stamp the new field; Redis blob
+        # carries it back on a fresh get().
+        pos = self.store.record_open(_new_position())
+        self.assertIsNone(pos.regime_label)
+        updated = self.store.record_entry_attribution(
+            pos.position_id,
+            entry_confidence=0.83,
+            resolved_kelly_pct=0.04,
+            regime_label="high_vol_chop",
+        )
+        assert updated is not None
+        self.assertEqual(updated.regime_label, "high_vol_chop")
+        rehydrated = self.store.get(pos.position_id)
+        assert rehydrated is not None
+        self.assertEqual(rehydrated.regime_label, "high_vol_chop")
+
+
+class PositionStoreSnapshotWriterTests(unittest.TestCase):
+    """Sprint 2.5: trade-context snapshot writers round-trip with the reader.
+
+    The reader (``TradeContextStore``) and these writers share the same
+    key + TTL, so anything written through PositionStore.record_*_snapshot
+    is observable via the TradeContextStore get_signal_snapshot family.
+    """
+
+    def setUp(self) -> None:
+        self.fake = fakeredis.FakeRedis(decode_responses=True)
+        self.store = PositionStore(redis_client=self.fake, namespace="test")
+
+    def _signal_payload(self, trade_id: str) -> dict:
+        return {
+            "trade_id": trade_id,
+            "symbol": "ETH/USD",
+            "captured_at_utc": "2026-05-18T20:00:00+00:00",
+            "phase": "signal",
+            "feature_buffer": {},
+            "feature_window": None,
+            "model_probs": {},
+            "model_confidence": 0.71,
+            "risk_metrics_input": {
+                "side": "buy",
+                "bankroll": 10000.0,
+                "resolved_kelly_pct": 0.03,
+            },
+            "risk_metrics_output": {},
+            "breaker_context": {},
+            "ticker_buffer": [],
+            "notes": None,
+            "kill_switch_reason": None,
+            "stop_loss_trigger_price": None,
+            "breaker_decision": None,
+        }
+
+    def test_record_signal_snapshot_writes_at_reader_key(self) -> None:
+        from state.trade_context_store import TradeContextStore
+        trade_id = "trade-signal-1"
+        self.store.record_signal_snapshot(
+            trade_id, self._signal_payload(trade_id)
+        )
+        # Direct dict-shape read via the writer's symmetric helper.
+        blob = self.store.get_trade_ctx_snapshot(trade_id, "signal")
+        assert blob is not None
+        self.assertEqual(blob["model_confidence"], 0.71)
+        # And the canonical reader (TradeContextStore) finds it too.
+        reader = TradeContextStore(
+            redis_client=self.fake, namespace="test"
+        )
+        snap = reader.get_signal_snapshot(trade_id)
+        assert snap is not None
+        self.assertEqual(snap.trade_id, trade_id)
+        self.assertAlmostEqual(snap.model_confidence, 0.71)
+        # TTL is applied (Redis EXPIRE) — should be positive and within
+        # the 30-day bound the reader documents.
+        ttl = self.fake.ttl(f"test:trade_ctx:{trade_id}:signal")
+        self.assertGreater(ttl, 0)
+        self.assertLessEqual(ttl, 30 * 24 * 3600)
+
+    def test_record_fill_and_breaker_snapshots_round_trip(self) -> None:
+        from state.trade_context_store import TradeContextStore
+
+        trade_id = "trade-fill-2"
+        fill_payload = {
+            "trade_id": trade_id,
+            "symbol": "BTC/USD",
+            "captured_at_utc": "2026-05-18T20:05:00+00:00",
+            "phase": "fill",
+            "feature_buffer": {},
+            "feature_window": None,
+            "model_probs": {},
+            "model_confidence": 0.0,
+            "risk_metrics_input": {},
+            "risk_metrics_output": {"fill_price": 50000.0},
+            "breaker_context": {},
+            "ticker_buffer": [],
+            "notes": "paper-deferred-fill",
+            "kill_switch_reason": None,
+            "stop_loss_trigger_price": None,
+            "breaker_decision": None,
+        }
+        breaker_payload = {
+            "trade_id": trade_id,
+            "symbol": "BTC/USD",
+            "captured_at_utc": "2026-05-18T20:10:00+00:00",
+            "phase": "breaker",
+            "feature_buffer": {},
+            "feature_window": None,
+            "model_probs": {},
+            "model_confidence": 0.0,
+            "risk_metrics_input": {},
+            "risk_metrics_output": {},
+            "breaker_context": {"reason": "force_flat"},
+            "ticker_buffer": [],
+            "notes": "kill_switch",
+            "kill_switch_reason": "kill_switch",
+            "stop_loss_trigger_price": None,
+            "breaker_decision": "force_flat",
+        }
+        self.store.record_fill_snapshot(trade_id, fill_payload)
+        self.store.record_breaker_snapshot(trade_id, breaker_payload)
+
+        reader = TradeContextStore(redis_client=self.fake, namespace="test")
+        fill = reader.get_fill_snapshot(trade_id)
+        assert fill is not None
+        self.assertEqual(fill.risk_metrics_output["fill_price"], 50000.0)
+        snaps = reader.get_snapshots(trade_id)
+        self.assertIn("breaker", snaps)
+        self.assertEqual(snaps["breaker"].breaker_decision, "force_flat")
+
+    def test_record_signal_snapshot_rejects_empty_trade_id(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.record_signal_snapshot("", self._signal_payload("x"))
+
+    def test_get_trade_ctx_snapshot_unknown_returns_none(self) -> None:
+        self.assertIsNone(self.store.get_trade_ctx_snapshot("nope", "signal"))
+
+    def test_get_trade_ctx_snapshot_rejects_invalid_phase(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.get_trade_ctx_snapshot("any", "bogus")
 
 
 if __name__ == "__main__":  # pragma: no cover

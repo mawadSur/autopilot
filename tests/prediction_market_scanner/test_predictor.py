@@ -328,7 +328,10 @@ class XGBoostPredictorIntegrationTests(unittest.TestCase):
             model_dir = Path(td) / "model_xgb"
             self._train_tiny_model(model_dir)
             # Set thr_long very high so almost no real prediction can clear
-            # it -- we expect the safe-default neutral.
+            # it -- we expect the safe-default neutral. A *valid* prediction
+            # below threshold returns _NEUTRAL_RESULT (0.0), the sentinel that
+            # any sensible --min-confidence filters out (see b4e31c4). This is
+            # distinct from the warmup/error path, which returns 0.5.
             predictor = XGBoostPredictor(
                 model_dir=str(model_dir),
                 exchange=ex,
@@ -337,7 +340,7 @@ class XGBoostPredictorIntegrationTests(unittest.TestCase):
             )
             fake_ticker = mock.MagicMock(symbol="ETH/USD")
             side, conf = predictor("ETH/USD", fake_ticker)
-        self.assertEqual((side, conf), ("buy", 0.5))
+        self.assertEqual((side, conf), ("buy", 0.0))
 
     def test_xgb_predictor_returns_neutral_on_insufficient_history(self) -> None:
         from predictor import XGBoostPredictor
@@ -499,6 +502,67 @@ class MultiSymbolPredictorRoutingTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             MultiSymbolXGBoostPredictor(model_map={})
+
+    def test_call_mirrors_child_kelly_and_regime_caches(self) -> None:
+        """The supervisor reads ``model_predict_fn._last_resolved_kelly_pct``
+        + ``..._last_resolved_regime_label`` directly. With multi-symbol mode
+        those caches live on the per-symbol child predictor. ``__call__``
+        must mirror them onto self after each predict so the supervisor's
+        getattr resolves to a real value, not the always-None default.
+        """
+        from predictor import MultiSymbolXGBoostPredictor
+
+        class _StubWithCache:
+            def __init__(self, kelly: Optional[float], label: Optional[str]) -> None:
+                self._last_resolved_kelly_pct = kelly
+                self._last_resolved_regime_label = label
+
+            def __call__(self, symbol, ticker):
+                return ("buy", 0.7)
+
+        eth_stub = _StubWithCache(kelly=0.08, label="trend_up")
+        btc_stub = _StubWithCache(kelly=None, label=None)
+        multi = MultiSymbolXGBoostPredictor(
+            model_map={"ETH/USD": eth_stub, "BTC/USD": btc_stub}
+        )
+        # Pre-call: caches are the safe sentinel.
+        self.assertIsNone(multi._last_resolved_kelly_pct)
+        self.assertIsNone(multi._last_resolved_regime_label)
+        # After predicting ETH, multi mirrors the ETH child's values.
+        multi("ETH/USD", None)
+        self.assertEqual(multi._last_resolved_kelly_pct, 0.08)
+        self.assertEqual(multi._last_resolved_regime_label, "trend_up")
+        # After predicting BTC (which has None caches), multi mirrors None.
+        # This is the "supervisor reads after the most recent predict"
+        # semantics — per-symbol state isolation.
+        multi("BTC/USD", None)
+        self.assertIsNone(multi._last_resolved_kelly_pct)
+        self.assertIsNone(multi._last_resolved_regime_label)
+
+    def test_unknown_symbol_resets_caches(self) -> None:
+        """An unknown symbol call returns the neutral result; it should also
+        clear the caches so the supervisor doesn't reuse a stale value from
+        the previously-called symbol.
+        """
+        from predictor import MultiSymbolXGBoostPredictor
+
+        class _StubWithCache:
+            def __init__(self, kelly: Optional[float]) -> None:
+                self._last_resolved_kelly_pct = kelly
+                self._last_resolved_regime_label = "chop"
+
+            def __call__(self, symbol, ticker):
+                return ("buy", 0.6)
+
+        eth_stub = _StubWithCache(kelly=0.04)
+        multi = MultiSymbolXGBoostPredictor(model_map={"ETH/USD": eth_stub})
+        # Prime the multi caches with ETH's values.
+        multi("ETH/USD", None)
+        self.assertEqual(multi._last_resolved_kelly_pct, 0.04)
+        # Unknown symbol — must clear, not leave ETH's stale cache visible.
+        multi("DOGE/USD", None)
+        self.assertIsNone(multi._last_resolved_kelly_pct)
+        self.assertIsNone(multi._last_resolved_regime_label)
 
 
 class PredictorResultDataclassTests(unittest.TestCase):

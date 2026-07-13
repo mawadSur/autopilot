@@ -403,5 +403,13 @@ class HyperliquidExchangeErrorTests(unittest.TestCase):
         self.assertIn("/info POST failed", str(ctx.exception))
 
 
+class MarketTypeMarkerTests(unittest.TestCase):
+    def test_hyperliquid_is_perp(self) -> None:
+        # Consumed by the halal-mode spot-only gate. Hyperliquid is perpetual
+        # futures (leverage + funding = riba + gharar), so halal mode refuses
+        # to place live orders through this connector.
+        self.assertEqual(HyperliquidExchange.MARKET_TYPE, "perp")
+
+
 if __name__ == "__main__":
     unittest.main()

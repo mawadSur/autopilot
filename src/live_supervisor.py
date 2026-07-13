@@ -76,6 +76,7 @@ _SRC_DIR = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+import redis.exceptions
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 if TYPE_CHECKING:  # pragma: no cover - type hints only
@@ -83,6 +84,7 @@ if TYPE_CHECKING:  # pragma: no cover - type hints only
 
 from alerts.notifier import Notifier
 from exchanges.coinbase import CoinbaseExchange, ExchangeError, OrderResult, Ticker
+from exit_policy import ExitDecision, ExitPolicy
 from risk.auto_pause import AutoPauseGate
 from risk.circuit_breakers import (
     CircuitBreakerSet,
@@ -291,6 +293,19 @@ class PendingPaperFill:
     # signal + fill snapshots share a key. None when no snapshot store is
     # wired (snapshot capture is a no-op anyway).
     trade_id: Optional[str] = None
+    # Sprint 2.5: entry attribution — predictor's confidence + resolved
+    # Kelly fraction at signal time. The paper drain stamps these onto the
+    # synthesized Position so ``diagnose_calibration_drift`` finds the
+    # confidence on the position blob without needing the snapshot store.
+    entry_confidence: Optional[float] = None
+    resolved_kelly_pct: Optional[float] = None
+    # Sprint 2.6: regime label resolved by the predictor's regime_lookup at
+    # signal time (or None when the lookup was off / low-confidence). The
+    # paper drain mirrors entry_confidence/resolved_kelly_pct and forwards
+    # this onto the synthesized Position so ``OutcomeAdjuster`` can probe
+    # the model_meta path on the Position blob without re-reading the
+    # snapshot store.
+    regime_label: Optional[str] = None
 
 
 _TIME_RE = re.compile(r"^time:(\d+)([smh])$", re.IGNORECASE)
@@ -347,7 +362,29 @@ _ActionTaken = Literal[
     "halted_breaker",
     "force_flatted",
     "errored",
+    # Halal mode: a would-be entry was blocked because it was not
+    # Shariah-compliant (a short entry, i.e. selling an asset not owned).
+    # Exits are never blocked. See SupervisorConfig.halal_mode.
+    "skipped_halal",
+    # Sprint 1 Wave 2: a tick where the exit policy closed one or more
+    # positions for the symbol BEFORE any new entry was considered. The
+    # supervisor never reopens on the same tick — the "exited" tick is
+    # terminal for that symbol.
+    "exited",
 ]
+
+
+def _exchange_is_spot(exchange: Any) -> bool:
+    """Fail-closed spot check for halal mode.
+
+    Returns ``True`` only when the exchange *explicitly* declares
+    ``MARKET_TYPE == "spot"``. A perp/margin connector (which declares
+    ``"perp"``) or any exchange that doesn't declare a market type at all
+    returns ``False`` — so under halal mode a non-compliant or unknown venue
+    can never receive a live order. Deliberately conservative: silence means
+    "not proven spot", not "assume spot".
+    """
+    return str(getattr(exchange, "MARKET_TYPE", "")).strip().lower() == "spot"
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +416,12 @@ class SupervisorConfig(BaseModel):
     shakedown_state_path: Path
     risk_pct_per_trade: float = 0.005
     min_confidence_to_trade: float = 0.6
+    # Halal (Shariah-compliant) trading mode. When True, the supervisor only
+    # opens LONG entries (a short means selling an asset you don't own) and
+    # fail-closes any live order routed to a non-spot venue (perps/leverage/
+    # funding = riba + gharar). Exits are never blocked — closing a long is a
+    # permissible sale of an owned asset. Mirrors cfg.HALAL_MODE / --halal-mode.
+    halal_mode: bool = False
     # Exit rule applied to open positions at the top of every tick. Syntax:
     #   "none"                              - never close (legacy behavior)
     #   "time:5m"                           - close after 5 minutes
@@ -580,6 +623,25 @@ class Supervisor:
         confidence_history: Optional[ConfidenceHistory] = None,
         auto_trip_threshold: int = 10,
         trade_context_store: Optional[TradeContextStore] = None,
+        # Sprint 1 Wave 2: exit policy + Kelly sizing.
+        # ``exit_policy`` is the ``ExitPolicy`` instance evaluated each tick
+        # against every open position for the current symbol BEFORE any new
+        # entry is considered. When None + ``exit_policy_enabled=True`` the
+        # supervisor builds a default policy from ``src/config.py`` (the
+        # production path). When None + ``exit_policy_enabled=False`` the
+        # policy is disabled — preserves the legacy "no exit policy" path
+        # for the regression-sentinel test.
+        # ``kelly_sizing_enabled`` / ``kelly_floor_pct`` / ``kelly_cap_pct``
+        # govern the per-trade notional sizing seam: when enabled AND the
+        # wired predictor exposes a non-None ``_last_resolved_kelly_pct``
+        # the supervisor sizes new entries as ``bankroll * clip(resolved,
+        # floor, cap)``. Falls back to ``bankroll * risk_pct_per_trade``
+        # otherwise.
+        exit_policy: Optional[ExitPolicy] = None,
+        exit_policy_enabled: Optional[bool] = None,
+        kelly_sizing_enabled: Optional[bool] = None,
+        kelly_floor_pct: Optional[float] = None,
+        kelly_cap_pct: Optional[float] = None,
     ) -> None:
         self.config = config
         self.exchange = exchange
@@ -685,6 +747,39 @@ class Supervisor:
         # (otherwise a freshly booted supervisor would always emit one
         # immediately).
         self._last_close_date: Optional[date] = None
+
+        # ----------------------------------------------------------------
+        # Sprint 1 Wave 2: ExitPolicy + Kelly sizing wire-up.
+        # ----------------------------------------------------------------
+        # Resolve the master switches + Kelly bounds. Explicit kwargs win;
+        # otherwise the singleton ``cfg`` from ``src/config.py`` provides
+        # the defaults so a fresh production boot picks up env-driven
+        # overrides without test fixtures having to import it.
+        resolved = self._resolve_exit_kelly_settings(
+            exit_policy=exit_policy,
+            exit_policy_enabled=exit_policy_enabled,
+            kelly_sizing_enabled=kelly_sizing_enabled,
+            kelly_floor_pct=kelly_floor_pct,
+            kelly_cap_pct=kelly_cap_pct,
+        )
+        self.exit_policy: Optional[ExitPolicy] = resolved["exit_policy"]
+        self.exit_policy_enabled: bool = bool(resolved["exit_policy_enabled"])
+        self.kelly_sizing_enabled: bool = bool(resolved["kelly_sizing_enabled"])
+        self.kelly_floor_pct: float = float(resolved["kelly_floor_pct"])
+        self.kelly_cap_pct: float = float(resolved["kelly_cap_pct"])
+
+        # Reason-tagged exit counters. Keys are the documented reasons from
+        # ``ExitPolicy`` (``time`` / ``sl`` / ``tp`` / ``trail`` / ``reversal``)
+        # plus the synthetic ``error`` bucket for ticks where an exit fill
+        # raised an unexpected error. Exposed via ``_emit_loop_metrics``.
+        self._exits_by_reason: Dict[str, int] = {
+            "time": 0,
+            "sl": 0,
+            "tp": 0,
+            "trail": 0,
+            "reversal": 0,
+            "error": 0,
+        }
 
         # One-shot "supervisor started" gauge -- only if a pusher is wired in.
         self._safe_metric_call(
@@ -1422,10 +1517,61 @@ class Supervisor:
         # 2d. Drain any pending paper fill against the FRESH ticker.
         self._drain_pending_paper_fill(symbol, ticker)
 
-        # 3. Build context + run breakers.
+        # 2c. Sprint 1 Wave 2: evaluate the exit policy against EVERY open
+        # position for THIS symbol BEFORE we consider a new entry. If
+        # anything closed on this tick we short-circuit — never reopen on
+        # the same tick that just closed a position (capital-preservation
+        # invariant; matches the CEO review brief).
+        exits_closed, exit_reason = 0, None
+        if self.exit_policy_enabled and self.exit_policy is not None:
+            try:
+                exits_closed, exit_reason = self._process_exits(
+                    symbol=symbol, ticker=ticker
+                )
+            except ExchangeError as exc:
+                # A live-tagged exit close raised. Treat like any other
+                # ExchangeError on the tick: bump the error counter, alert,
+                # short-circuit with an ``errored`` tick. The kill-switch
+                # auto-trip will fire if these accumulate.
+                self._handle_tick_error(symbol)
+                self._safe_alert(
+                    f"exit close failed for {symbol}: {exc}",
+                    severity="alert",
+                )
+                return SupervisorTick(
+                    tick_at_utc=now.isoformat(),
+                    symbol=symbol,
+                    verdict=self._allow_verdict(),
+                    model_confidence=None,
+                    action_taken="errored",
+                    notes=f"exit_close: {exc!r}",
+                )
+
+        if exits_closed > 0:
+            return SupervisorTick(
+                tick_at_utc=now.isoformat(),
+                symbol=symbol,
+                verdict=self._allow_verdict(),
+                model_confidence=None,
+                action_taken="exited",
+                notes=(
+                    f"exited={exits_closed} reason={exit_reason}"
+                    if exit_reason
+                    else f"exited={exits_closed}"
+                ),
+            )
+
+        # 3. Build context + run breakers. The breakers care about
+        # proposed notional vs cap, so we feed them the FLAT (legacy)
+        # ``bankroll * risk_pct_per_trade`` figure here — the Kelly
+        # resize happens AFTER the predict call so the predictor's
+        # ``_last_resolved_kelly_pct`` (set on each predict) is available.
+        # Source string ends up in SupervisorTick.notes so we can tell at
+        # a glance which path won (per CEO review brief).
         proposed = float(self.config.bankroll_usd) * float(
             self.config.risk_pct_per_trade
         )
+        _sizing_source = "flat"
         daily_pnl = float(self.position_store.daily_realized_pnl_usd())
         # Per-symbol equity tracking (P0 #1). Drawdown is computed against
         # THIS symbol's realised PnL only, against THIS symbol's peak. A
@@ -1568,6 +1714,49 @@ class Supervisor:
                 ),
             )
 
+        # 5b-Halal. Long-only gate. When halal_mode is on, only long entries
+        # are permitted — opening a short means selling an asset you don't own,
+        # which is not Shariah-compliant. This is enforced in BOTH paper and
+        # live so a paper "validation" run reflects halal behavior too. Exits
+        # are unaffected (closing a long is a permissible sale of an owned
+        # asset, handled on the exit path, never here).
+        if self.config.halal_mode and side != "buy":
+            LOGGER.info(
+                "halal_mode: blocking non-long entry for %s (side=%s, "
+                "confidence=%.3f)",
+                symbol,
+                side,
+                confidence,
+            )
+            return SupervisorTick(
+                tick_at_utc=now.isoformat(),
+                symbol=symbol,
+                verdict=verdict,
+                model_confidence=confidence,
+                raw_max_prob=raw_max_prob,
+                raw_probs=raw_probs,
+                action_taken="skipped_halal",
+                notes=f"halal_mode: short entry blocked (side={side})",
+            )
+
+        # 5a-Kelly. Sprint 1 Wave 2: re-size the proposed notional from the
+        # predictor's resolved Kelly fraction now that the predict call has
+        # populated ``_last_resolved_kelly_pct``. Falls back to the flat
+        # path computed in step 3 if Kelly is disabled or the predictor
+        # didn't surface a value. The breaker context above used the flat
+        # number — Kelly resizing only affects what hits the exchange.
+        proposed, _sizing_source, resolved_kelly_pct = (
+            self._resolve_proposed_notional(symbol=symbol)
+        )
+        # Sprint 2.6: mirror the kelly-cache read so we forward the resolved
+        # regime label (when the predictor's regime_lookup fired with
+        # confidence >= 0.5) through the same path Sprint 2.5 used for the
+        # Kelly fraction. ``None`` when the lookup didn't fire — the
+        # downstream snapshot writer drops the key in that case.
+        resolved_regime_label = getattr(
+            self.model_predict_fn, "_last_resolved_regime_label", None
+        )
+
         # 5b. Lane E E1: capture the signal snapshot BEFORE the mode gate
         # AND before order placement so a forensics agent can reconstruct
         # decision-time context even if the order itself fails or the
@@ -1581,6 +1770,8 @@ class Supervisor:
             confidence=confidence,
             ticker=ticker,
             ctx=ctx,
+            resolved_kelly_pct=resolved_kelly_pct,
+            regime_label=resolved_regime_label,
         )
 
         # 6. Mode gate -- live falls back to paper if THIS symbol's shakedown
@@ -1609,6 +1800,9 @@ class Supervisor:
                     side=side,
                     ticker=ticker,
                     proposed_usd=proposed,
+                    entry_confidence=confidence,
+                    resolved_kelly_pct=resolved_kelly_pct,
+                    regime_label=resolved_regime_label,
                 )
                 return SupervisorTick(
                     tick_at_utc=now.isoformat(),
@@ -1629,16 +1823,22 @@ class Supervisor:
                     side=side,
                     ticker=ticker,
                     proposed_usd=proposed,
+                    entry_confidence=confidence,
+                    resolved_kelly_pct=resolved_kelly_pct,
+                    regime_label=resolved_regime_label,
                 )
-                notes_extra = "live"
+                notes_extra = f"live sizing={_sizing_source} usd={proposed:.2f}"
             else:
                 self._paper_simulate_fill(
                     symbol=symbol,
                     side=side,
                     ticker=ticker,
                     proposed_usd=proposed,
+                    entry_confidence=confidence,
+                    resolved_kelly_pct=resolved_kelly_pct,
+                    regime_label=resolved_regime_label,
                 )
-                notes_extra = "paper"
+                notes_extra = f"paper sizing={_sizing_source} usd={proposed:.2f}"
         except ExchangeError as exc:
             self._handle_tick_error(symbol)
             self._safe_alert(
@@ -1694,8 +1894,24 @@ class Supervisor:
         side: Literal["buy", "sell"],
         ticker: Ticker,
         proposed_usd: float,
+        entry_confidence: Optional[float] = None,
+        resolved_kelly_pct: Optional[float] = None,
+        regime_label: Optional[str] = None,
     ) -> None:
         """Place a real market order. Raises ExchangeError on failure."""
+        # Halal spot-only fail-close. This is the last line of defence before a
+        # real order hits the venue: under halal mode we refuse to trade
+        # through anything not explicitly declared spot (perps/leverage/funding
+        # = riba + gharar). Fail-closed — an undeclared/unknown exchange is
+        # rejected too. Only the OPEN path is gated here; exits go through their
+        # own close path so a position can always be liquidated.
+        if self.config.halal_mode and not _exchange_is_spot(self.exchange):
+            raise ExchangeError(
+                "halal_mode: refusing live order on non-spot venue "
+                f"{type(self.exchange).__name__} "
+                f"(MARKET_TYPE={getattr(self.exchange, 'MARKET_TYPE', None)!r}); "
+                "only spot exchanges are Shariah-compliant"
+            )
         order_start = time.monotonic()
         try:
             order: OrderResult = self.exchange.place_market_order(
@@ -1722,6 +1938,33 @@ class Supervisor:
             position = position.model_copy(
                 update={"position_id": pending_trade_id}
             )
+        # Sprint 2.5: stamp the entry attribution onto the position BEFORE
+        # the store write so the persisted blob carries entry_confidence
+        # (what diagnose_calibration_drift's resolve_confidence reads first)
+        # and resolved_kelly_pct (sizing forensics seam) without a second
+        # round-trip. Both fields default to None on legacy reads.
+        position = position.model_copy(
+            update={
+                "entry_confidence": (
+                    float(entry_confidence)
+                    if entry_confidence is not None
+                    else None
+                ),
+                "resolved_kelly_pct": (
+                    float(resolved_kelly_pct)
+                    if resolved_kelly_pct is not None
+                    else None
+                ),
+                # Sprint 2.6: mirror the kelly stamp pattern. Empty strings
+                # collapse to None so the Position blob's regime_label stays
+                # absent when the predictor didn't surface a label.
+                "regime_label": (
+                    (str(regime_label).strip() or None)
+                    if regime_label is not None
+                    else None
+                ),
+            }
+        )
         if order.status == "filled":
             self.position_store.record_open(position)
         else:
@@ -1767,6 +2010,9 @@ class Supervisor:
         side: Literal["buy", "sell"],
         ticker: Ticker,
         proposed_usd: float,
+        entry_confidence: Optional[float] = None,
+        resolved_kelly_pct: Optional[float] = None,
+        regime_label: Optional[str] = None,
     ) -> None:
         """Queue a paper-trade signal for next-tick fill (P0 #4).
 
@@ -1804,6 +2050,24 @@ class Supervisor:
             slippage_bps=PAPER_SLIPPAGE_BPS,
             enqueued_tick_index=self._symbol_tick_index.get(symbol, 0),
             trade_id=pending_trade_id,
+            entry_confidence=(
+                float(entry_confidence)
+                if entry_confidence is not None
+                else None
+            ),
+            resolved_kelly_pct=(
+                float(resolved_kelly_pct)
+                if resolved_kelly_pct is not None
+                else None
+            ),
+            # Sprint 2.6: carry the resolved regime label through the
+            # deferred-fill state machine so the next-tick paper drain
+            # stamps it onto the synthesized Position.
+            regime_label=(
+                (str(regime_label).strip() or None)
+                if regime_label is not None
+                else None
+            ),
         )
         LOGGER.info(
             "paper signal queued for next-tick fill: %s side=%s notional=%.2f USD "
@@ -1869,6 +2133,14 @@ class Supervisor:
             opened_at_utc=self._now().isoformat(),
             fees_usd=0.0,
             notes="paper-deferred-fill",
+            # Sprint 2.5: paper-fill drains carry entry_confidence +
+            # resolved_kelly_pct off the PendingPaperFill so the stored
+            # position blob has the same attribution as a live fill.
+            entry_confidence=pending.entry_confidence,
+            resolved_kelly_pct=pending.resolved_kelly_pct,
+            # Sprint 2.6: carry the regime label across the deferred-fill
+            # boundary too, mirroring the kelly stamp pattern.
+            regime_label=pending.regime_label,
         )
         self.position_store.record_open(position)
 
@@ -2150,6 +2422,356 @@ class Supervisor:
         )
 
     # ------------------------------------------------------------------
+    # Sprint 1 Wave 2: exit-policy + Kelly sizing helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _resolve_exit_kelly_settings(
+        *,
+        exit_policy: Optional[ExitPolicy],
+        exit_policy_enabled: Optional[bool],
+        kelly_sizing_enabled: Optional[bool],
+        kelly_floor_pct: Optional[float],
+        kelly_cap_pct: Optional[float],
+    ) -> Dict[str, Any]:
+        """Pick effective Wave-2 settings from kwargs, falling back to cfg.
+
+        Kept as a staticmethod so it can be exercised without constructing
+        a full Supervisor. The fallback path lazy-imports ``cfg`` so the
+        rest of the supervisor module stays config-free for the existing
+        test fixtures (which don't write a TradingConfig file).
+        """
+        cfg_obj: Any = None
+
+        def _from_cfg(attr: str, default: Any) -> Any:
+            nonlocal cfg_obj
+            if cfg_obj is None:
+                try:
+                    from config import cfg as _cfg  # noqa: WPS433 - lazy
+                    cfg_obj = _cfg
+                except Exception:  # noqa: BLE001 - cfg load failures fall back
+                    cfg_obj = False  # sentinel: tried + failed
+            if cfg_obj is False:
+                return default
+            return getattr(cfg_obj, attr, default)
+
+        if exit_policy_enabled is None:
+            exit_policy_enabled = bool(_from_cfg("EXIT_POLICY_ENABLED", True))
+        if kelly_sizing_enabled is None:
+            kelly_sizing_enabled = bool(_from_cfg("KELLY_SIZING_ENABLED", True))
+        if kelly_floor_pct is None:
+            kelly_floor_pct = float(_from_cfg("KELLY_FLOOR_PCT", 0.005))
+        if kelly_cap_pct is None:
+            kelly_cap_pct = float(_from_cfg("KELLY_CAP_PCT", 0.05))
+
+        # Construct a default ExitPolicy from cfg when one wasn't supplied
+        # AND the master switch is on. With the switch off we leave the
+        # attribute None — the tick loop guards on the flag, but a None
+        # policy is the unambiguous "no exits configured" signal.
+        if exit_policy is None and exit_policy_enabled:
+            exit_policy = ExitPolicy(
+                time_stop_bars=_from_cfg("TIME_STOP_BARS", 20),
+                stop_loss_pct=_from_cfg("STOP_LOSS_PCT", -0.004),
+                take_profit_pct=_from_cfg("TAKE_PROFIT_PCT", 0.008),
+                trailing_stop_pct=_from_cfg("TRAILING_STOP_PCT", None),
+                signal_reversal=bool(_from_cfg("EXIT_SIGNAL_REVERSAL", False)),
+            )
+
+        return {
+            "exit_policy": exit_policy,
+            "exit_policy_enabled": bool(exit_policy_enabled),
+            "kelly_sizing_enabled": bool(kelly_sizing_enabled),
+            "kelly_floor_pct": float(kelly_floor_pct),
+            "kelly_cap_pct": float(kelly_cap_pct),
+        }
+
+    def _resolve_proposed_notional(
+        self, *, symbol: str
+    ) -> Tuple[float, str, Optional[float]]:
+        """Pick the per-trade notional in USD for ``symbol``.
+
+        Returns ``(usd, source, resolved_kelly_pct)`` where ``source`` is
+        ``"kelly"`` when the predictor's resolved Kelly fraction was used
+        (clipped to the floor/cap), and ``"flat"`` when we fell back to
+        the legacy ``bankroll * risk_pct_per_trade`` path. ``source`` is
+        surfaced to ``SupervisorTick.notes`` so operators can see *which*
+        sizing the tick used without reading metrics.
+        ``resolved_kelly_pct`` is the (post-clip) Kelly fraction when
+        Kelly fired, else ``None`` — Sprint 2.5 forwards this onto the
+        opened :class:`Position` as ``resolved_kelly_pct`` so the Lane E
+        sizing forensics can pull it without re-resolving the regime.
+
+        The Kelly read is via ``getattr(self.model_predict_fn,
+        '_last_resolved_kelly_pct', None)``: the predictor itself decides
+        when to populate it (regime-memory match with confidence >= 0.5).
+        We never re-resolve the regime or re-derive the kelly here — the
+        predictor is the single source of truth.
+        """
+        flat_pct = float(self.config.risk_pct_per_trade)
+        flat_usd = float(self.config.bankroll_usd) * flat_pct
+        if not self.kelly_sizing_enabled:
+            return flat_usd, "flat", None
+        kelly_pct = getattr(
+            self.model_predict_fn, "_last_resolved_kelly_pct", None
+        )
+        if kelly_pct is None:
+            return flat_usd, "flat", None
+        try:
+            kelly_pct_f = float(kelly_pct)
+        except (TypeError, ValueError):
+            return flat_usd, "flat", None
+        if not math.isfinite(kelly_pct_f) or kelly_pct_f <= 0:
+            return flat_usd, "flat", None
+        clipped = min(
+            max(kelly_pct_f, float(self.kelly_floor_pct)),
+            float(self.kelly_cap_pct),
+        )
+        return float(self.config.bankroll_usd) * clipped, "kelly", clipped
+
+    @staticmethod
+    def _ticker_to_exit_tick(
+        ticker: Any, signal_prob: Optional[float] = None
+    ) -> Any:
+        """Adapt a ``Ticker`` to the duck-typed contract ``ExitPolicy`` expects.
+
+        ``ExitPolicy`` reads ``tick.price`` (the current mark) and
+        ``tick.signal_prob`` (for the reversal branch). The exchange's
+        ``Ticker`` model uses ``mid`` / ``bid`` / ``ask`` / ``last`` —
+        we collapse those into ``price`` here so the policy stays
+        exchange-agnostic. ``signal_prob`` is set when the supervisor
+        opts into the reversal branch (off by default in Wave 2).
+        """
+        # Pick mid when available; fall back to last; finally to 0.0 to
+        # let the policy's downstream sign checks handle a degenerate
+        # tick rather than crashing here.
+        price: float = 0.0
+        for attr in ("mid", "last", "price"):
+            value = getattr(ticker, attr, None)
+            if value is not None:
+                try:
+                    price = float(value)
+                    break
+                except (TypeError, ValueError):
+                    continue
+        # Use a SimpleNamespace so the policy's _require helper can read
+        # both attrs without us having to define a one-off dataclass.
+        import types
+        return types.SimpleNamespace(
+            price=price,
+            signal_prob=float(signal_prob) if signal_prob is not None else 0.5,
+        )
+
+    def _process_exits(
+        self, *, symbol: str, ticker: Ticker
+    ) -> Tuple[int, Optional[str]]:
+        """Evaluate ExitPolicy against every open position for ``symbol``.
+
+        Returns ``(closed_count, last_reason)``. The caller uses
+        ``closed_count > 0`` to short-circuit entry consideration on the
+        SAME tick — the supervisor never opens a new position on a tick
+        that just closed one (capital-preservation invariant).
+
+        For each surviving open position we:
+
+        1. Call ``policy.update_high_water_mark`` with the current tick.
+        2. Persist the new HWM via ``store.update_runtime_fields`` so the
+           trailing-stop branch has fresh state on the next tick / process.
+        3. Call ``policy.evaluate`` — on close=True, dispatch through the
+           same per-tag close path used by ``_force_flat_all`` (paper
+           positions stay local; live-tagged positions go through the
+           exchange). On ``ExchangeError`` we fall through to the paper
+           close for paper-tagged positions only — live errors must
+           surface so the kill-switch / breaker logic can react.
+        4. Otherwise: bump ``bars_held`` by 1 and persist.
+
+        Master-switch: with ``self.exit_policy_enabled`` False (or
+        ``self.exit_policy`` None) this is a no-op returning ``(0, None)``.
+        """
+        if not self.exit_policy_enabled or self.exit_policy is None:
+            return 0, None
+
+        try:
+            open_positions = self.position_store.list_open()
+        except Exception as exc:  # noqa: BLE001 - state read is best-effort
+            LOGGER.warning(
+                "exit policy: list_open failed for %s: %s; skipping exits",
+                symbol,
+                exc,
+            )
+            return 0, None
+
+        closed = 0
+        last_reason: Optional[str] = None
+        # Adapt the exchange ``Ticker`` to the duck-typed contract once per
+        # tick — every position evaluation reuses the same exit-tick view.
+        exit_tick = self._ticker_to_exit_tick(ticker)
+        for position in open_positions:
+            if position.symbol != symbol:
+                continue
+            # Closing / closed positions should never appear in
+            # ``list_open`` (the store filters them) but guard defensively
+            # so the policy never evaluates a half-closed blob.
+            if position.status not in ("open", "pending"):
+                continue
+
+            # Seed high_water_mark if it's missing — the legacy schema
+            # didn't carry one, and the policy needs SOMETHING to compare
+            # against on the first tick. Treat None as "use entry price".
+            if getattr(position, "high_water_mark", None) is None:
+                seed_hwm = float(position.entry_price)
+                # Update the in-memory object so the policy reads the seed.
+                # Persistence happens below alongside the post-tick update.
+                try:
+                    position.high_water_mark = seed_hwm  # pydantic v2 allows mutation
+                except (AttributeError, TypeError):
+                    # Frozen model — fall back to model_copy. The local
+                    # binding is updated; the persisted blob is written
+                    # below.
+                    position = position.model_copy(
+                        update={"high_water_mark": seed_hwm}
+                    )
+
+            self.exit_policy.update_high_water_mark(position, exit_tick)
+
+            decision: ExitDecision = self.exit_policy.evaluate(position, exit_tick)
+            if decision.close:
+                reason = decision.reason or "unknown"
+                last_reason = reason
+                self._exits_by_reason[reason] = (
+                    self._exits_by_reason.get(reason, 0) + 1
+                )
+                close_side: Literal["buy", "sell"] = (
+                    "sell" if position.side == "long" else "buy"
+                )
+                try:
+                    self._submit_exit_close(
+                        position=position,
+                        close_side=close_side,
+                        reason=reason,
+                    )
+                    closed += 1
+                except ExchangeError as exc:
+                    # Live-tagged positions surface the error so the
+                    # consecutive-error breaker / kill switch can react.
+                    # Paper-tagged positions fall through to the local
+                    # paper force-flat (matches the 2026-05-14 incident
+                    # fix in commit 2b62a7d).
+                    if position.exchange == "coinbase-paper":
+                        LOGGER.warning(
+                            "exit close ExchangeError on paper position %s; "
+                            "falling back to _paper_force_flat: %s",
+                            position.position_id,
+                            exc,
+                        )
+                        try:
+                            self._paper_force_flat(position, close_side)
+                            closed += 1
+                        except Exception as inner:  # noqa: BLE001 - log only
+                            LOGGER.warning(
+                                "paper force-flat fallback failed for %s: %s",
+                                position.position_id,
+                                inner,
+                            )
+                            self._exits_by_reason["error"] = (
+                                self._exits_by_reason.get("error", 0) + 1
+                            )
+                    else:
+                        self._exits_by_reason["error"] = (
+                            self._exits_by_reason.get("error", 0) + 1
+                        )
+                        raise
+            else:
+                # Position survives this tick — bump bars_held and persist
+                # the (possibly updated) high_water_mark in one round-trip.
+                new_bars = int(getattr(position, "bars_held", 0) or 0) + 1
+                try:
+                    self.position_store.update_runtime_fields(
+                        position.position_id,
+                        bars_held=new_bars,
+                        high_water_mark=float(
+                            getattr(position, "high_water_mark", position.entry_price)
+                        ),
+                    )
+                except AttributeError:
+                    # Stub stores from older test fixtures may not have
+                    # update_runtime_fields. Log once + continue; the exit
+                    # policy still works for SL/TP/reversal (which don't
+                    # need persistence), and the trail/time branches just
+                    # see stale state for that tick.
+                    if not getattr(self, "_warned_no_update_runtime", False):
+                        LOGGER.warning(
+                            "position_store has no update_runtime_fields; "
+                            "trailing-stop / time-stop will not persist "
+                            "across ticks until upgraded"
+                        )
+                        self._warned_no_update_runtime = True
+                except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+                    LOGGER.warning(
+                        "update_runtime_fields failed for %s: %s",
+                        position.position_id,
+                        exc,
+                    )
+
+        return closed, last_reason
+
+    def _submit_exit_close(
+        self,
+        *,
+        position: Position,
+        close_side: Literal["buy", "sell"],
+        reason: str,
+    ) -> None:
+        """Dispatch an exit-policy close to the right close path.
+
+        Per-tag dispatch matches ``_force_flat_all``: paper positions stay
+        local, live positions route through the exchange. The reason is
+        echoed into the exchange's order metadata via the LOGGER only —
+        ccxt market orders don't carry custom tags, but our paper close
+        records the reason in the position notes for forensics.
+        """
+        if position.exchange == "coinbase-paper":
+            self._paper_force_flat(position, close_side)
+            return
+        # Live close: a real market order. ExchangeError is raised by the
+        # exchange wrapper; the caller decides whether to rethrow (live)
+        # or fall back to paper close (paper-tagged). We do NOT swallow
+        # here.
+        self.exchange.place_market_order(
+            position.symbol, close_side, base_size=position.base_size
+        )
+        LOGGER.info(
+            "exit close: live %s side=%s reason=%s base=%.6f",
+            position.position_id,
+            close_side,
+            reason,
+            float(position.base_size),
+        )
+
+    def _oldest_open_position_age_s(self) -> float:
+        """Seconds since the oldest currently-open position was opened."""
+        try:
+            opens = self.position_store.list_open()
+        except Exception:  # noqa: BLE001 - telemetry must never raise
+            return 0.0
+        if not opens:
+            return 0.0
+        now = self._now().astimezone(timezone.utc)
+        oldest_s = 0.0
+        for position in opens:
+            opened_raw = getattr(position, "opened_at_utc", None)
+            if not opened_raw:
+                continue
+            try:
+                opened = datetime.fromisoformat(str(opened_raw))
+            except (TypeError, ValueError):
+                continue
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            age_s = (now - opened.astimezone(timezone.utc)).total_seconds()
+            if age_s > oldest_s:
+                oldest_s = age_s
+        return float(max(oldest_s, 0.0))
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
     def _allow_verdict(self) -> CircuitBreakerVerdict:
@@ -2209,11 +2831,53 @@ class Supervisor:
         confidence: float,
         ticker: Ticker,
         ctx: DecisionContext,
+        resolved_kelly_pct: Optional[float] = None,
+        regime_label: Optional[str] = None,
     ) -> None:
         """Capture the signal-time snapshot. No-op if no store is wired."""
         if self.trade_context_store is None:
             return
         try:
+            risk_in: Dict[str, Any] = {
+                "side": str(side),
+                "proposed_notional_usd": float(ctx.proposed_notional_usd),
+                "current_open_notional_usd": float(
+                    ctx.current_open_notional_usd
+                ),
+                "current_per_symbol_notional_usd": float(
+                    ctx.current_per_symbol_notional_usd
+                ),
+                "daily_realized_pnl_usd": float(ctx.daily_realized_pnl_usd),
+                "equity_peak_usd": float(ctx.equity_peak_usd),
+                "equity_current_usd": float(ctx.equity_current_usd),
+                "bankroll": float(self.config.bankroll_usd),
+            }
+            # Sprint 2.5: the sizing forensics agent (A3) prefers a
+            # ``resolved_kelly_pct`` key on risk_metrics_input over
+            # re-resolving from the predictor. None means "Kelly didn't
+            # fire on this tick" — distinct from key-missing which would
+            # imply the field was never written.
+            if resolved_kelly_pct is not None:
+                risk_in["resolved_kelly_pct"] = float(resolved_kelly_pct)
+            # Sprint 2.6: belt-and-suspenders write of the regime label.
+            # ``scripts/run_outcome_adjuster.py``'s
+            # ``_try_label_from_signal_snapshot`` iterates over
+            # ``risk_metrics_input`` (today's concrete probe), and the
+            # script docstring (lines 15-22) names ``signal_snapshot
+            # ["regime_label"]`` the canonical top-level seam. We write
+            # both so the resolver finds the label regardless of which
+            # seam ends up canonical. Empty / blank labels collapse to
+            # ``None`` so the key only appears when there's a real label.
+            normalized_label: Optional[str] = None
+            if regime_label is not None:
+                try:
+                    candidate = str(regime_label).strip()
+                except (TypeError, ValueError):
+                    candidate = ""
+                if candidate:
+                    normalized_label = candidate
+            if normalized_label is not None:
+                risk_in["regime_label"] = normalized_label
             snap = TradeContextSnapshot(
                 trade_id=trade_id,
                 symbol=symbol,
@@ -2223,19 +2887,7 @@ class Supervisor:
                 feature_window=None,
                 model_probs={},
                 model_confidence=float(confidence),
-                risk_metrics_input={
-                    "side": str(side),
-                    "proposed_notional_usd": float(ctx.proposed_notional_usd),
-                    "current_open_notional_usd": float(
-                        ctx.current_open_notional_usd
-                    ),
-                    "current_per_symbol_notional_usd": float(
-                        ctx.current_per_symbol_notional_usd
-                    ),
-                    "daily_realized_pnl_usd": float(ctx.daily_realized_pnl_usd),
-                    "equity_peak_usd": float(ctx.equity_peak_usd),
-                    "equity_current_usd": float(ctx.equity_current_usd),
-                },
+                risk_metrics_input=risk_in,
                 risk_metrics_output={},
                 breaker_context={},
                 ticker_buffer=[
@@ -2247,8 +2899,17 @@ class Supervisor:
                     }
                 ],
                 notes=None,
+                regime_label=normalized_label,
             )
             self.trade_context_store.record_snapshot(snap)
+        except redis.exceptions.RedisError as exc:
+            # Best-effort persistence: a Redis hiccup must not crash the
+            # tick. Logged with the symbol so operators can find the gap.
+            LOGGER.warning(
+                "trade_context_store signal snapshot redis error for %s: %r",
+                symbol,
+                exc,
+            )
         except Exception as exc:  # noqa: BLE001 - never crash the tick
             LOGGER.warning(
                 "trade_context_store signal snapshot failed for %s: %r",
@@ -2319,6 +2980,12 @@ class Supervisor:
                 notes=notes,
             )
             self.trade_context_store.record_snapshot(snap)
+        except redis.exceptions.RedisError as exc:
+            LOGGER.warning(
+                "trade_context_store fill snapshot redis error for %s: %r",
+                symbol,
+                exc,
+            )
         except Exception as exc:  # noqa: BLE001 - never crash the tick
             LOGGER.warning(
                 "trade_context_store fill snapshot failed for %s: %r",
@@ -2425,6 +3092,12 @@ class Supervisor:
                 breaker_decision=breaker_decision,
             )
             self.trade_context_store.record_snapshot(snap)
+        except redis.exceptions.RedisError as exc:
+            LOGGER.warning(
+                "trade_context_store breaker snapshot redis error for %s: %r",
+                position.position_id,
+                exc,
+            )
         except Exception as exc:  # noqa: BLE001 - never crash the tick
             LOGGER.warning(
                 "trade_context_store breaker snapshot failed for %s: %r",
@@ -2655,6 +3328,26 @@ class Supervisor:
             self.metrics_pusher.gauge("orphan_positions", orphans)
         except (AttributeError, Exception):  # noqa: BLE001 - tolerate stub stores
             pass
+
+        # Sprint 1 Wave 2: exit-policy observability.
+        # ``exits_by_reason`` is the cumulative count per reason since
+        # process boot (the supervisor doesn't reset these — Prometheus
+        # rate() handles intervals). ``open_positions_count`` is already
+        # gauged above; we add the per-symbol oldest-age gauge so the
+        # operator can spot stuck positions before the breaker fires.
+        for reason, count in self._exits_by_reason.items():
+            self.metrics_pusher.counter(
+                "exits_by_reason_total",
+                float(count),
+                labels={"reason": reason},
+            )
+        try:
+            self.metrics_pusher.gauge(
+                "oldest_open_position_age_s",
+                float(self._oldest_open_position_age_s()),
+            )
+        except Exception as exc:  # noqa: BLE001 - telemetry must not crash
+            LOGGER.debug("oldest_open_position_age_s emit failed: %r", exc)
 
     def _emit_daily_close_metrics(
         self,
@@ -3515,6 +4208,18 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--halal-mode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Halal (Shariah-compliant) trading: long-only + spot-only. Blocks "
+            "any short entry and fail-closes any live order routed to a "
+            "non-spot venue (perps/leverage/funding). ON by default; pass "
+            "--no-halal-mode to disable for this run (or set HALAL_MODE=0). "
+            "When omitted, follows the HALAL_MODE env var (default on)."
+        ),
+    )
+    p.add_argument(
         "--once",
         action="store_true",
         help="Run a single iteration and exit (cron-friendly).",
@@ -3703,9 +4408,40 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 2
 
+    # Resolve halal mode: an explicit --halal-mode wins; otherwise fall back to
+    # the HALAL_MODE env var (via the config singleton). Under halal mode the
+    # prediction-market (Polymarket) stack is refused outright — betting on
+    # event outcomes is maisir (gambling), which no spot/long-only gate can
+    # make Shariah-compliant.
+    if args.halal_mode is None:
+        try:
+            from config import cfg as _halal_cfg  # noqa: WPS433 - lazy import
+
+            halal_mode = bool(getattr(_halal_cfg, "HALAL_MODE", False))
+        except Exception:  # noqa: BLE001 - config import must never crash boot
+            halal_mode = False
+    else:
+        halal_mode = bool(args.halal_mode)
+
+    if halal_mode and polymarket_market_ids:
+        print(
+            "error: halal_mode is on but --polymarket-markets was passed; "
+            "prediction markets are maisir (gambling) and are not permitted. "
+            "Remove --polymarket-markets or disable halal mode.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if halal_mode:
+        LOGGER.info(
+            "HALAL_MODE active: long-only + spot-only enforced; shorts, "
+            "perps/leverage/funding, and prediction markets are blocked."
+        )
+
     # Build PolymarketTradeable instances up-front so SupervisorConfig
     # validation sees the union of (symbols, tradeables) and the
-    # supervisor's __init__ wires them into the iteration list.
+    # supervisor's __init__ wires them into the iteration list. (Empty under
+    # halal mode — the refusal above returns before we get here.)
     tradeables: List[Any] = []
     if polymarket_market_ids:
         from exchanges.adapters import PolymarketTradeable
@@ -3725,6 +4461,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         risk_pct_per_trade=args.risk_pct,
         min_confidence_to_trade=args.min_confidence,
         exit_rule=args.exit_rule,
+        halal_mode=halal_mode,
     )
 
     # Optional Sentry init -- a no-op if SENTRY_DSN is unset.
@@ -3742,6 +4479,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     position_store = PositionStore()
     circuit_breakers = CircuitBreakerSet()
     notifier = Notifier()
+
+    # Sprint 2.5: wire the Lane E trade-context snapshot store onto the
+    # same Redis client the position store already uses. Best-effort —
+    # a TradeContextStore construction failure logs and proceeds with
+    # ``trade_context_store=None``, which makes the three snapshot helpers
+    # no-op (same as pre-2.5 behaviour). Without this wiring the run_postmortem
+    # specialists return verdict=unknown for every trade and the calibration
+    # drift script's snapshot-fallback path is dead — they need this store
+    # to read from, and only the supervisor writes to it during a tick.
+    trade_context_store: Optional[TradeContextStore] = None
+    try:
+        # Share the position store's Redis client so we don't open a second
+        # connection per process. Falls through to a URL-based construction
+        # when the position store's internal client isn't exposed.
+        ps_redis = getattr(position_store, "_redis", None)
+        if ps_redis is not None:
+            trade_context_store = TradeContextStore(redis_client=ps_redis)
+        else:
+            trade_context_store = TradeContextStore()
+    except Exception as exc:  # noqa: BLE001 - never crash boot on snapshot store
+        LOGGER.warning(
+            "trade_context_store bootstrap failed (%s); snapshot capture disabled",
+            exc,
+        )
+        trade_context_store = None
 
     # Try the legacy transformer; fall back to neutral placeholder if anything
     # goes wrong (missing artifacts, torch import error, etc.). The supervisor
@@ -3814,6 +4576,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         metrics_pusher=metrics_pusher,
         auto_pause_gate=auto_pause_gate,
         confidence_history=confidence_history,
+        trade_context_store=trade_context_store,
     )
 
     # Include polymarket market ids in the run-dir name when set so the

@@ -74,6 +74,15 @@ class TradingConfig(BaseSettings):
     starting_cash: float = Field(10_000.0, env="STARTING_CASH")
     allow_shorts: bool = Field(False, env="ALLOW_SHORTS")
     max_leverage: float = Field(1.0, env="MAX_LEVERAGE")
+    # Halal (Shariah-compliant) trading mode. When True, the live supervisor
+    # hard-enforces LONG-ONLY + SPOT-ONLY execution and fail-closes on any
+    # non-compliant order: no shorts (selling an asset you don't own), no
+    # perpetual-futures / leverage / funding-rate venues (riba + gharar). The
+    # Polymarket prediction-market stack (maisir/gambling) is scan-and-advise
+    # only and is never routed to the trading engine. Default ON — this is the
+    # operational default for every CLI run of the bot. Disable per-run with
+    # --no-halal-mode, or globally with HALAL_MODE=0 in the environment.
+    HALAL_MODE: bool = Field(True, env="HALAL_MODE")
     risk_pct_per_trade: float = Field(0.004, env="RISK_PCT_PER_TRADE")
     csv_path: str = Field("", env="CSV_PATH")
     testnet: bool = Field(True, env="TESTNET")
@@ -98,6 +107,35 @@ class TradingConfig(BaseSettings):
     gemini_model: str = Field("gemini-2.5-flash", env="GEMINI_MODEL")
     gemini_timeout_s: int = Field(30, env="GEMINI_TIMEOUT_S")
     gemini_use_search_grounding: bool = Field(True, env="GEMINI_USE_SEARCH_GROUNDING")
+
+    # Exit policy (Sprint 1 Wave 1B + Wave 2). All knobs are independently
+    # togglable — the float / int thresholds use None to disable, the
+    # master switch uses False. ``EXIT_POLICY_ENABLED`` flipped to True in
+    # Wave 2 once the high-water-mark plumbing and reason-tagged force-flat
+    # paths landed; operators can still opt out with
+    # ``EXIT_POLICY_ENABLED=0`` to reproduce the legacy "no exit policy"
+    # behavior (regression sentinel).
+    STOP_LOSS_PCT: Optional[float] = Field(-0.004, env="STOP_LOSS_PCT")
+    TAKE_PROFIT_PCT: Optional[float] = Field(0.008, env="TAKE_PROFIT_PCT")
+    TIME_STOP_BARS: Optional[int] = Field(20, env="TIME_STOP_BARS")
+    TRAILING_STOP_PCT: Optional[float] = Field(None, env="TRAILING_STOP_PCT")
+    EXIT_SIGNAL_REVERSAL: bool = Field(False, env="EXIT_SIGNAL_REVERSAL")
+    EXIT_POLICY_ENABLED: bool = Field(True, env="EXIT_POLICY_ENABLED")
+
+    # Kelly sizing (Sprint 1 Wave 2). When ``KELLY_SIZING_ENABLED`` is True
+    # and the wired predictor exposes a non-None ``_last_resolved_kelly_pct``
+    # (set by ``XGBoostPredictor`` from the regime-memory lookup), the
+    # supervisor sizes new entries as ``bankroll * resolved_pct`` clipped
+    # to ``[KELLY_FLOOR_PCT, KELLY_CAP_PCT]``. When the predictor doesn't
+    # surface a value, OR the master switch is False, sizing falls back to
+    # the legacy ``bankroll * risk_pct_per_trade`` path (preserving every
+    # existing test fixture). Defaults are deliberately conservative:
+    # 0.5% floor (any opened trade must be at least meaningful) and 5% cap
+    # (Kelly half-fraction ceiling — protects against blown-up resolved
+    # values from a low-confidence regime match).
+    KELLY_SIZING_ENABLED: bool = Field(True, env="KELLY_SIZING_ENABLED")
+    KELLY_FLOOR_PCT: float = Field(0.005, env="KELLY_FLOOR_PCT")
+    KELLY_CAP_PCT: float = Field(0.05, env="KELLY_CAP_PCT")
 
     if _USE_PYDANTIC_SETTINGS and SettingsConfigDict is not None:
         model_config = SettingsConfigDict(

@@ -66,6 +66,11 @@ ruvector.db
 # Polymarket scanner JSON exports
 output/
 
+# Lane E nightly digests (regenerated daily by scripts/run_postmortem.py
+# via launchd/com.autopilot.loss-postmortem.plist). The .gitkeep tracks
+# the directory itself.
+docs/digests/*.md
+
 # Supervisor runtime artifacts (nohup capture + pidfiles)
 nohup.out
 *.pid

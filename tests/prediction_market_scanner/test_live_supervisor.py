@@ -419,6 +419,7 @@ def _build_supervisor(
     symbols: Optional[List[str]] = None,
     auto_trip_threshold: int = 10,
     exit_rule: str = "none",
+    halal_mode: bool = False,
     now_fn=None,
 ) -> Tuple[Supervisor, Dict[str, Any]]:
     """Construct a supervisor with stubbed dependencies, returning both."""
@@ -437,6 +438,7 @@ def _build_supervisor(
         risk_pct_per_trade=risk_pct,
         min_confidence_to_trade=min_confidence,
         exit_rule=exit_rule,
+        halal_mode=halal_mode,
     )
     exchange = exchange or StubExchange()
     position_store = position_store or StubPositionStore()
@@ -851,7 +853,12 @@ class TestLiveAllowedAfterShakedown(unittest.TestCase):
         self.assertTrue(sup.is_live_unlocked())
         ticks = sup.run_once()
         self.assertEqual(ticks[0].action_taken, "allowed")
-        self.assertEqual(ticks[0].notes, "live")
+        # Sprint 1 Wave 2: the ``notes`` field now embeds the sizing
+        # source (flat / kelly) and the notional in USD so operators can
+        # see at a glance which path won. The legacy ``"live"`` substring
+        # is preserved as a prefix.
+        self.assertTrue(ticks[0].notes.startswith("live"))
+        self.assertIn("sizing=", ticks[0].notes)
         # Live order WAS placed.
         self.assertEqual(len(exch.market_orders), 1)
         order_call = exch.market_orders[0]
@@ -888,6 +895,141 @@ class TestExchangeErrorHandling(unittest.TestCase):
         # The loop survived -- a second call should still execute cleanly.
         ticks2 = sup.run_once()
         self.assertEqual(len(ticks2), 1)
+
+
+class TestHalalMode(unittest.TestCase):
+    """HALAL_MODE gate: long-only + spot-only, fail-closed, exits never blocked."""
+
+    def test_exchange_is_spot_helper_fail_closed(self) -> None:
+        from live_supervisor import _exchange_is_spot
+
+        class _Spot:
+            MARKET_TYPE = "spot"
+
+        class _Perp:
+            MARKET_TYPE = "perp"
+
+        class _Unmarked:
+            pass
+
+        self.assertTrue(_exchange_is_spot(_Spot()))
+        self.assertFalse(_exchange_is_spot(_Perp()))
+        self.assertFalse(_exchange_is_spot(_Unmarked()))  # undeclared -> not proven spot
+        self.assertFalse(_exchange_is_spot(None))
+
+    def test_halal_off_short_signal_opens_short(self) -> None:
+        """Baseline: with halal_mode OFF a 'sell' signal still opens a short,
+        proving the guard (not some other path) is what blocks it when ON."""
+        store = StubPositionStore()
+        exch = StubExchange(ticker_mid=2_000.0)
+        sup, _refs = _build_supervisor(
+            mode="paper",
+            halal_mode=False,
+            position_store=store,
+            exchange=exch,
+            predict_fn=lambda s, t: ("sell", 0.9),
+        )
+        ticks = sup.run_once()
+        self.assertEqual(ticks[0].action_taken, "allowed")
+        sup.run_once()  # drain the deferred paper fill
+        self.assertEqual(len(store.recorded_open), 1)
+        self.assertEqual(store.recorded_open[0].side, "short")
+
+    def test_halal_on_blocks_short_entry(self) -> None:
+        store = StubPositionStore()
+        exch = StubExchange(ticker_mid=2_000.0)
+        sup, _refs = _build_supervisor(
+            mode="paper",
+            halal_mode=True,
+            position_store=store,
+            exchange=exch,
+            predict_fn=lambda s, t: ("sell", 0.9),
+        )
+        ticks = sup.run_once()
+        self.assertEqual(ticks[0].action_taken, "skipped_halal")
+        self.assertIn("short entry blocked", ticks[0].notes or "")
+        # Nothing queued, nothing recorded even after a second (drain) tick.
+        sup.run_once()
+        self.assertEqual(len(store.recorded_open), 0)
+        self.assertEqual(len(exch.market_orders), 0)
+
+    def test_halal_on_allows_long_entry(self) -> None:
+        store = StubPositionStore()
+        exch = StubExchange(ticker_mid=2_000.0)
+        sup, _refs = _build_supervisor(
+            mode="paper",
+            halal_mode=True,
+            position_store=store,
+            exchange=exch,
+            predict_fn=lambda s, t: ("buy", 0.9),
+        )
+        ticks = sup.run_once()
+        self.assertEqual(ticks[0].action_taken, "allowed")
+        sup.run_once()  # drain
+        self.assertEqual(len(store.recorded_open), 1)
+        self.assertEqual(store.recorded_open[0].side, "long")
+
+    def test_halal_on_live_refuses_non_spot_exchange(self) -> None:
+        """Fail-closed: a live long on a non-spot venue is refused before the
+        order ever reaches the exchange."""
+        store = StubPositionStore()
+        exch = StubExchange(ticker_mid=2_000.0)  # no MARKET_TYPE -> not spot
+        sup, refs = _build_supervisor(
+            mode="live",
+            paper_days_clean=14,
+            shakedown_min_days=14,
+            halal_mode=True,
+            position_store=store,
+            exchange=exch,
+            predict_fn=lambda s, t: ("buy", 0.9),
+        )
+        ticks = sup.run_once()
+        self.assertEqual(ticks[0].action_taken, "errored")
+        self.assertEqual(len(exch.market_orders), 0)
+        self.assertEqual(len(store.recorded_open), 0)
+        self.assertEqual(len(refs["notifier"].alert_calls), 1)
+
+    def test_halal_on_live_allows_spot_exchange(self) -> None:
+        class _SpotStub(StubExchange):
+            MARKET_TYPE = "spot"
+
+        store = StubPositionStore()
+        exch = _SpotStub(ticker_mid=2_000.0)
+        sup, _refs = _build_supervisor(
+            mode="live",
+            paper_days_clean=14,
+            shakedown_min_days=14,
+            halal_mode=True,
+            position_store=store,
+            exchange=exch,
+            predict_fn=lambda s, t: ("buy", 0.9),
+        )
+        ticks = sup.run_once()
+        self.assertEqual(ticks[0].action_taken, "allowed")
+        self.assertEqual(len(exch.market_orders), 1)
+        self.assertEqual(exch.market_orders[0]["side"], "buy")
+        self.assertEqual(len(store.recorded_open), 1)
+
+    def test_halal_on_does_not_block_long_exit(self) -> None:
+        """Closing an owned long is a permissible sale — the spot-only gate is
+        on the OPEN path only, so a force-flat exit still places its orders
+        even under halal_mode with a non-spot exchange."""
+        open_positions = [
+            _make_position(side="long", symbol="ETH/USDT"),
+            _make_position(side="long", symbol="BTC/USDT"),
+        ]
+        store = StubPositionStore(open_positions=open_positions)
+        breakers = StubCircuitBreakers(kill_switch=True)
+        exch = StubExchange(ticker_mid=2_000.0)  # non-spot; must NOT block exits
+        sup, refs = _build_supervisor(
+            halal_mode=True,
+            position_store=store,
+            circuit_breakers=breakers,
+            exchange=exch,
+        )
+        ticks = sup.run_once()
+        self.assertEqual(ticks[0].action_taken, "force_flatted")
+        self.assertEqual(len(refs["exchange"].market_orders), 2)
 
 
 class TestRunLoopMaxIterations(unittest.TestCase):
