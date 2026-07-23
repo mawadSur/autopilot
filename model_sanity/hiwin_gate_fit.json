@@ -1,0 +1,170 @@
+{
+  "thr": 0.57,
+  "n_fires": 340,
+  "fit_eval_split": {
+    "best_gate": {
+      "theta_bb_width": 0.0015159162554179962,
+      "theta_range_pct": 0.00010285861226599085,
+      "n": 170,
+      "wr": 0.6470588235294118,
+      "retention": 1.0,
+      "score": 0.6470588235294118
+    },
+    "eval_stats": {
+      "n": 77,
+      "wr": 0.5194805194805194,
+      "retention": 0.45294117647058824,
+      "score": 0.3496150890136245
+    },
+    "eval_baseline_wr": 0.5529411764705883,
+    "eval_lift": -0.03346065699006884
+  },
+  "loo_cv": [
+    {
+      "held_day": "2026-04-15",
+      "n_total": 6,
+      "n_kept": 6,
+      "kept_wr": 0.8333333333333334,
+      "baseline_wr": 0.8333333333333334,
+      "lift": 0.0,
+      "theta_bb_width": 0.0004199777508992368,
+      "theta_range_pct": 0.0
+    },
+    {
+      "held_day": "2026-04-16",
+      "n_total": 3,
+      "n_kept": 3,
+      "kept_wr": 1.0,
+      "baseline_wr": 1.0,
+      "lift": 0.0,
+      "theta_bb_width": 0.0004199777508992368,
+      "theta_range_pct": 0.0
+    },
+    {
+      "held_day": "2026-04-17",
+      "n_total": 13,
+      "n_kept": 13,
+      "kept_wr": 0.6153846153846154,
+      "baseline_wr": 0.6153846153846154,
+      "lift": 0.0,
+      "theta_bb_width": 0.0004199777508992368,
+      "theta_range_pct": 0.0
+    },
+    {
+      "held_day": "2026-04-18",
+      "n_total": 16,
+      "n_kept": 16,
+      "kept_wr": 0.75,
+      "baseline_wr": 0.75,
+      "lift": 0.0,
+      "theta_bb_width": 0.0004199777508992368,
+      "theta_range_pct": 0.0
+    },
+    {
+      "held_day": "2026-04-19",
+      "n_total": 78,
+      "n_kept": 78,
+      "kept_wr": 0.6794871794871795,
+      "baseline_wr": 0.6794871794871795,
+      "lift": 0.0,
+      "theta_bb_width": 0.0004199777508992368,
+      "theta_range_pct": 0.0
+    },
+    {
+      "held_day": "2026-04-20",
+      "n_total": 8,
+      "n_kept": 8,
+      "kept_wr": 0.75,
+      "baseline_wr": 0.75,
+      "lift": 0.0,
+      "theta_bb_width": 0.0004199777508992368,
+      "theta_range_pct": 0.0
+    },
+    {
+      "held_day": "2026-04-21",
+      "n_total": 2,
+      "n_kept": 2,
+      "kept_wr": 1.0,
+      "baseline_wr": 1.0,
+      "lift": 0.0,
+      "theta_bb_width": 0.0004199777508992368,
+      "theta_range_pct": 0.0
+    },
+    {
+      "held_day": "2026-04-22",
+      "n_total": 9,
+      "n_kept": 9,
+      "kept_wr": 0.5555555555555556,
+      "baseline_wr": 0.5555555555555556,
+      "lift": 0.0,
+      "theta_bb_width": 0.0004199777508992368,
+      "theta_range_pct": 0.0
+    },
+    {
+      "held_day": "2026-04-23",
+      "n_total": 30,
+      "n_kept": 30,
+      "kept_wr": 0.5,
+      "baseline_wr": 0.5,
+      "lift": 0.0,
+      "theta_bb_width": 0.0004199777508992368,
+      "theta_range_pct": 0.0
+    },
+    {
+      "held_day": "2026-04-24",
+      "n_total": 23,
+      "n_kept": 23,
+      "kept_wr": 0.6086956521739131,
+      "baseline_wr": 0.6086956521739131,
+      "lift": 0.0,
+      "theta_bb_width": 0.0004199777508992368,
+      "theta_range_pct": 0.0
+    },
+    {
+      "held_day": "2026-04-25",
+      "n_total": 109,
+      "n_kept": 77,
+      "kept_wr": 0.5584415584415584,
+      "baseline_wr": 0.5229357798165137,
+      "lift": 0.03550577862504467,
+      "theta_bb_width": 0.0007902625010473547,
+      "theta_range_pct": 1.2950516078152086e-05
+    },
+    {
+      "held_day": "2026-04-26",
+      "n_total": 13,
+      "n_kept": 13,
+      "kept_wr": 0.46153846153846156,
+      "baseline_wr": 0.46153846153846156,
+      "lift": 0.0,
+      "theta_bb_width": 0.0004199777508992368,
+      "theta_range_pct": 0.0
+    },
+    {
+      "held_day": "2026-04-27",
+      "n_total": 23,
+      "n_kept": 23,
+      "kept_wr": 0.6086956521739131,
+      "baseline_wr": 0.6086956521739131,
+      "lift": 0.0,
+      "theta_bb_width": 0.0004199777508992368,
+      "theta_range_pct": 0.0
+    },
+    {
+      "held_day": "2026-04-28",
+      "n_total": 7,
+      "n_kept": 7,
+      "kept_wr": 0.5714285714285714,
+      "baseline_wr": 0.5714285714285714,
+      "lift": 0.0,
+      "theta_bb_width": 0.0004199777508992368,
+      "theta_range_pct": 0.0
+    }
+  ],
+  "loo_aggregate": {
+    "n_total_sum": 340,
+    "n_kept_sum": 308,
+    "kept_wr_weighted": 0.6168831168831169,
+    "baseline_wr_weighted": 0.6
+  }
+}

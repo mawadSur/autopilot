@@ -1,0 +1,9 @@
+{
+  "ev_per_trade": -0.0037127103734026987,
+  "expectancy": -0.0037127103734026987,
+  "profit_factor": 0.18291708450659439,
+  "max_drawdown_pct": 4.4308413059382525,
+  "sharpe": -10.399856221051039,
+  "win_rate_pct": 30.303030303030305,
+  "recommendation": "Retrain recommended"
+}
